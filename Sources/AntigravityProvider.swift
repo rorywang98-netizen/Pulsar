@@ -4,6 +4,45 @@ import Darwin
 import Foundation
 import Security
 
+// MARK: - Antigravity Credential Drift Model
+
+public struct AntigravityCredentialDrift: Equatable, Sendable {
+    public enum Reason: String, Equatable, Sendable {
+        case desktopKeychainMismatch
+        case mirrorFileMismatch
+        case staleMetadata
+    }
+
+    public let reason: Reason
+    public let desktopAccountId: String?
+    public let desktopEmail: String
+    public let desktopDisplayName: String?
+    public let keychainEmail: String?
+    public let mirrorEmail: String?
+    public let staleBackgroundAgyPids: [Int]
+    public let summaryMessage: String
+
+    public init(
+        reason: Reason,
+        desktopAccountId: String?,
+        desktopEmail: String,
+        desktopDisplayName: String?,
+        keychainEmail: String?,
+        mirrorEmail: String?,
+        staleBackgroundAgyPids: [Int],
+        summaryMessage: String
+    ) {
+        self.reason = reason
+        self.desktopAccountId = desktopAccountId
+        self.desktopEmail = desktopEmail
+        self.desktopDisplayName = desktopDisplayName
+        self.keychainEmail = keychainEmail
+        self.mirrorEmail = mirrorEmail
+        self.staleBackgroundAgyPids = staleBackgroundAgyPids
+        self.summaryMessage = summaryMessage
+    }
+}
+
 /// Multi-account switcher, local Connect RPC + Cloud Code quota provider, and safe client controller
 /// for Antigravity (supporting dual Stable + Insiders installs and `agy` CLI).
 public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
@@ -53,21 +92,25 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         public var insidersAppURL: URL
         public var agyCLIURL: URL
         public var mirrorTokenURL: URL
+        public var daemonDirectories: [URL]
 
         public init(
             stableAppURL: URL,
             insidersAppURL: URL,
             agyCLIURL: URL,
-            mirrorTokenURL: URL
+            mirrorTokenURL: URL,
+            daemonDirectories: [URL] = []
         ) {
             self.stableAppURL = stableAppURL
             self.insidersAppURL = insidersAppURL
             self.agyCLIURL = agyCLIURL
             self.mirrorTokenURL = mirrorTokenURL
+            self.daemonDirectories = daemonDirectories
         }
 
         public static var liveDefaults: Paths {
             let home = FileManager.default.homeDirectoryForCurrentUser
+            let geminiDir = home.appendingPathComponent(".gemini", isDirectory: true)
             return Paths(
                 stableAppURL: URL(fileURLWithPath: "/Applications/Antigravity.app", isDirectory: true),
                 insidersAppURL: URL(fileURLWithPath: "/Applications/Antigravity - Insiders.app", isDirectory: true),
@@ -75,10 +118,40 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                     .appendingPathComponent(".local", isDirectory: true)
                     .appendingPathComponent("bin", isDirectory: true)
                     .appendingPathComponent("agy", isDirectory: false),
-                mirrorTokenURL: home
-                    .appendingPathComponent(".gemini", isDirectory: true)
-                    .appendingPathComponent("jetski-standalone-oauth-token", isDirectory: false)
+                mirrorTokenURL: geminiDir
+                    .appendingPathComponent("jetski-standalone-oauth-token", isDirectory: false),
+                daemonDirectories: [
+                    geminiDir
+                        .appendingPathComponent("antigravity", isDirectory: true)
+                        .appendingPathComponent("daemon", isDirectory: true),
+                    geminiDir
+                        .appendingPathComponent("antigravity-insiders", isDirectory: true)
+                        .appendingPathComponent("daemon", isDirectory: true),
+                ]
             )
+        }
+    }
+
+    /// Parsed descriptor from Antigravity 2.34+ `~/.gemini/antigravity*/daemon/hub_*.json`.
+    public struct DaemonHubDescriptor: Equatable, Sendable {
+        public let pid: Int
+        public let httpsPort: Int?
+        public let httpPort: Int?
+        public let csrfToken: String
+        public let lsVersion: String?
+
+        public init(
+            pid: Int,
+            httpsPort: Int?,
+            httpPort: Int?,
+            csrfToken: String,
+            lsVersion: String? = nil
+        ) {
+            self.pid = pid
+            self.httpsPort = httpsPort
+            self.httpPort = httpPort
+            self.csrfToken = csrfToken
+            self.lsVersion = lsVersion
         }
     }
 
@@ -93,6 +166,16 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
     private let cacheLock = NSLock()
     private var cachedStableVersion: String?
     private var cachedClientSecret: String?
+    private var cachedCredentialDrift: AntigravityCredentialDrift?
+
+    /// Most recent Keychain / mirror / desktop drift detected during `syncLiveAccount(registry:)`.
+    public var currentCredentialDrift: AntigravityCredentialDrift? {
+        cacheLock.withLock { cachedCredentialDrift }
+    }
+
+    private func setCurrentCredentialDrift(_ drift: AntigravityCredentialDrift?) {
+        cacheLock.withLock { cachedCredentialDrift = drift }
+    }
 
     // MARK: - Initializers
 
@@ -104,7 +187,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             keychain: keychain,
             processController: processController,
             paths: .liveDefaults,
-            session: nil
+            session: nil,
+            localRPCSession: nil
         )
     }
 
@@ -112,7 +196,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         keychain: KeychainStore,
         processController: ProcessController,
         paths: Paths = .liveDefaults,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        localRPCSession: URLSession? = nil
     ) {
         self.keychain = keychain
         self.processController = processController
@@ -121,17 +206,21 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         let delegate = LocalhostSelfSignedDelegate()
         self.localRPCDelegate = delegate
-        let localCfg = URLSessionConfiguration.ephemeral
-        localCfg.timeoutIntervalForRequest = 4.0
-        localCfg.timeoutIntervalForResource = 8.0
-        localCfg.waitsForConnectivity = false
-        localCfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        localCfg.urlCache = nil
-        localCfg.httpCookieStorage = nil
-        localCfg.httpShouldSetCookies = false
-        // Explicitly bypass system proxy for 127.0.0.1 Connect RPC.
-        localCfg.connectionProxyDictionary = [:]
-        self.localRPCSession = URLSession(configuration: localCfg, delegate: delegate, delegateQueue: nil)
+        if let localRPCSession {
+            self.localRPCSession = localRPCSession
+        } else {
+            let localCfg = URLSessionConfiguration.ephemeral
+            localCfg.timeoutIntervalForRequest = 4.0
+            localCfg.timeoutIntervalForResource = 8.0
+            localCfg.waitsForConnectivity = false
+            localCfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            localCfg.urlCache = nil
+            localCfg.httpCookieStorage = nil
+            localCfg.httpShouldSetCookies = false
+            // Explicitly bypass system proxy for 127.0.0.1 Connect RPC.
+            localCfg.connectionProxyDictionary = [:]
+            self.localRPCSession = URLSession(configuration: localCfg, delegate: delegate, delegateQueue: nil)
+        }
     }
 
     // MARK: - Detached Executable Matchers
@@ -330,6 +419,72 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         var idToken: String?
         var rawKeychainString: String?
         var rawMirrorData: Data?
+    }
+
+    private struct ParsedBundleSnapshot {
+        let root: [String: Any]
+        let accessToken: String?
+        let refreshToken: String?
+        let expiry: Date?
+        let idToken: String?
+        let idTokenEmail: String?
+        let jwtSub: String?
+        let jwtEmail: String?
+        let jwtName: String?
+        let jwtPictureURL: String?
+        let writerID: String?
+    }
+
+    private static func parseBundleSnapshot(from data: Data) -> ParsedBundleSnapshot? {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any] else {
+            return nil
+        }
+        let tokenObj = obj["token"] as? [String: Any]
+        let accessToken = nonEmptyStatic(tokenObj?["access_token"] as? String)
+        let refreshToken = nonEmptyStatic(tokenObj?["refresh_token"] as? String)
+        let expiry = (tokenObj?["expiry"] as? String).flatMap { Formatters.parseRFC3339($0) }
+        let idToken = nonEmptyStatic(obj["id_token"] as? String)
+        let idTokenEmail = nonEmptyStatic(obj["id_token_email"] as? String)
+        let writerID = nonEmptyStatic(obj["writer_id"] as? String)
+
+        let claims = idToken.flatMap { Formatters.decodeJWTPayload($0) }
+        let jwtSub = nonEmptyStatic(claims?["sub"] as? String)
+        let jwtEmail = nonEmptyStatic(claims?["email"] as? String)
+        let jwtName = nonEmptyStatic(claims?["name"] as? String)
+        let jwtPictureURL = Formatters.sanitizedHTTPSURLString(claims?["picture"] as? String)
+
+        return ParsedBundleSnapshot(
+            root: obj,
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            expiry: expiry,
+            idToken: idToken,
+            idTokenEmail: idTokenEmail,
+            jwtSub: jwtSub,
+            jwtEmail: jwtEmail,
+            jwtName: jwtName,
+            jwtPictureURL: jwtPictureURL,
+            writerID: writerID
+        )
+    }
+
+    private func readKeychainBundle() -> (raw: String?, snapshot: ParsedBundleSnapshot?) {
+        let rawKC = try? keychain.readExternalGenericPassword(
+            service: Self.liveKeychainService,
+            account: Self.liveKeychainAccount
+        )
+        guard let rawKC, !rawKC.isEmpty, let kcData = Self.decodeGoKeyringValue(rawKC) else {
+            return (rawKC, nil)
+        }
+        return (rawKC, Self.parseBundleSnapshot(from: kcData))
+    }
+
+    private func readMirrorBundle() -> (exists: Bool, raw: Data?, snapshot: ParsedBundleSnapshot?) {
+        let exists = FileManager.default.fileExists(atPath: paths.mirrorTokenURL.path)
+        guard exists, let rawMirror = try? Data(contentsOf: paths.mirrorTokenURL), !rawMirror.isEmpty else {
+            return (exists, nil, nil)
+        }
+        return (true, rawMirror, Self.parseBundleSnapshot(from: rawMirror))
     }
 
     public static func encodeGoKeyringValue(_ jsonData: Data) -> String {
@@ -813,88 +968,268 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
     // MARK: - Live Account Sync & Import
 
+    private func matchVaultedAccount(forRefreshToken refreshToken: String?, in registry: RegistryData) -> AccountRecord? {
+        guard let refreshToken = nonEmpty(refreshToken) else { return nil }
+        let liveDigest = Formatters.sha256Hex(refreshToken)
+        for existing in registry.accounts(for: .antigravity) {
+            if let vaulted = try? keychain.readSecret(service: isolatedStoreNamespace, account: existing.id),
+               Formatters.sha256Hex(vaulted) == liveDigest {
+                return existing
+            }
+        }
+        return nil
+    }
+
+    private func detectStaleBackgroundAgyPids() -> [Int] {
+        let selfPid = Int(ProcessInfo.processInfo.processIdentifier)
+        var pids: [Int] = []
+        for proc in processController.inspector.allRunningProcesses() {
+            guard proc.id > 1, proc.id != selfPid else { continue }
+            guard proc.bundleId == nil else { continue }
+            let trimmedPath = proc.executablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPath.isEmpty else { continue }
+            let base = URL(fileURLWithPath: trimmedPath).lastPathComponent
+            guard Self.isAgyExecutableName(base) else { continue }
+            let args = processController.inspector.processArguments(pid: proc.id)
+            if Self.isAutoRespawnedAgyACPProcess(proc, arguments: args) {
+                continue
+            }
+            pids.append(proc.id)
+        }
+        return Array(Set(pids)).sorted()
+    }
+
     public func syncLiveAccount(registry: inout RegistryData) async -> String? {
-        guard let live = readLiveBundle() else {
+        let kcRead = readKeychainBundle()
+        let mirrorRead = readMirrorBundle()
+        let primaryBundle = kcRead.snapshot ?? mirrorRead.snapshot
+        let desktopIdentity = await probeLiveDesktopIdentity()
+
+        if primaryBundle == nil && desktopIdentity == nil {
+            setCurrentCredentialDrift(nil)
             registry.setActiveLive(accountId: nil, for: .antigravity)
             return nil
         }
 
-        // Fast offline identity from id_token first, then read-only userinfo if unexpired access_token exists.
-        var identity: GoogleIdentity?
-        if let idToken = live.idToken, let claims = Formatters.decodeJWTPayload(idToken),
-           let sub = nonEmpty(claims["sub"] as? String) {
-            let email = nonEmpty(claims["email"] as? String) ?? ""
-            let name = nonEmpty(claims["name"] as? String) ?? email
-            let picture = Formatters.sanitizedHTTPSURLString(claims["picture"] as? String)
-            identity = GoogleIdentity(
-                sub: sub,
-                email: email,
-                displayName: name.isEmpty ? sub : name,
-                pictureURL: picture
-            )
-        }
-
-        let existingMatchedAvatar = identity.flatMap { ident in
-            registry.accounts(for: .antigravity)
-                .first(where: { $0.id == ident.sub })
-                .flatMap { Formatters.sanitizedHTTPSURLString($0.avatarURL) }
-        }
-
-        if (identity == nil || (identity?.pictureURL == nil && existingMatchedAvatar == nil)),
-           let access = live.accessToken {
-            let stillValid = live.expiry.map { $0 > Date().addingTimeInterval(15) } ?? true
-            if stillValid,
-               let fetched = await resolveGoogleIdentity(accessToken: access, idToken: live.idToken) {
-                identity = fetched
+        // Resolve live Keychain/mirror identity offline FIRST:
+        // 1) JWT id_token claims if present;
+        // 2) Vaulted refresh_token SHA-256 match BEFORE hitting network resolveGoogleIdentity;
+        // 3) Network userinfo only if unmatched or avatar missing.
+        var keychainIdentity: GoogleIdentity?
+        if let bundle = primaryBundle {
+            if let sub = bundle.jwtSub {
+                let email = bundle.jwtEmail ?? ""
+                let name = bundle.jwtName ?? email
+                keychainIdentity = GoogleIdentity(
+                    sub: sub,
+                    email: email,
+                    displayName: name.isEmpty ? sub : name,
+                    pictureURL: bundle.jwtPictureURL
+                )
             }
-        }
 
-        // If live access_token expired and id_token absent, try matching by refresh_token SHA against vaulted accounts.
-        if identity == nil, let liveRT = live.refreshToken {
-            let liveDigest = Formatters.sha256Hex(liveRT)
-            for existing in registry.accounts(for: .antigravity) {
-                if let vaulted = try? keychain.readSecret(service: isolatedStoreNamespace, account: existing.id),
-                   Formatters.sha256Hex(vaulted) == liveDigest {
-                    identity = GoogleIdentity(
-                        sub: existing.id,
-                        email: existing.email,
-                        displayName: existing.displayName,
-                        pictureURL: existing.avatarURL
-                    )
-                    break
+            if keychainIdentity == nil,
+               let matchedVault = matchVaultedAccount(forRefreshToken: bundle.refreshToken, in: registry) {
+                keychainIdentity = GoogleIdentity(
+                    sub: matchedVault.id,
+                    email: matchedVault.email,
+                    displayName: matchedVault.displayName,
+                    pictureURL: matchedVault.avatarURL
+                )
+            }
+
+            let existingMatchedAvatar = keychainIdentity.flatMap { ident in
+                registry.accounts(for: .antigravity)
+                    .first(where: { $0.id == ident.sub })
+                    .flatMap { Formatters.sanitizedHTTPSURLString($0.avatarURL) }
+            }
+
+            if (keychainIdentity == nil || (keychainIdentity?.pictureURL == nil && existingMatchedAvatar == nil)),
+               let access = bundle.accessToken {
+                let stillValid = bundle.expiry.map { $0 > Date().addingTimeInterval(15) } ?? true
+                if stillValid,
+                   let fetched = await resolveGoogleIdentity(accessToken: access, idToken: bundle.idToken) {
+                    if keychainIdentity == nil {
+                        keychainIdentity = fetched
+                    } else if let current = keychainIdentity, fetched.sub == current.sub {
+                        keychainIdentity = GoogleIdentity(
+                            sub: current.sub,
+                            email: current.email.isEmpty ? fetched.email : current.email,
+                            displayName: current.displayName.isEmpty ? fetched.displayName : current.displayName,
+                            pictureURL: fetched.pictureURL ?? current.pictureURL
+                        )
+                    }
                 }
             }
         }
 
-        guard let resolved = identity else {
-            return nil
+        // Upsert/enrich Keychain identity in registry without prematurely overriding desktop truth.
+        if let resolvedKC = keychainIdentity {
+            if let existing = registry.accounts(for: .antigravity).first(where: { $0.id == resolvedKC.sub }) {
+                var updated = existing
+                if updated.email.isEmpty && !resolvedKC.email.isEmpty { updated.email = resolvedKC.email }
+                if updated.displayName.isEmpty && !resolvedKC.displayName.isEmpty { updated.displayName = resolvedKC.displayName }
+                if let newPicture = resolvedKC.pictureURL {
+                    updated.avatarURL = newPicture
+                }
+                registry.upsertAccount(updated)
+            } else {
+                registry.upsertAccount(
+                    AccountRecord(
+                        id: resolvedKC.sub,
+                        provider: .antigravity,
+                        email: resolvedKC.email,
+                        displayName: resolvedKC.displayName,
+                        plan: nil,
+                        addedAt: Date(),
+                        isActiveLive: false,
+                        avatarURL: resolvedKC.pictureURL
+                    )
+                )
+            }
         }
 
-        if let existing = registry.accounts(for: .antigravity).first(where: { $0.id == resolved.sub }) {
-            var updated = existing
-            if updated.email.isEmpty && !resolved.email.isEmpty { updated.email = resolved.email }
-            if updated.displayName.isEmpty && !resolved.displayName.isEmpty { updated.displayName = resolved.displayName }
-            if let newPicture = resolved.pictureURL {
-                updated.avatarURL = newPicture
+        // Desktop live truth precedence: if running Antigravity.app reports an email matching a
+        // registered account, mark THAT desktop account active so Pulsar never contradicts the open
+        // desktop window and immediately uses Tier 1 local RPC for it.
+        let matchedDesktopAccount: AccountRecord? = desktopIdentity.flatMap { desktop in
+            let targetLower = desktop.email.lowercased()
+            return registry.accounts(for: .antigravity).first {
+                !$0.email.isEmpty && $0.email.lowercased() == targetLower
             }
-            updated.isActiveLive = true
-            registry.upsertAccount(updated)
-        } else {
-            registry.upsertAccount(
-                AccountRecord(
-                    id: resolved.sub,
-                    provider: .antigravity,
-                    email: resolved.email,
-                    displayName: resolved.displayName,
-                    plan: nil,
-                    addedAt: Date(),
-                    isActiveLive: true,
-                    avatarURL: resolved.pictureURL
-                )
-            )
         }
-        registry.setActiveLive(accountId: resolved.sub, for: .antigravity)
-        return resolved.sub
+
+        let activeAccountId: String?
+        if desktopIdentity != nil {
+            if let matchedDesktopAccount {
+                activeAccountId = matchedDesktopAccount.id
+                registry.setActiveLive(accountId: matchedDesktopAccount.id, for: .antigravity)
+            } else {
+                // Desktop is signed into an account not yet imported into Pulsar:
+                // never mark a different Keychain account active or point repair at it.
+                activeAccountId = nil
+                registry.setActiveLive(accountId: nil, for: .antigravity)
+            }
+        } else if let resolvedKC = keychainIdentity {
+            activeAccountId = resolvedKC.sub
+            registry.setActiveLive(accountId: resolvedKC.sub, for: .antigravity)
+        } else {
+            activeAccountId = nil
+        }
+
+        // Reconcile desktop identity vs Keychain vs mirror file for credential drift detection.
+        let authoritativeEmail = nonEmpty(desktopIdentity?.email)
+            ?? nonEmpty(matchedDesktopAccount?.email)
+            ?? nonEmpty(keychainIdentity?.email)
+        let authoritativeAccountId = (desktopIdentity != nil) ? matchedDesktopAccount?.id : activeAccountId
+        let authoritativeDisplayName = nonEmpty(matchedDesktopAccount?.displayName)
+            ?? nonEmpty(desktopIdentity?.displayName)
+            ?? nonEmpty(keychainIdentity?.displayName)
+            ?? authoritativeEmail
+
+        let keychainEmail: String? = {
+            guard let kcSnap = kcRead.snapshot else { return nil }
+            if let resolvedEmail = nonEmpty(keychainIdentity?.email) {
+                return resolvedEmail
+            }
+            return kcSnap.jwtEmail ?? kcSnap.idTokenEmail
+        }()
+
+        let mirrorEmail: String? = {
+            guard let mirrorSnap = mirrorRead.snapshot else { return nil }
+            if let explicit = mirrorSnap.idTokenEmail ?? mirrorSnap.jwtEmail {
+                return explicit
+            }
+            return nonEmpty(matchVaultedAccount(forRefreshToken: mirrorSnap.refreshToken, in: registry)?.email)
+        }()
+
+        var detectedDrift: AntigravityCredentialDrift?
+        if let authEmail = authoritativeEmail {
+            let authLower = authEmail.lowercased()
+
+            // 1. Desktop vs Keychain mismatch
+            if let desktop = desktopIdentity,
+               keychainEmail?.lowercased() != desktop.email.lowercased() {
+                let stalePids = detectStaleBackgroundAgyPids()
+                let summary: String
+                if let kcEmail = keychainEmail {
+                    summary = "桌面端当前为 \(desktop.email)，但系统钥匙串仍指向 \(kcEmail)，点击修复可无感同步（不重启 Antigravity）"
+                } else {
+                    summary = "桌面端当前为 \(desktop.email)，但系统钥匙串凭证缺失，点击修复可无感同步（不重启 Antigravity）"
+                }
+                detectedDrift = AntigravityCredentialDrift(
+                    reason: .desktopKeychainMismatch,
+                    desktopAccountId: authoritativeAccountId,
+                    desktopEmail: desktop.email,
+                    desktopDisplayName: authoritativeDisplayName,
+                    keychainEmail: keychainEmail,
+                    mirrorEmail: mirrorEmail,
+                    staleBackgroundAgyPids: stalePids,
+                    summaryMessage: summary
+                )
+            }
+            // 2. Keychain stale metadata (`id_token_email` disagrees with authoritative active email)
+            else if let kcSnap = kcRead.snapshot,
+                    let kcMetaEmail = kcSnap.idTokenEmail,
+                    kcMetaEmail.lowercased() != authLower {
+                let stalePids = detectStaleBackgroundAgyPids()
+                let summary = "系统钥匙串元数据（id_token_email: \(kcMetaEmail)）与当前账号 \(authEmail) 不一致，建议一键修复"
+                detectedDrift = AntigravityCredentialDrift(
+                    reason: .staleMetadata,
+                    desktopAccountId: authoritativeAccountId,
+                    desktopEmail: authEmail,
+                    desktopDisplayName: authoritativeDisplayName,
+                    keychainEmail: kcMetaEmail,
+                    mirrorEmail: mirrorEmail,
+                    staleBackgroundAgyPids: stalePids,
+                    summaryMessage: summary
+                )
+            }
+            // 3. Mirror file mismatch (only check refresh_token & email metadata; NEVER flag normal hourly access_token/expiry refresh!)
+            else if mirrorRead.exists {
+                let mirrorCorrupt = (mirrorRead.snapshot == nil)
+                let refreshTokenMismatch: Bool = {
+                    guard let kcRT = kcRead.snapshot?.refreshToken,
+                          let mirrorSnap = mirrorRead.snapshot else {
+                        return false
+                    }
+                    return mirrorSnap.refreshToken != kcRT
+                }()
+                let mirrorMetaMismatch: Bool = {
+                    guard let mirrorSnap = mirrorRead.snapshot else { return false }
+                    if let metaEmail = mirrorSnap.idTokenEmail, metaEmail.lowercased() != authLower {
+                        return true
+                    }
+                    if let jwtEmail = mirrorSnap.jwtEmail, jwtEmail.lowercased() != authLower {
+                        return true
+                    }
+                    return false
+                }()
+
+                if mirrorCorrupt || refreshTokenMismatch || mirrorMetaMismatch {
+                    let stalePids = detectStaleBackgroundAgyPids()
+                    let summary: String
+                    if let mEmail = mirrorEmail, mEmail.lowercased() != authLower {
+                        summary = "本地镜像文件（jetski-standalone-oauth-token）仍指向 \(mEmail)，与当前账号 \(authEmail) 不一致，建议一键修复"
+                    } else {
+                        summary = "本地镜像文件（jetski-standalone-oauth-token）与系统钥匙串不一致，建议一键修复"
+                    }
+                    detectedDrift = AntigravityCredentialDrift(
+                        reason: .mirrorFileMismatch,
+                        desktopAccountId: authoritativeAccountId,
+                        desktopEmail: authEmail,
+                        desktopDisplayName: authoritativeDisplayName,
+                        keychainEmail: keychainEmail,
+                        mirrorEmail: mirrorEmail,
+                        staleBackgroundAgyPids: stalePids,
+                        summaryMessage: summary
+                    )
+                }
+            }
+        }
+
+        setCurrentCredentialDrift(detectedDrift)
+        return activeAccountId
     }
 
     public func importLiveAccount() async throws -> AccountRecord {
@@ -1038,10 +1373,126 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
     // MARK: Tier 1 — Local `language_server` Connect RPC
 
+    private struct LocalServerTarget {
+        let scheme: String
+        let port: Int
+    }
+
     private struct LocalServerEndpoint {
         let pid: Int
         let csrfToken: String
-        let ports: [Int]
+        let targets: [LocalServerTarget]
+    }
+
+    private struct LiveDesktopIdentity {
+        let email: String
+        let displayName: String?
+        let plan: PlanInfo?
+        let pid: Int
+    }
+
+    private enum LocalRPCResponse {
+        case success([String: Any])
+        case httpError(Int)
+        case transportError
+    }
+
+    /// Parses an Antigravity 2.34+ `daemon/hub_*.json` descriptor supporting both camelCase and snake_case keys.
+    public static func parseDaemonHubDescriptor(from data: Data) -> DaemonHubDescriptor? {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any] else {
+            return nil
+        }
+
+        guard let pid = parseExactInt(from: obj, keys: ["pid", "processId", "process_id"]),
+              pid > 1 else {
+            return nil
+        }
+
+        guard let csrfToken = nonEmptyStatic(obj["csrfToken"] as? String)
+            ?? nonEmptyStatic(obj["csrf_token"] as? String) else {
+            return nil
+        }
+
+        let rawHTTPSPort = parseExactInt(from: obj, keys: ["httpsPort", "https_port"])
+        let rawHTTPPort = parseExactInt(from: obj, keys: ["httpPort", "http_port"])
+        let httpsPort = rawHTTPSPort.flatMap { (1...65535).contains($0) ? $0 : nil }
+        let httpPort = rawHTTPPort.flatMap { (1...65535).contains($0) ? $0 : nil }
+        guard httpsPort != nil || httpPort != nil else {
+            return nil
+        }
+
+        let lsVersion = nonEmptyStatic(obj["lsVersion"] as? String)
+            ?? nonEmptyStatic(obj["ls_version"] as? String)
+
+        return DaemonHubDescriptor(
+            pid: pid,
+            httpsPort: httpsPort,
+            httpPort: httpPort,
+            csrfToken: csrfToken,
+            lsVersion: lsVersion
+        )
+    }
+
+    private static func parseExactInt(from dict: [String: Any], keys: [String]) -> Int? {
+        for key in keys {
+            if let num = dict[key] as? NSNumber,
+               CFGetTypeID(num) != CFBooleanGetTypeID() {
+                let d = num.doubleValue
+                if d.isFinite, d == floor(d), d >= Double(Int.min), d <= Double(Int.max) {
+                    return Int(d)
+                }
+            }
+            if let str = dict[key] as? String,
+               let parsed = Int(str.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return parsed
+            }
+        }
+        return nil
+    }
+
+    private static func isAntigravityLanguageServerProcess(_ proc: ClientProcessInfo) -> Bool {
+        let base = URL(fileURLWithPath: proc.executablePath).lastPathComponent.lowercased()
+        let lowerPath = proc.executablePath.lowercased()
+        guard base.hasPrefix("language_server") else {
+            return false
+        }
+        return lowerPath.contains("antigravity") || lowerPath.contains("/.gemini/")
+    }
+
+    private func probeLiveDesktopIdentity() async -> LiveDesktopIdentity? {
+        let endpoints = discoverLocalLanguageServerEndpoints()
+        guard !endpoints.isEmpty else { return nil }
+
+        for endpoint in endpoints {
+            for target in endpoint.targets {
+                let baseURL = "\(target.scheme)://127.0.0.1:\(target.port)/exa.language_server_pb.LanguageServerService"
+                let response = await postLocalRPCResult(
+                    urlString: "\(baseURL)/GetUserStatus",
+                    csrfToken: endpoint.csrfToken,
+                    body: [:]
+                )
+                guard case .success(let statusJSON) = response else {
+                    continue
+                }
+                let userStatus = (statusJSON["userStatus"] as? [String: Any]) ?? statusJSON
+                guard let email = nonEmpty(userStatus["email"] as? String)
+                    ?? nonEmpty(userStatus["userEmail"] as? String)
+                    ?? nonEmpty(userStatus["user_email"] as? String) else {
+                    continue
+                }
+                let displayName = nonEmpty(userStatus["name"] as? String)
+                    ?? nonEmpty(userStatus["displayName"] as? String)
+                    ?? nonEmpty(userStatus["display_name"] as? String)
+                let plan = Self.parsePlanFromUserStatus(userStatus)
+                return LiveDesktopIdentity(
+                    email: email,
+                    displayName: displayName,
+                    plan: plan,
+                    pid: endpoint.pid
+                )
+            }
+        }
+        return nil
     }
 
     private func fetchLocalRPCQuota(for account: AccountRecord) async -> QuotaSnapshot? {
@@ -1050,11 +1501,35 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         let version = resolveStableAppVersion()
         endpointLoop: for endpoint in endpoints {
-            for port in endpoint.ports {
-                for scheme in ["https", "http"] {
-                    let baseURL = "\(scheme)://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService"
+            for target in endpoint.targets {
+                let baseURL = "\(target.scheme)://127.0.0.1:\(target.port)/exa.language_server_pb.LanguageServerService"
 
-                    // 1. Probe with GetUnleashData.
+                // 1. Check GetUserStatus first (proves Connect RPC connectivity, verifies email match, extracts plan).
+                var resolvedPlan = account.plan
+                var userStatusObj: [String: Any]?
+                let statusResp = await postLocalRPCResult(
+                    urlString: "\(baseURL)/GetUserStatus",
+                    csrfToken: endpoint.csrfToken,
+                    body: [:]
+                )
+                switch statusResp {
+                case .success(let statusJSON):
+                    userStatusObj = statusJSON
+                    let userStatus = (statusJSON["userStatus"] as? [String: Any]) ?? statusJSON
+                    if let localEmail = nonEmpty(userStatus["email"] as? String)
+                        ?? nonEmpty(userStatus["userEmail"] as? String)
+                        ?? nonEmpty(userStatus["user_email"] as? String),
+                       !account.email.isEmpty,
+                       localEmail.lowercased() != account.email.lowercased() {
+                        // Local language_server belongs to a different account; try next endpoint instead of leaking!
+                        continue endpointLoop
+                    }
+                    if let plan = Self.parsePlanFromUserStatus(userStatus) {
+                        resolvedPlan = plan
+                    }
+
+                case .httpError:
+                    // Fallback probe via GetUnleashData only if server spoke HTTP on this target.
                     let probeBody: [String: Any] = [
                         "context": [
                             "properties": [
@@ -1072,86 +1547,68 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                         continue
                     }
 
-                    // 2. Check GetUserStatus to confirm email match & read plan info.
-                    var resolvedPlan = account.plan
-                    var userStatusObj: [String: Any]?
-                    if let statusJSON = await postLocalRPC(
-                        urlString: "\(baseURL)/GetUserStatus",
-                        csrfToken: endpoint.csrfToken,
-                        body: [:]
-                    ) {
-                        userStatusObj = statusJSON
-                        let userStatus = (statusJSON["userStatus"] as? [String: Any]) ?? statusJSON
-                        if let localEmail = nonEmpty(userStatus["email"] as? String),
-                           !account.email.isEmpty,
-                           localEmail.lowercased() != account.email.lowercased() {
-                            // Local language_server belongs to a different account; try next endpoint instead of leaking!
-                            continue endpointLoop
-                        }
-                        if let plan = Self.parsePlanFromUserStatus(userStatus) {
-                            resolvedPlan = plan
-                        }
-                    }
+                case .transportError:
+                    continue
+                }
 
-                    // 3. Call RetrieveUserQuotaSummary.
-                    if let summaryJSON = await postLocalRPC(
-                        urlString: "\(baseURL)/RetrieveUserQuotaSummary",
-                        csrfToken: endpoint.csrfToken,
-                        body: [:]
-                    ) {
-                        let now = Date()
-                        let windows = Self.parseQuotaSummaryWindows(from: summaryJSON, now: now)
-                        if !windows.isEmpty {
-                            let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
-                            return QuotaSnapshot(
-                                provider: .antigravity,
-                                accountId: account.id,
-                                plan: resolvedPlan,
-                                windows: windows,
-                                balance: nil,
-                                status: .ready(fetchedAt: now, stale: isStale),
-                                sourceLabel: "本地 RPC"
-                            )
-                        }
+                // 2. Call RetrieveUserQuotaSummary.
+                if let summaryJSON = await postLocalRPC(
+                    urlString: "\(baseURL)/RetrieveUserQuotaSummary",
+                    csrfToken: endpoint.csrfToken,
+                    body: [:]
+                ) {
+                    let now = Date()
+                    let windows = Self.parseQuotaSummaryWindows(from: summaryJSON, now: now)
+                    if !windows.isEmpty {
+                        let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
+                        return QuotaSnapshot(
+                            provider: .antigravity,
+                            accountId: account.id,
+                            plan: resolvedPlan,
+                            windows: windows,
+                            balance: nil,
+                            status: .ready(fetchedAt: now, stale: isStale),
+                            sourceLabel: "本地 RPC"
+                        )
                     }
+                }
 
-                    // 4. Fallback to GetUserStatus model configs or GetCommandModelConfigs.
-                    if let userStatusObj {
-                        let now = Date()
-                        let windows = Self.parseModelConfigWindows(from: userStatusObj, now: now)
-                        if !windows.isEmpty {
-                            let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
-                            return QuotaSnapshot(
-                                provider: .antigravity,
-                                accountId: account.id,
-                                plan: resolvedPlan,
-                                windows: windows,
-                                balance: nil,
-                                status: .ready(fetchedAt: now, stale: isStale),
-                                sourceLabel: "本地 RPC"
-                            )
-                        }
+                // 3. Fallback to GetUserStatus model configs or GetCommandModelConfigs.
+                if let userStatusObj {
+                    let now = Date()
+                    let windows = Self.parseModelConfigWindows(from: userStatusObj, now: now)
+                    if !windows.isEmpty {
+                        let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
+                        return QuotaSnapshot(
+                            provider: .antigravity,
+                            accountId: account.id,
+                            plan: resolvedPlan,
+                            windows: windows,
+                            balance: nil,
+                            status: .ready(fetchedAt: now, stale: isStale),
+                            sourceLabel: "本地 RPC"
+                        )
                     }
+                }
 
-                    if let cmdConfigsJSON = await postLocalRPC(
-                        urlString: "\(baseURL)/GetCommandModelConfigs",
-                        csrfToken: endpoint.csrfToken,
-                        body: [:]
-                    ) {
-                        let now = Date()
-                        let windows = Self.parseModelConfigWindows(from: cmdConfigsJSON, now: now)
-                        if !windows.isEmpty {
-                            let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
-                            return QuotaSnapshot(
-                                provider: .antigravity,
-                                accountId: account.id,
-                                plan: resolvedPlan,
-                                windows: windows,
-                                balance: nil,
-                                status: .ready(fetchedAt: now, stale: isStale),
-                                sourceLabel: "本地 RPC"
-                            )
-                        }
+                if let cmdConfigsJSON = await postLocalRPC(
+                    urlString: "\(baseURL)/GetCommandModelConfigs",
+                    csrfToken: endpoint.csrfToken,
+                    body: [:]
+                ) {
+                    let now = Date()
+                    let windows = Self.parseModelConfigWindows(from: cmdConfigsJSON, now: now)
+                    if !windows.isEmpty {
+                        let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
+                        return QuotaSnapshot(
+                            provider: .antigravity,
+                            accountId: account.id,
+                            plan: resolvedPlan,
+                            windows: windows,
+                            balance: nil,
+                            status: .ready(fetchedAt: now, stale: isStale),
+                            sourceLabel: "本地 RPC"
+                        )
                     }
                 }
             }
@@ -1161,13 +1618,77 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
     private func discoverLocalLanguageServerEndpoints() -> [LocalServerEndpoint] {
         let procs = processController.inspector.allRunningProcesses()
-        var endpoints: [LocalServerEndpoint] = []
+        var lsProcByPid: [Int: ClientProcessInfo] = [:]
+        for proc in procs where Self.isAntigravityLanguageServerProcess(proc) {
+            lsProcByPid[proc.id] = proc
+        }
 
+        var endpoints: [LocalServerEndpoint] = []
+        var discoveredPids = Set<Int>()
+        let fm = FileManager.default
+
+        // 1. Antigravity 2.34+ `daemon/hub_*.json` discovery (newest mtime first per dir).
+        for dir in paths.daemonDirectories {
+            guard let entries = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            let hubFiles = entries.filter { url in
+                let name = url.lastPathComponent
+                return name.hasPrefix("hub_") && name.hasSuffix(".json")
+            }
+
+            let sortedHubFiles = hubFiles.sorted { lhs, rhs in
+                let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if lDate != rDate {
+                    return lDate > rDate
+                }
+                return lhs.lastPathComponent > rhs.lastPathComponent
+            }
+
+            for fileURL in sortedHubFiles {
+                let isRegular = (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+                guard isRegular,
+                      let data = try? Data(contentsOf: fileURL),
+                      let desc = Self.parseDaemonHubDescriptor(from: data) else {
+                    continue
+                }
+
+                // Verify PID is alive AND matches a running Antigravity `language_server` process.
+                guard !discoveredPids.contains(desc.pid),
+                      processController.inspector.isProcessAlive(pid: desc.pid),
+                      lsProcByPid[desc.pid] != nil else {
+                    continue
+                }
+
+                var targets: [LocalServerTarget] = []
+                if let httpsPort = desc.httpsPort {
+                    targets.append(LocalServerTarget(scheme: "https", port: httpsPort))
+                }
+                if let httpPort = desc.httpPort {
+                    targets.append(LocalServerTarget(scheme: "http", port: httpPort))
+                }
+                guard !targets.isEmpty else { continue }
+
+                discoveredPids.insert(desc.pid)
+                endpoints.append(
+                    LocalServerEndpoint(
+                        pid: desc.pid,
+                        csrfToken: desc.csrfToken,
+                        targets: targets
+                    )
+                )
+            }
+        }
+
+        // 2. Classic `--csrf_token` argv discovery fallback for any remaining `language_server` PIDs.
         for proc in procs {
-            let base = URL(fileURLWithPath: proc.executablePath).lastPathComponent.lowercased()
-            let lowerPath = proc.executablePath.lowercased()
-            guard base.hasPrefix("language_server"),
-                  (lowerPath.contains("antigravity") || lowerPath.contains("/.gemini/")) else {
+            guard lsProcByPid[proc.id] != nil, !discoveredPids.contains(proc.id) else {
                 continue
             }
 
@@ -1179,12 +1700,26 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             var ports = Self.listeningTCPPorts(forPID: proc.id)
             if let extPortStr = Self.extractFlagValue(from: args, names: ["--extension_server_port", "--port"]),
                let extPort = Int(extPortStr),
+               (1...65535).contains(extPort),
                !ports.contains(extPort) {
                 ports.append(extPort)
             }
             guard !ports.isEmpty else { continue }
 
-            endpoints.append(LocalServerEndpoint(pid: proc.id, csrfToken: csrf, ports: ports))
+            var targets: [LocalServerTarget] = []
+            for port in ports {
+                targets.append(LocalServerTarget(scheme: "https", port: port))
+                targets.append(LocalServerTarget(scheme: "http", port: port))
+            }
+
+            discoveredPids.insert(proc.id)
+            endpoints.append(
+                LocalServerEndpoint(
+                    pid: proc.id,
+                    csrfToken: csrf,
+                    targets: targets
+                )
+            )
         }
 
         return endpoints
@@ -1244,9 +1779,20 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         csrfToken: String,
         body: [String: Any]
     ) async -> [String: Any]? {
+        if case .success(let obj) = await postLocalRPCResult(urlString: urlString, csrfToken: csrfToken, body: body) {
+            return obj
+        }
+        return nil
+    }
+
+    private func postLocalRPCResult(
+        urlString: String,
+        csrfToken: String,
+        body: [String: Any]
+    ) async -> LocalRPCResponse {
         guard let url = URL(string: urlString),
               let bodyData = try? JSONSerialization.data(withJSONObject: body, options: []) else {
-            return nil
+            return .transportError
         }
 
         var req = URLRequest(url: url)
@@ -1262,12 +1808,18 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         do {
             let (data, resp) = try await localRPCSession.data(for: req)
-            guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                return nil
+            guard let http = resp as? HTTPURLResponse else {
+                return .transportError
             }
-            return (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
+            guard (200...299).contains(http.statusCode) else {
+                return .httpError(http.statusCode)
+            }
+            guard let obj = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any] else {
+                return .httpError(http.statusCode)
+            }
+            return .success(obj)
         } catch {
-            return nil
+            return .transportError
         }
     }
 
@@ -1469,23 +2021,47 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         for account: AccountRecord,
         isActiveLive: Bool
     ) async throws -> RemoteAccessCredentials {
-        // Reuse valid live access_token for active account when available (saves an OAuth round-trip).
-        if isActiveLive, let live = readLiveBundle() {
-            if let liveAccess = live.accessToken,
-               let expiry = live.expiry,
-               expiry > Date().addingTimeInterval(60) {
+        // Reuse valid live access_token for active account ONLY when Keychain is positively verified to belong to `account`.
+        if isActiveLive, currentCredentialDrift == nil, let live = readLiveBundle() {
+            let vaultedRT = nonEmpty(try? keychain.readSecret(service: isolatedStoreNamespace, account: account.id))
+            let liveMatchesAccount: Bool = {
+                var positiveMatch = false
+
                 if let idToken = live.idToken,
                    let claims = Formatters.decodeJWTPayload(idToken),
                    let sub = nonEmpty(claims["sub"] as? String) {
-                    if sub == account.id {
-                        return RemoteAccessCredentials(accessToken: liveAccess, idToken: live.idToken)
-                    }
-                } else {
-                    return RemoteAccessCredentials(accessToken: liveAccess, idToken: live.idToken)
+                    guard sub == account.id else { return false }
+                    positiveMatch = true
                 }
+
+                if let liveRT = live.refreshToken, let vaultedRT {
+                    guard Formatters.sha256Hex(liveRT) == Formatters.sha256Hex(vaultedRT) else {
+                        return false
+                    }
+                    positiveMatch = true
+                }
+
+                if let metaEmail = nonEmpty(live.root["id_token_email"] as? String),
+                   !account.email.isEmpty {
+                    guard metaEmail.lowercased() == account.email.lowercased() else {
+                        return false
+                    }
+                    positiveMatch = true
+                }
+
+                // Fail closed: require at least one positive identity match before reusing live Keychain credentials.
+                return positiveMatch
+            }()
+
+            if liveMatchesAccount,
+               let liveAccess = live.accessToken,
+               let expiry = live.expiry,
+               expiry > Date().addingTimeInterval(60) {
+                return RemoteAccessCredentials(accessToken: liveAccess, idToken: live.idToken)
             }
-            if let liveRT = live.refreshToken,
-               (try? keychain.readSecret(service: isolatedStoreNamespace, account: account.id)) == nil {
+            if liveMatchesAccount,
+               let liveRT = live.refreshToken,
+               vaultedRT == nil {
                 let minted = try await refreshAccessToken(refreshToken: liveRT)
                 return RemoteAccessCredentials(accessToken: minted.accessToken, idToken: minted.idToken)
             }
@@ -2491,11 +3067,101 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         // Step 6.5: Gently send SIGTERM once to any currently running non-interactive `agy acp` worker
         // so `agy-bridge` immediately respawns it against the newly verified Keychain + fresh `writer_id`.
         recycleAutoRespawnedAgyACPProcesses(recorded: deferredAutoRespawnedACP)
+        setCurrentCredentialDrift(nil)
 
         // Step 7: Reopen ONLY filtered bundle(s) (by default Stable only; Insiders excluded unless explicitly enabled).
         await processController.reopenApps(urls: reopenURLs)
         let reopenedNames = reopenURLs.map { $0.deletingPathExtension().lastPathComponent }
         return .switched(reopenedApps: reopenedNames)
+    }
+
+    // MARK: - One-Click No-Restart Live Credential Repair
+
+    /// Repairs Keychain `(gemini, antigravity)` and `~/.gemini/jetski-standalone-oauth-token` drift
+    /// for `account` WITHOUT stopping or restarting `Antigravity.app` and WITHOUT sending `SIGKILL`.
+    public func repairLiveCredentials(for account: AccountRecord) async -> SwitchResult {
+        // Step 1: Read vaulted refresh_token for target account.
+        guard let storedRefresh = try? keychain.readSecret(service: isolatedStoreNamespace, account: account.id),
+              !storedRefresh.isEmpty else {
+            return .failed("未在钥匙串中找到目标 Antigravity 账号凭证，请重新添加或导入该账号")
+        }
+
+        // Step 2: Mint fresh access token via Google OAuth & verify `sub == account.id`.
+        let minted: TokenResponse
+        do {
+            minted = try await refreshAccessToken(refreshToken: storedRefresh)
+        } catch {
+            return .failed("目标账号令牌验证失败，未修改任何本地凭证: \(error.localizedDescription)")
+        }
+
+        guard let targetIdentity = await resolveGoogleIdentity(accessToken: minted.accessToken, idToken: minted.idToken) else {
+            return .failed("无法校验目标账号 Google 身份，已中止修复")
+        }
+        guard targetIdentity.sub == account.id else {
+            return .failed("目标凭证身份不匹配（安全校验失败），已中止修复")
+        }
+
+        let effectiveTargetRefresh = minted.refreshToken ?? storedRefresh
+        if effectiveTargetRefresh != storedRefresh {
+            try? keychain.writeSecret(service: isolatedStoreNamespace, account: account.id, value: effectiveTargetRefresh)
+        }
+        let targetExpiry = Date().addingTimeInterval(max(minted.expiresIn, 60.0))
+
+        // Step 3: Snapshot previous Keychain + mirror file for atomic rollback.
+        let kcRead = readKeychainBundle()
+        let mirrorRead = readMirrorBundle()
+        let previousKeychainRaw = kcRead.raw
+        let previousMirrorData = mirrorRead.raw
+        let previousWriterID = kcRead.snapshot?.writerID ?? mirrorRead.snapshot?.writerID
+        let baseRoot = kcRead.snapshot?.root ?? mirrorRead.snapshot?.root
+
+        // Step 4: Generate fresh rotated 43-char `writer_id` (`!= previousWriterID`) and build clean JSON.
+        let freshWriterID = Self.generateWriterID(excluding: previousWriterID)
+        let expectedEmail = nonEmpty(targetIdentity.email) ?? nonEmpty(account.email)
+
+        let bundleData: Data
+        do {
+            bundleData = try Self.buildUpdatedBundleJSON(
+                base: baseRoot,
+                accessToken: minted.accessToken,
+                refreshToken: effectiveTargetRefresh,
+                expiry: targetExpiry,
+                expiresIn: minted.expiresIn,
+                idToken: minted.idToken,
+                targetEmail: expectedEmail,
+                writerID: freshWriterID
+            )
+        } catch {
+            return .failed("构造 Antigravity 凭证失败: \(error.localizedDescription)")
+        }
+
+        // Step 5: Atomically write BOTH Keychain `(gemini, antigravity)` and mirror file (`0600`) + strict readback.
+        let encodedKeyring = Self.encodeGoKeyringValue(bundleData)
+        do {
+            try keychain.writeExternalGenericPassword(
+                service: Self.liveKeychainService,
+                account: Self.liveKeychainAccount,
+                value: encodedKeyring
+            )
+            try KeychainStore.writeAtomicFile(data: bundleData, to: paths.mirrorTokenURL, mode: 0o600)
+
+            try verifyLiveWriteReadback(
+                expectedRefreshToken: effectiveTargetRefresh,
+                expectedAccessToken: minted.accessToken,
+                expectedSub: account.id,
+                expectedEmail: expectedEmail,
+                expectedWriterID: freshWriterID,
+                previousWriterID: previousWriterID
+            )
+        } catch {
+            rollbackLiveCredentials(previousKeychainRaw: previousKeychainRaw, previousMirrorData: previousMirrorData)
+            return .failed("修复或校验 Antigravity 凭证失败，已回滚原凭证: \(error.localizedDescription)")
+        }
+
+        // Step 6: Gently send SIGTERM once to auto-respawned `agy acp` workers ONLY (never touch Antigravity.app, zero SIGKILL).
+        recycleAutoRespawnedAgyACPProcesses()
+        setCurrentCredentialDrift(nil)
+        return .switched(reopenedApps: [])
     }
 
     @discardableResult

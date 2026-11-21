@@ -4582,7 +4582,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.2.2", "AppStore.appVersion must match v1.2.2")
+        T.expectEqual(AppStore.appVersion, "1.2.3", "AppStore.appVersion must match v1.2.3")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -7032,6 +7032,1050 @@ private func testV122RegressionSuite() async {
     }
 }
 
+// MARK: - Test 19: v1.2.3 Regression Suite (Unlinked ProcArgs2 Fallback, Daemon Hub Local RPC, Desktop Truth & Drift Detection, No-Restart Repair)
+
+private func makeSyntheticProcArgs2Data(
+    argc: Int32,
+    execPath: String,
+    nulPaddingCount: Int = 3,
+    arguments: [String]
+) -> Data {
+    var data = Data()
+    var mutableArgc = argc
+    withUnsafeBytes(of: &mutableArgc) { data.append(contentsOf: $0) }
+    data.append(contentsOf: execPath.utf8)
+    data.append(contentsOf: [UInt8](repeating: 0, count: max(1, nulPaddingCount)))
+    for arg in arguments {
+        data.append(contentsOf: arg.utf8)
+        data.append(0)
+    }
+    // Append a realistic env entry after argv to verify parser stops cleanly at argc.
+    data.append(contentsOf: "HOME=/Users/example".utf8)
+    data.append(0)
+    return data
+}
+
+private func testV123RegressionSuite() async {
+    // 19.1 ProcessControl: KERN_PROCARGS2 parser (unlinked agy.<ts>.old + empty execPath fallback to argv[0])
+    T.suite("V123.ProcArgs2UnlinkedBinaryFallback") {
+        let unlinkedPath = "/Users/example/.local/bin/agy.1795227640703023000.old"
+        let normalBuf = makeSyntheticProcArgs2Data(
+            argc: 2,
+            execPath: unlinkedPath,
+            nulPaddingCount: 4,
+            arguments: ["agy", "daemon"]
+        )
+        let parsedNormal = LiveProcessInspector.parseProcArgs2Buffer(normalBuf)
+        T.expectEqual(parsedNormal.execPath, unlinkedPath, "parseProcArgs2Buffer must preserve unlinked execPath")
+        T.expectEqual(parsedNormal.arguments, ["agy", "daemon"], "parseProcArgs2Buffer must extract exact argc arguments")
+
+        // Verify unaligned Data slice (startIndex == 1) parses cleanly without alignment crash.
+        var padded = Data([0xAA])
+        padded.append(normalBuf)
+        let unalignedSlice = padded[1...]
+        let parsedSlice = LiveProcessInspector.parseProcArgs2Buffer(unalignedSlice)
+        T.expectEqual(parsedSlice.execPath, unlinkedPath, "unaligned Data slice must parse identically")
+        T.expectEqual(parsedSlice.arguments, ["agy", "daemon"])
+
+        // Empty execPath in KERN_PROCARGS2 -> caller falls back to arguments.first (`argv[0]`).
+        let emptyExecBuf = makeSyntheticProcArgs2Data(
+            argc: 3,
+            execPath: "",
+            nulPaddingCount: 4,
+            arguments: [unlinkedPath, "acp", "--process-per-session"]
+        )
+        let parsedEmptyExec = LiveProcessInspector.parseProcArgs2Buffer(emptyExecBuf)
+        T.expectEqual(parsedEmptyExec.execPath, "", "empty execPath must parse as empty string")
+        T.expectEqual(parsedEmptyExec.arguments, [unlinkedPath, "acp", "--process-per-session"])
+        let fallbackExec = parsedEmptyExec.execPath.isEmpty ? (parsedEmptyExec.arguments.first ?? "") : parsedEmptyExec.execPath
+        T.expectEqual(fallbackExec, unlinkedPath, "empty execPath must fall back to argv[0]")
+        T.expectEqual(
+            AntigravityProvider.isAgyExecutableName(URL(fileURLWithPath: fallbackExec).lastPathComponent),
+            true,
+            "fallback argv[0] basename must match isAgyExecutableName"
+        )
+
+        // Malformed / truncated / out-of-range argc buffers must fail closed.
+        T.expectEqual(LiveProcessInspector.parseProcArgs2Buffer(Data()).execPath, "")
+        T.expectEqual(LiveProcessInspector.parseProcArgs2Buffer(Data([1, 0, 0])).arguments.isEmpty, true)
+        let negArgc = makeSyntheticProcArgs2Data(argc: -1, execPath: unlinkedPath, arguments: ["agy"])
+        T.expectEqual(LiveProcessInspector.parseProcArgs2Buffer(negArgc).execPath, "")
+        let hugeArgc = makeSyntheticProcArgs2Data(argc: 9999, execPath: unlinkedPath, arguments: ["agy"])
+        T.expectEqual(LiveProcessInspector.parseProcArgs2Buffer(hugeArgc).execPath, "")
+    }
+
+    // 19.2 DaemonHubDescriptor parser (camelCase, snake_case, invalid rejection, port validation)
+    T.suite("V123.DaemonHubDescriptorParser") {
+        let camelJSON = Data("""
+        {"pid": 5432, "httpsPort": 51443, "httpPort": 51080, "csrfToken": "csrf_camel_tok", "lsVersion": "2.34.1"}
+        """.utf8)
+        let camelDesc = AntigravityProvider.parseDaemonHubDescriptor(from: camelJSON)
+        T.expectEqual(
+            camelDesc,
+            AntigravityProvider.DaemonHubDescriptor(
+                pid: 5432,
+                httpsPort: 51443,
+                httpPort: 51080,
+                csrfToken: "csrf_camel_tok",
+                lsVersion: "2.34.1"
+            ),
+            "camelCase hub_*.json must parse all fields"
+        )
+
+        let snakeJSON = Data("""
+        {"pid": 6789, "https_port": 0, "http_port": 52080, "csrf_token": "csrf_snake_tok", "ls_version": "2.34.2"}
+        """.utf8)
+        let snakeDesc = AntigravityProvider.parseDaemonHubDescriptor(from: snakeJSON)
+        T.expectEqual(
+            snakeDesc,
+            AntigravityProvider.DaemonHubDescriptor(
+                pid: 6789,
+                httpsPort: nil,
+                httpPort: 52080,
+                csrfToken: "csrf_snake_tok",
+                lsVersion: "2.34.2"
+            ),
+            "snake_case hub_*.json with https_port=0 must keep valid http_port"
+        )
+
+        // Invalid descriptors must return nil.
+        let invalidCases: [(String, String)] = [
+            ("pid <= 1", #"{"pid": 1, "httpsPort": 51443, "csrfToken": "tok"}"#),
+            ("empty csrfToken", #"{"pid": 5432, "httpsPort": 51443, "csrfToken": "   "}"#),
+            ("missing ports", #"{"pid": 5432, "csrfToken": "tok"}"#),
+            ("out-of-range ports", #"{"pid": 5432, "httpsPort": 70000, "httpPort": -5, "csrfToken": "tok"}"#),
+            ("boolean port", #"{"pid": 5432, "httpsPort": true, "csrfToken": "tok"}"#),
+            ("corrupt JSON", #"not-json"#),
+        ]
+        for (label, raw) in invalidCases {
+            T.expect(
+                AntigravityProvider.parseDaemonHubDescriptor(from: Data(raw.utf8)) == nil,
+                "invalid hub descriptor (\(label)) must return nil"
+            )
+        }
+    }
+
+    // 19.3 Local RPC `hub_*.json` discovery (ignores dead/reused PIDs, https->http port order, returns `本地 RPC` quota)
+    await T.asyncSuite("V123.DaemonHubLocalRPCDiscoveryAndPortOrder") {
+        let dir = try makeTempDir(prefix: "pulsar-v123-hub-rpc")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let stableApp = dir.appendingPathComponent("Antigravity.app", isDirectory: true)
+        try writeSyntheticASAR(to: stableApp.appendingPathComponent("Contents/Resources/app.asar"), version: "2.34.0")
+        let daemonDir = dir.appendingPathComponent(".gemini/antigravity/daemon", isDirectory: true)
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+
+        // 1. Dead PID hub file (must be ignored)
+        let deadHub = daemonDir.appendingPathComponent("hub_dead.json")
+        try Data(#"{"pid": 8801, "httpsPort": 59901, "httpPort": 59902, "csrfToken": "csrf_dead"}"#.utf8).write(to: deadHub)
+
+        // 2. Alive PID reused by unrelated process (must be ignored)
+        let reusedHub = daemonDir.appendingPathComponent("hub_reused.json")
+        try Data(#"{"pid": 8802, "httpsPort": 59903, "csrfToken": "csrf_reused"}"#.utf8).write(to: reusedHub)
+
+        // 3. Live Antigravity language_server PID with BOTH httpsPort (fails) and httpPort (succeeds) to test ordered targets
+        let liveHub = daemonDir.appendingPathComponent("hub_live.json")
+        try Data(#"{"pid": 8803, "httpsPort": 54321, "httpPort": 54322, "csrfToken": "csrf_live_234", "lsVersion": "2.34.0"}"#.utf8).write(to: liveHub)
+
+        let inspector = MockProcessInspector()
+        inspector.processes = [
+            ClientProcessInfo(id: 8802, name: "python3", executablePath: "/usr/bin/python3"),
+            ClientProcessInfo(
+                id: 8803,
+                name: "language_server_macos_arm",
+                executablePath: stableApp.appendingPathComponent("Contents/Resources/bin/language_server_macos_arm").path
+            ),
+        ]
+
+        let futureReset = Formatters.formatRFC3339UTC(Date().addingTimeInterval(4 * 3600))
+        let weeklyReset = Formatters.formatRFC3339UTC(Date().addingTimeInterval(5 * 86_400))
+        StubURLProtocol.reset { req, _ in
+            let urlStr = req.url?.absoluteString ?? ""
+            let csrf = req.value(forHTTPHeaderField: "X-Codeium-Csrf-Token") ?? ""
+            let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            // Simulate HTTPS port refusing / failing so provider MUST fall back to HTTP port in order!
+            if urlStr.hasPrefix("https://127.0.0.1:54321/") {
+                throw URLError(.cannotConnectToHost)
+            }
+            if urlStr.hasPrefix("http://127.0.0.1:54322/"), csrf == "csrf_live_234" {
+                if urlStr.hasSuffix("/GetUserStatus") {
+                    return resp(200, [
+                        "userStatus": [
+                            "email": "snow@example.com",
+                            "name": "Snow",
+                            "userTier": ["id": "g1-ultra-tier", "name": "Google AI Ultra"],
+                        ],
+                    ])
+                }
+                if urlStr.hasSuffix("/RetrieveUserQuotaSummary") {
+                    return resp(200, [
+                        "response": [
+                            "groups": [
+                                [
+                                    "displayName": "Gemini",
+                                    "buckets": [
+                                        ["window": "5h", "remainingFraction": 0.88, "resetTime": futureReset],
+                                        ["window": "weekly", "remainingFraction": 0.94, "resetTime": weeklyReset],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ])
+                }
+            }
+            return resp(404, [:])
+        }
+
+        let paths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: dir.appendingPathComponent("Insiders.app"),
+            agyCLIURL: dir.appendingPathComponent("agy"),
+            mirrorTokenURL: dir.appendingPathComponent("mirror"),
+            daemonDirectories: [daemonDir]
+        )
+        let provider = AntigravityProvider(
+            keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+            processController: ProcessController(inspector: inspector, selfPid: 9999),
+            paths: paths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+        let snowAcct = AccountRecord(id: "sub-snow", provider: .antigravity, email: "snow@example.com", displayName: "Snow")
+        let snap = await provider.fetchQuota(for: snowAcct, isActiveLive: true)
+
+        T.expect(snap.status.isReady, "hub_*.json local RPC must return ready quota")
+        T.expectEqual(snap.sourceLabel, "本地 RPC", "hub_*.json discovery must report 本地 RPC source")
+        T.expectEqual(snap.plan?.kind, .ultra)
+        T.expectEqual(snap.primaryRemainingPercent, 88)
+
+        let reqURLs = StubURLProtocol.snapshotRequests().compactMap { $0.request.url?.absoluteString }
+        T.expect(!reqURLs.contains { $0.contains("59901") || $0.contains("59902") }, "dead PID hub file must NEVER be probed")
+        T.expect(!reqURLs.contains { $0.contains("59903") }, "PID reused by non-language_server must NEVER be probed")
+        let httpsIdx = reqURLs.firstIndex { $0.hasPrefix("https://127.0.0.1:54321/") }
+        let httpIdx = reqURLs.firstIndex { $0.hasPrefix("http://127.0.0.1:54322/") }
+        T.expect(httpsIdx != nil && httpIdx != nil && httpsIdx! < httpIdx!, "httpsPort MUST be tried before httpPort")
+    }
+
+    // 19.4 syncLiveAccount drift detection, offline vaulted refresh_token SHA-256 matching & desktop truth precedence
+    await T.asyncSuite("V123.SyncLiveAccountDriftAndDesktopTruth") {
+        let dir = try makeTempDir(prefix: "pulsar-v123-drift")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let stableApp = dir.appendingPathComponent("Antigravity.app", isDirectory: true)
+        try writeSyntheticASAR(to: stableApp.appendingPathComponent("Contents/Resources/app.asar"), version: "2.34.0")
+        let daemonDir = dir.appendingPathComponent(".gemini/antigravity/daemon", isDirectory: true)
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        let mirrorURL = dir.appendingPathComponent(".gemini/jetski-standalone-oauth-token")
+
+        let lsPID = 8901
+        let staleAgyPID = 668
+        let bridgePID = 8902
+        let acpPID = 8903
+        try Data(#"{"pid": 8901, "httpsPort": 54443, "csrfToken": "csrf_drift_test"}"#.utf8)
+            .write(to: daemonDir.appendingPathComponent("hub_8901.json"))
+
+        let inspector = MockProcessInspector()
+        inspector.processes = [
+            ClientProcessInfo(
+                id: lsPID,
+                name: "language_server_macos_arm",
+                executablePath: stableApp.appendingPathComponent("Contents/Resources/bin/language_server_macos_arm").path
+            ),
+            ClientProcessInfo(
+                id: staleAgyPID,
+                name: "agy.1795227640703023000.old",
+                executablePath: "/Users/example/.local/bin/agy.1795227640703023000.old",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+            ClientProcessInfo(
+                id: bridgePID,
+                name: "agy-bridge",
+                executablePath: "/opt/homebrew/bin/agy-bridge",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+            ClientProcessInfo(
+                id: acpPID,
+                name: "agy",
+                executablePath: "/Users/example/.local/bin/agy",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+        ]
+        inspector.argsByPid = [
+            staleAgyPID: ["agy"],
+            bridgePID: ["agy-bridge", "serve"],
+            acpPID: ["agy", "acp", "--process-per-session"],
+        ]
+
+        let backend = InMemoryKeychainBackend()
+        let kc = KeychainStore(backend: backend)
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-snow", value: "rt_snow_vault")
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-rory", value: "rt_rory_vault")
+
+        let writeLiveBundle: ([String: Any], [String: Any]?) throws -> Void = { kcObj, mirrorObj in
+            let kcData = try JSONSerialization.data(withJSONObject: kcObj, options: [.sortedKeys])
+            try kc.writeExternalGenericPassword(
+                service: AntigravityProvider.liveKeychainService,
+                account: AntigravityProvider.liveKeychainAccount,
+                value: AntigravityProvider.encodeGoKeyringValue(kcData)
+            )
+            if let mirrorObj {
+                let mData = try JSONSerialization.data(withJSONObject: mirrorObj, options: [.sortedKeys])
+                try KeychainStore.writeAtomicFile(data: mData, to: mirrorURL, mode: 0o600)
+            } else {
+                try? FileManager.default.removeItem(at: mirrorURL)
+            }
+        }
+
+        let futureExpiry = Formatters.formatRFC3339Local(Date().addingTimeInterval(3600))
+        let pastExpiry = Formatters.formatRFC3339Local(Date().addingTimeInterval(-300))
+        let futureReset = Formatters.formatRFC3339UTC(Date().addingTimeInterval(4 * 3600))
+        StubURLProtocol.reset { req, _ in
+            let urlStr = req.url?.absoluteString ?? ""
+            let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            if urlStr.hasPrefix("https://127.0.0.1:54443/") {
+                if urlStr.hasSuffix("/GetUserStatus") {
+                    return resp(200, [
+                        "userStatus": [
+                            "email": "snow@example.com",
+                            "name": "Snow",
+                            "userTier": ["id": "g1-ultra-tier", "name": "Google AI Ultra"],
+                        ],
+                    ])
+                }
+                if urlStr.hasSuffix("/RetrieveUserQuotaSummary") {
+                    return resp(200, [
+                        "response": [
+                            "groups": [
+                                [
+                                    "displayName": "Gemini",
+                                    "buckets": [
+                                        ["window": "5h", "remainingFraction": 0.91, "resetTime": futureReset],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ])
+                }
+            }
+            return resp(404, [:])
+        }
+
+        let paths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: dir.appendingPathComponent("Insiders.app"),
+            agyCLIURL: dir.appendingPathComponent("agy"),
+            mirrorTokenURL: mirrorURL,
+            daemonDirectories: [daemonDir]
+        )
+        let provider = AntigravityProvider(
+            keychain: kc,
+            processController: ProcessController(inspector: inspector, selfPid: 9999),
+            paths: paths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+
+        var reg = RegistryData(accounts: [
+            AccountRecord(
+                id: "sub-snow",
+                provider: .antigravity,
+                email: "snow@example.com",
+                displayName: "Snow",
+                isActiveLive: false,
+                avatarURL: "https://lh3.googleusercontent.com/snow.png"
+            ),
+            AccountRecord(
+                id: "sub-rory",
+                provider: .antigravity,
+                email: "rorywangdev@example.com",
+                displayName: "rorywangdev",
+                isActiveLive: true,
+                avatarURL: "https://lh3.googleusercontent.com/rory.png"
+            ),
+        ])
+
+        // 4a. Desktop Snow vs Keychain rorywangdev (no id_token in Keychain -> offline SHA-256 match, ZERO userinfo calls)
+        let roryBundle: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_rory_1111111111111111111111111111111",
+            "id_token_email": "rorywangdev@example.com",
+            "token": [
+                "access_token": "at_rory_1",
+                "refresh_token": "rt_rory_vault",
+                "expiry": futureExpiry,
+            ],
+        ]
+        try writeLiveBundle(roryBundle, roryBundle)
+
+        let liveId = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(liveId, "sub-snow", "desktop truth must mark Snow active even when Keychain holds rorywangdev")
+        T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-snow" }?.isActiveLive, true)
+        T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-rory" }?.isActiveLive, false)
+
+        let userInfoCalls = StubURLProtocol.snapshotRequests().filter {
+            $0.request.url?.absoluteString.contains("oauth2/v2/userinfo") == true
+        }
+        T.expectEqual(userInfoCalls.count, 0, "offline vaulted refresh_token SHA-256 match must skip Google userinfo when avatar exists")
+
+        let drift4a = provider.currentCredentialDrift
+        T.expectEqual(drift4a?.reason, .desktopKeychainMismatch, "must flag .desktopKeychainMismatch")
+        T.expectEqual(drift4a?.desktopAccountId, "sub-snow")
+        T.expectEqual(drift4a?.desktopEmail, "snow@example.com")
+        T.expectEqual(drift4a?.keychainEmail, "rorywangdev@example.com")
+        T.expectEqual(drift4a?.mirrorEmail, "rorywangdev@example.com")
+        T.expectEqual(drift4a?.staleBackgroundAgyPids, [668], "must detect PID 668 and exclude agy-bridge & agy acp")
+
+        // Active desktop Snow immediately gets 本地 RPC quota even before repair.
+        let snowAcct = reg.accounts(for: .antigravity).first { $0.id == "sub-snow" }!
+        let snowSnap = await provider.fetchQuota(for: snowAcct, isActiveLive: true)
+        T.expectEqual(snowSnap.sourceLabel, "本地 RPC")
+        T.expectEqual(snowSnap.primaryRemainingPercent, 91)
+
+        // 4b. Keychain matches Snow's refresh_token, but Keychain id_token_email is stale -> .staleMetadata
+        let staleMetaKC: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_snow_1111111111111111111111111111111",
+            "id_token_email": "rorywangdev@example.com",
+            "token": [
+                "access_token": "at_snow_1",
+                "refresh_token": "rt_snow_vault",
+                "expiry": futureExpiry,
+            ],
+        ]
+        try writeLiveBundle(staleMetaKC, nil)
+        _ = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(provider.currentCredentialDrift?.reason, .staleMetadata, "stale Keychain id_token_email must flag .staleMetadata")
+
+        // 4c. Keychain is clean Snow, mirror file has stale id_token_email -> .mirrorFileMismatch
+        let cleanSnowKC: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_snow_2222222222222222222222222222222",
+            "id_token_email": "snow@example.com",
+            "token": [
+                "access_token": "at_snow_hour2",
+                "refresh_token": "rt_snow_vault",
+                "expiry": futureExpiry,
+            ],
+        ]
+        let staleMirrorEmail: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_snow_1111111111111111111111111111111",
+            "id_token_email": "rorywangdev@example.com",
+            "token": [
+                "access_token": "at_snow_hour1",
+                "refresh_token": "rt_snow_vault",
+                "expiry": pastExpiry,
+            ],
+        ]
+        try writeLiveBundle(cleanSnowKC, staleMirrorEmail)
+        _ = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(provider.currentCredentialDrift?.reason, .mirrorFileMismatch, "stale mirror id_token_email must flag .mirrorFileMismatch")
+        T.expectEqual(provider.currentCredentialDrift?.mirrorEmail, "rorywangdev@example.com")
+
+        // 4c-ii. Mirror file has stale refresh_token (even when id_token_email is absent) -> .mirrorFileMismatch
+        let staleMirrorRT: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_snow_1111111111111111111111111111111",
+            "token": [
+                "access_token": "at_rory_old",
+                "refresh_token": "rt_rory_vault",
+                "expiry": pastExpiry,
+            ],
+        ]
+        try writeLiveBundle(cleanSnowKC, staleMirrorRT)
+        _ = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(provider.currentCredentialDrift?.reason, .mirrorFileMismatch, "mismatched mirror refresh_token must flag .mirrorFileMismatch")
+        T.expectEqual(provider.currentCredentialDrift?.mirrorEmail, "rorywangdev@example.com")
+
+        // 4d. Normal hourly Keychain refresh (different access_token / expiry / writer_id, same refresh_token & matching id_token_email) -> nil drift!
+        let normalHourlyMirror: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_snow_1111111111111111111111111111111",
+            "id_token_email": "snow@example.com",
+            "token": [
+                "access_token": "at_snow_hour1_old",
+                "refresh_token": "rt_snow_vault",
+                "expiry": pastExpiry,
+            ],
+        ]
+        try writeLiveBundle(cleanSnowKC, normalHourlyMirror)
+        _ = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(provider.currentCredentialDrift, nil, "normal hourly Keychain refresh must produce ZERO false-positive drift")
+    }
+
+    // 19.5 repairLiveCredentials(for:), AppStore.repairAntigravityCredentialDrift(), rollback on write error & MenuBarView drift banner widths
+    await T.asyncSuite("V123.RepairLiveCredentialsAndRollback") {
+        let dir = try makeTempDir(prefix: "pulsar-v123-repair")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let stableApp = dir.appendingPathComponent("Antigravity.app", isDirectory: true)
+        try writeSyntheticASAR(to: stableApp.appendingPathComponent("Contents/Resources/app.asar"), version: "2.34.0")
+        let binDir = stableApp.appendingPathComponent("Contents/Resources/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try Data("GOCSPX-1234567890abcdefghijklmnopqr".utf8).write(to: binDir.appendingPathComponent("language_server"))
+
+        let daemonDir = dir.appendingPathComponent(".gemini/antigravity/daemon", isDirectory: true)
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        try Data(#"{"pid": 9002, "httpsPort": 54555, "csrfToken": "csrf_repair_test"}"#.utf8)
+            .write(to: daemonDir.appendingPathComponent("hub_9002.json"))
+
+        let mirrorURL = dir.appendingPathComponent(".gemini/jetski-standalone-oauth-token")
+        let backend = InMemoryKeychainBackend()
+        let kc = KeychainStore(backend: backend)
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-snow", value: "rt_snow_seed")
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-rory", value: "rt_rory_seed")
+
+        let oldWriterID = "old_drift_writer_0123456789abcdefghijklmnop"
+        let driftedObj: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": oldWriterID,
+            "id_token_email": "rorywangdev@example.com",
+            "polluted_field": "must_strip",
+            "token": [
+                "access_token": "at_rory_stale",
+                "refresh_token": "rt_rory_seed",
+                "expiry": Formatters.formatRFC3339Local(Date().addingTimeInterval(3600)),
+            ],
+        ]
+        let driftedData = try JSONSerialization.data(withJSONObject: driftedObj, options: [.sortedKeys])
+        let driftedKCRaw = AntigravityProvider.encodeGoKeyringValue(driftedData)
+        try kc.writeExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount,
+            value: driftedKCRaw
+        )
+        try KeychainStore.writeAtomicFile(data: driftedData, to: mirrorURL, mode: 0o600)
+
+        let snowIDToken = makeUnsignedJWT(payload: [
+            "sub": "sub-snow",
+            "email": "snow@example.com",
+            "name": "Snow",
+        ])
+        let futureReset = Formatters.formatRFC3339UTC(Date().addingTimeInterval(4 * 3600))
+        StubURLProtocol.reset { req, bodyData in
+            let urlStr = req.url?.absoluteString ?? ""
+            let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            if urlStr.contains("oauth2.googleapis.com/token") {
+                let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
+                if bodyStr.contains("roryorbit_client_secret_probe") {
+                    return resp(400, ["error": "invalid_grant"])
+                }
+                return resp(200, [
+                    "access_token": "at_snow_repaired",
+                    "refresh_token": "rt_snow_repaired",
+                    "expires_in": 3600,
+                    "id_token": snowIDToken,
+                ])
+            }
+            if urlStr.contains("googleapis.com/oauth2/v2/userinfo") {
+                return resp(200, [
+                    "id": "sub-snow",
+                    "email": "snow@example.com",
+                    "name": "Snow",
+                ])
+            }
+            if urlStr.hasPrefix("https://127.0.0.1:54555/") {
+                if urlStr.hasSuffix("/GetUserStatus") {
+                    return resp(200, [
+                        "userStatus": [
+                            "email": "snow@example.com",
+                            "name": "Snow",
+                            "userTier": ["id": "g1-ultra-tier", "name": "Google AI Ultra"],
+                        ],
+                    ])
+                }
+                if urlStr.hasSuffix("/RetrieveUserQuotaSummary") {
+                    return resp(200, [
+                        "response": [
+                            "groups": [
+                                [
+                                    "displayName": "Gemini",
+                                    "buckets": [
+                                        ["window": "5h", "remainingFraction": 0.95, "resetTime": futureReset],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ])
+                }
+            }
+            return resp(404, [:])
+        }
+
+        let guiPID = 9001
+        let lsPID = 9002
+        let bridgePID = 9003
+        let acpPID = 9004
+        let nonAcpAgyPID = 668
+        let inspector = MockProcessInspector()
+        inspector.guiApps = [
+            RunningGUIApp(
+                pid: guiPID,
+                bundleId: AntigravityProvider.stableBundleId,
+                localizedName: "Antigravity",
+                bundleURL: stableApp,
+                executablePath: stableApp.appendingPathComponent("Contents/MacOS/Antigravity").path
+            ),
+        ]
+        inspector.processes = [
+            ClientProcessInfo(
+                id: guiPID,
+                name: "Antigravity",
+                executablePath: stableApp.appendingPathComponent("Contents/MacOS/Antigravity").path,
+                bundleId: AntigravityProvider.stableBundleId
+            ),
+            ClientProcessInfo(
+                id: lsPID,
+                name: "language_server",
+                executablePath: binDir.appendingPathComponent("language_server").path
+            ),
+            ClientProcessInfo(
+                id: bridgePID,
+                name: "agy-bridge",
+                executablePath: "/opt/homebrew/bin/agy-bridge"
+            ),
+            ClientProcessInfo(
+                id: acpPID,
+                name: "agy",
+                executablePath: "/Users/example/.local/bin/agy",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+            ClientProcessInfo(
+                id: nonAcpAgyPID,
+                name: "agy.1795227640703023000.old",
+                executablePath: "/Users/example/.local/bin/agy.1795227640703023000.old",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+        ]
+        inspector.argsByPid = [
+            bridgePID: ["agy-bridge", "serve"],
+            acpPID: ["agy", "acp", "--process-per-session"],
+            nonAcpAgyPID: ["agy"],
+        ]
+
+        // 5a. Rollback test: mirror path is a directory -> write fails -> Keychain MUST roll back cleanly with ZERO signals!
+        let blockingDirMirror = dir.appendingPathComponent("unwritable-mirror-dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockingDirMirror, withIntermediateDirectories: true)
+        let rollbackPaths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: dir.appendingPathComponent("Insiders.app"),
+            agyCLIURL: dir.appendingPathComponent("agy"),
+            mirrorTokenURL: blockingDirMirror,
+            daemonDirectories: [daemonDir]
+        )
+        let rollbackProvider = AntigravityProvider(
+            keychain: kc,
+            processController: ProcessController(inspector: inspector, selfPid: 9999),
+            paths: rollbackPaths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+        let snowRecord = AccountRecord(
+            id: "sub-snow",
+            provider: .antigravity,
+            email: "snow@example.com",
+            displayName: "Snow",
+            avatarURL: "https://lh3.googleusercontent.com/snow.png"
+        )
+        let rollbackRes = await rollbackProvider.repairLiveCredentials(for: snowRecord)
+        if case .failed = rollbackRes {
+            T.expect(true)
+        } else {
+            T.expect(false, "repairLiveCredentials must fail when mirror write fails, got \(rollbackRes)")
+        }
+        let kcAfterRollback = try kc.readExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount
+        )
+        T.expectEqual(kcAfterRollback, driftedKCRaw, "failed repair MUST roll back Keychain to exact previous payload")
+        T.expectEqual(inspector.signalsSent.count, 0, "failed repair must send ZERO signals")
+        T.expectEqual(inspector.terminateRequests.count, 0, "failed repair must NEVER touch Antigravity.app")
+
+        // Reset vaulted seed for clean success test (repair rotated vault before write failed)
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-snow", value: "rt_snow_seed")
+
+        // 5b. Full AppStore + AntigravityProvider drift detection -> one-click repair -> clean clear!
+        let repairPaths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: dir.appendingPathComponent("Insiders.app"),
+            agyCLIURL: dir.appendingPathComponent("agy"),
+            mirrorTokenURL: mirrorURL,
+            daemonDirectories: [daemonDir]
+        )
+        let repairProvider = AntigravityProvider(
+            keychain: kc,
+            processController: ProcessController(inspector: inspector, selfPid: 9999),
+            paths: repairPaths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+        let regURL = dir.appendingPathComponent("registry.json")
+        let initialReg = RegistryData(accounts: [
+            snowRecord,
+            AccountRecord(
+                id: "sub-rory",
+                provider: .antigravity,
+                email: "rorywangdev@example.com",
+                displayName: "rorywangdev",
+                isActiveLive: true,
+                avatarURL: "https://lh3.googleusercontent.com/rory.png"
+            ),
+        ])
+        try initialReg.save(to: regURL)
+
+        let store = await MainActor.run {
+            AppStore(
+                keychain: kc,
+                processController: ProcessController(inspector: inspector, selfPid: 9999),
+                adapters: [.antigravity: repairProvider],
+                registryURL: regURL,
+                startScheduler: false,
+                persistAccountPoolExport: false
+            )
+        }
+
+        await store.refreshProvider(.antigravity, persistExport: false)
+        let detectedDrift = await MainActor.run { store.antigravityCredentialDrift }
+        T.expectEqual(detectedDrift?.reason, .desktopKeychainMismatch, "AppStore must propagate antigravityCredentialDrift")
+        T.expectEqual(detectedDrift?.desktopAccountId, "sub-snow")
+        T.expectEqual(detectedDrift?.staleBackgroundAgyPids, [668])
+
+        await store.repairAntigravityCredentialDrift()
+
+        let driftAfterRepair = await MainActor.run { store.antigravityCredentialDrift }
+        let bannerAfterRepair = await MainActor.run { store.operationBanner ?? "" }
+        let bannerIsError = await MainActor.run { store.operationBannerIsError }
+        T.expectEqual(driftAfterRepair, nil, "successful repair must clear AppStore.antigravityCredentialDrift")
+        T.expectEqual(repairProvider.currentCredentialDrift, nil, "successful repair must clear provider.currentCredentialDrift")
+        T.expectEqual(bannerIsError, false, "repair banner must be non-error")
+        T.expect(bannerAfterRepair.contains("无感修复"), "repair banner must confirm silent no-restart repair")
+
+        // Verify Keychain + mirror contents, rotated 43-char writer_id, 0600 mode, and strict zero-restart signal invariants.
+        let repairedKCRaw = try kc.readExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount
+        )
+        let repairedKCData = repairedKCRaw.flatMap { AntigravityProvider.decodeGoKeyringValue($0) }
+        let repairedMirrorData = try Data(contentsOf: mirrorURL)
+        T.expectEqual(repairedKCData, repairedMirrorData, "repaired Keychain and mirror file must match byte-for-byte")
+
+        let repairedObj = try JSONSerialization.jsonObject(with: repairedMirrorData, options: []) as? [String: Any]
+        let newWriterID = repairedObj?["writer_id"] as? String ?? ""
+        T.expectEqual(newWriterID.count, 43, "repaired writer_id must be 43 chars")
+        T.expect(newWriterID != oldWriterID, "repaired writer_id must rotate away from old writer_id")
+        T.expectEqual(repairedObj?["id_token_email"] as? String, "snow@example.com")
+        T.expect(repairedObj?["polluted_field"] == nil, "polluted field must be stripped during repair")
+        let repairedToken = repairedObj?["token"] as? [String: Any]
+        T.expectEqual(repairedToken?["access_token"] as? String, "at_snow_repaired")
+        T.expectEqual(repairedToken?["refresh_token"] as? String, "rt_snow_repaired")
+        let repairedPerms = (try FileManager.default.attributesOfItem(atPath: mirrorURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        T.expectEqual(repairedPerms, 0o600, "repaired mirror file mode must remain 0600")
+
+        // Signal invariants: ONLY SIGTERM to `agy acp` (9004); NEVER touch Antigravity.app, language_server, agy-bridge, or PID 668; ZERO SIGKILL; ZERO relaunches!
+        T.expectEqual(inspector.terminateRequests.count, 0, "repairLiveCredentials must NEVER terminate Antigravity.app")
+        T.expectEqual(inspector.reopenedURLs.count, 0, "repairLiveCredentials must NEVER restart/reopen apps")
+        T.expect(inspector.signalsSent.allSatisfy { $0.signal == SIGTERM }, "repairLiveCredentials must send ZERO SIGKILL signals")
+        T.expectEqual(inspector.signalsSent.map(\.pid), [acpPID], "repairLiveCredentials must gently SIGTERM ONLY auto-respawned agy acp")
+
+        // Verify drift banner Row 1 fits cleanly inside 340pt narrow popover inner width (340 - 2*9 - 2*9 = 304pt) without clipping.
+        let narrowTitleW = ceil(("钥匙串与桌面账号不一致" as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]).width)
+        let narrowBtnTextW = ceil(("一键修复钥匙串" as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .semibold)]).width)
+        let estimatedRow1W = 14.0 + 6.0 + narrowTitleW + 4.0 + (narrowBtnTextW + 30.0)
+        T.expect(estimatedRow1W < 304.0, "340pt drift banner header row (\(estimatedRow1W)pt) must fit comfortably inside 304pt inner width")
+    }
+
+    // 19.6 Defensive Edge Cases: Unregistered Desktop Account Guard & Fail-Closed Remote Token Match
+    await T.asyncSuite("V123.UnregisteredDesktopAndFailClosedRemoteTokenGuard") {
+        let dir = try makeTempDir(prefix: "pulsar-v123-edge")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let stableApp = dir.appendingPathComponent("Antigravity.app", isDirectory: true)
+        try writeSyntheticASAR(to: stableApp.appendingPathComponent("Contents/Resources/app.asar"), version: "2.34.0")
+        let binDir = stableApp.appendingPathComponent("Contents/Resources/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try Data("GOCSPX-1234567890abcdefghijklmnopqr".utf8).write(to: binDir.appendingPathComponent("language_server"))
+
+        let daemonDir = dir.appendingPathComponent(".gemini/antigravity/daemon", isDirectory: true)
+        try FileManager.default.createDirectory(at: daemonDir, withIntermediateDirectories: true)
+        try Data(#"{"pid": 9102, "httpsPort": 54666, "csrfToken": "csrf_edge_test"}"#.utf8)
+            .write(to: daemonDir.appendingPathComponent("hub_9102.json"))
+
+        let mirrorURL = dir.appendingPathComponent(".gemini/jetski-standalone-oauth-token")
+        let backend = InMemoryKeychainBackend()
+        let kc = KeychainStore(backend: backend)
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-rory", value: "rt_rory_vault")
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-snow", value: "rt_snow_vault")
+
+        let futureExpiry = Formatters.formatRFC3339Local(Date().addingTimeInterval(3600))
+        let roryKCObj: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": "writer_rory_edge_0123456789abcdefghijklmnop",
+            "id_token_email": "rorywangdev@example.com",
+            "token": [
+                "access_token": "at_rory_live",
+                "refresh_token": "rt_rory_vault",
+                "expiry": futureExpiry,
+            ],
+        ]
+        let roryKCData = try JSONSerialization.data(withJSONObject: roryKCObj, options: [.sortedKeys])
+        let roryKCRaw = AntigravityProvider.encodeGoKeyringValue(roryKCData)
+        try kc.writeExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount,
+            value: roryKCRaw
+        )
+        try KeychainStore.writeAtomicFile(data: roryKCData, to: mirrorURL, mode: 0o600)
+
+        let inspector = MockProcessInspector()
+        inspector.processes = [
+            ClientProcessInfo(
+                id: 9102,
+                name: "language_server",
+                executablePath: binDir.appendingPathComponent("language_server").path
+            ),
+        ]
+
+        // Part (a): Unregistered desktop account (`unregistered@example.com`) vs registered Keychain (`rorywangdev`)
+        StubURLProtocol.reset { req, _ in
+            let urlStr = req.url?.absoluteString ?? ""
+            let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            if urlStr.hasPrefix("https://127.0.0.1:54666/") && urlStr.hasSuffix("/GetUserStatus") {
+                return resp(200, [
+                    "userStatus": [
+                        "email": "unregistered@example.com",
+                        "name": "Unregistered User",
+                    ],
+                ])
+            }
+            return resp(404, [:])
+        }
+
+        let paths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: dir.appendingPathComponent("Insiders.app"),
+            agyCLIURL: dir.appendingPathComponent("agy"),
+            mirrorTokenURL: mirrorURL,
+            daemonDirectories: [daemonDir]
+        )
+        let provider = AntigravityProvider(
+            keychain: kc,
+            processController: ProcessController(inspector: inspector, selfPid: 9999),
+            paths: paths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+
+        var reg = RegistryData(accounts: [
+            AccountRecord(
+                id: "sub-rory",
+                provider: .antigravity,
+                email: "rorywangdev@example.com",
+                displayName: "rorywangdev",
+                isActiveLive: true,
+                avatarURL: "https://lh3.googleusercontent.com/rory.png"
+            ),
+        ])
+
+        let syncedId = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(syncedId, nil, "unregistered desktop account must NOT mark another Keychain account active")
+        T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-rory" }?.isActiveLive, false, "rorywangdev must have isActiveLive == false when desktop is unregistered@example.com")
+        T.expectEqual(provider.currentCredentialDrift?.reason, .desktopKeychainMismatch)
+        T.expectEqual(provider.currentCredentialDrift?.desktopAccountId, nil, "unregistered desktop drift must set desktopAccountId == nil")
+        T.expectEqual(provider.currentCredentialDrift?.desktopEmail, "unregistered@example.com")
+
+        // Verify AppStore.repairAntigravityCredentialDrift() refuses to overwrite Keychain with rorywangdev!
+        let regURL = dir.appendingPathComponent("registry-edge.json")
+        try reg.save(to: regURL)
+        let store = await MainActor.run {
+            AppStore(
+                keychain: kc,
+                processController: ProcessController(inspector: inspector, selfPid: 9999),
+                adapters: [.antigravity: provider],
+                registryURL: regURL,
+                startScheduler: false,
+                persistAccountPoolExport: false
+            )
+        }
+        await store.refreshProvider(.antigravity, persistExport: false)
+        let storeDrift = await MainActor.run { store.antigravityCredentialDrift }
+        T.expectEqual(storeDrift?.desktopAccountId, nil)
+        T.expectEqual(storeDrift?.desktopEmail, "unregistered@example.com")
+
+        let tokenCallsBeforeRepair = StubURLProtocol.snapshotRequests().filter {
+            $0.request.url?.absoluteString.contains("oauth2.googleapis.com/token") == true
+        }.count
+        await store.repairAntigravityCredentialDrift()
+
+        let errBanner = await MainActor.run { store.operationBanner ?? "" }
+        let errFlag = await MainActor.run { store.operationBannerIsError }
+        T.expectEqual(errFlag, true, "repairing unregistered desktop account must surface an error banner")
+        T.expect(errBanner.contains("请先添加或导入该账号"), "error banner must instruct user to add/import account, got: \(errBanner)")
+        T.expect(errBanner.contains("unregistered@example.com"), "error banner must name the unregistered desktop email")
+        let kcAfterRefusedRepair = try kc.readExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount
+        )
+        T.expectEqual(kcAfterRefusedRepair, roryKCRaw, "refused repair must NEVER modify Keychain")
+        let tokenCallsAfterRepair = StubURLProtocol.snapshotRequests().filter {
+            $0.request.url?.absoluteString.contains("oauth2.googleapis.com/token") == true
+        }.count
+        T.expectEqual(tokenCallsAfterRepair - tokenCallsBeforeRepair, 0, "refused repair must not hit OAuth token endpoint")
+
+        // Part (b): Standalone fetchQuota (before syncLiveAccount, currentCredentialDrift == nil) must NEVER reuse unverified or RT-mismatched live Keychain access_token!
+        let futureReset = Formatters.formatRFC3339UTC(Date().addingTimeInterval(4 * 3600))
+        let standalonePaths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: dir.appendingPathComponent("Insiders.app"),
+            agyCLIURL: dir.appendingPathComponent("agy"),
+            mirrorTokenURL: dir.appendingPathComponent("nonexistent-mirror"),
+            daemonDirectories: [] // Force Tier 2 Cloud Code path directly
+        )
+        let snowAcct = AccountRecord(
+            id: "sub-snow",
+            provider: .antigravity,
+            email: "snow@example.com",
+            displayName: "Snow"
+        )
+
+        // (b-i) Bare live Keychain bundle with NO id_token, NO id_token_email, NO refresh_token (fail-closed!)
+        let bareBundleData = try JSONSerialization.data(withJSONObject: [
+            "auth_method": "consumer",
+            "token": [
+                "access_token": "at_unverified_wrong_account",
+                "expiry": futureExpiry,
+            ],
+        ])
+        try kc.writeExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount,
+            value: AntigravityProvider.encodeGoKeyringValue(bareBundleData)
+        )
+
+        StubURLProtocol.reset { req, bodyData in
+            let urlStr = req.url?.absoluteString ?? ""
+            let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            if urlStr.contains("oauth2.googleapis.com/token") {
+                let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
+                if bodyStr.contains("roryorbit_client_secret_probe") {
+                    return resp(400, ["error": "invalid_grant"])
+                }
+                return resp(200, ["access_token": "at_minted_clean_snow", "expires_in": 3600])
+            }
+            if urlStr.contains("daily-cloudcode-pa.googleapis.com") {
+                return resp(200, [
+                    "groups": [
+                        [
+                            "displayName": "Gemini",
+                            "buckets": [
+                                ["window": "5h", "remainingFraction": 0.87, "resetTime": futureReset],
+                            ],
+                        ],
+                    ],
+                ])
+            }
+            return resp(404, [:])
+        }
+
+        let freshProvider1 = AntigravityProvider(
+            keychain: kc,
+            processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+            paths: standalonePaths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+        T.expectEqual(freshProvider1.currentCredentialDrift, nil, "precondition: syncLiveAccount not yet called")
+        let snapBare = await freshProvider1.fetchQuota(for: snowAcct, isActiveLive: true)
+        T.expect(snapBare.status.isReady, "standalone fetchQuota must succeed by minting from vaulted RT")
+        let bareCloudAuth = StubURLProtocol.snapshotRequests()
+            .first { $0.request.url?.absoluteString.contains("daily-cloudcode-pa") == true }?
+            .request.value(forHTTPHeaderField: "Authorization")
+        T.expectEqual(bareCloudAuth, "Bearer at_minted_clean_snow", "fail-closed guard must NEVER reuse unverified live access_token")
+
+        // (b-ii) Poisoned mixed bundle: id_token claims `sub-snow`, BUT refresh_token is `rt_rory_vault` (!= vaulted `rt_snow_vault`)
+        let mixedSnowIDToken = makeUnsignedJWT(payload: [
+            "sub": "sub-snow",
+            "email": "snow@example.com",
+        ])
+        let mixedBundleData = try JSONSerialization.data(withJSONObject: [
+            "auth_method": "consumer",
+            "id_token": mixedSnowIDToken,
+            "id_token_email": "snow@example.com",
+            "token": [
+                "access_token": "at_poisoned_rory_token",
+                "refresh_token": "rt_rory_vault",
+                "expiry": futureExpiry,
+            ],
+        ])
+        try kc.writeExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount,
+            value: AntigravityProvider.encodeGoKeyringValue(mixedBundleData)
+        )
+
+        StubURLProtocol.reset { req, bodyData in
+            let urlStr = req.url?.absoluteString ?? ""
+            let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            if urlStr.contains("oauth2.googleapis.com/token") {
+                let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
+                if bodyStr.contains("roryorbit_client_secret_probe") {
+                    return resp(400, ["error": "invalid_grant"])
+                }
+                return resp(200, ["access_token": "at_minted_clean_snow_2", "expires_in": 3600])
+            }
+            if urlStr.contains("daily-cloudcode-pa.googleapis.com") {
+                return resp(200, [
+                    "groups": [
+                        [
+                            "displayName": "Gemini",
+                            "buckets": [
+                                ["window": "5h", "remainingFraction": 0.92, "resetTime": futureReset],
+                            ],
+                        ],
+                    ],
+                ])
+            }
+            return resp(404, [:])
+        }
+
+        let freshProvider2 = AntigravityProvider(
+            keychain: kc,
+            processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+            paths: standalonePaths,
+            session: makeMockSession(),
+            localRPCSession: makeMockSession()
+        )
+        let snapMixed = await freshProvider2.fetchQuota(for: snowAcct, isActiveLive: true)
+        T.expect(snapMixed.status.isReady, "standalone fetchQuota must recover via vaulted RT when live RT mismatches")
+        let mixedCloudAuth = StubURLProtocol.snapshotRequests()
+            .first { $0.request.url?.absoluteString.contains("daily-cloudcode-pa") == true }?
+            .request.value(forHTTPHeaderField: "Authorization")
+        T.expectEqual(mixedCloudAuth, "Bearer at_minted_clean_snow_2", "mismatched live refresh_token MUST reject live access_token even when id_token matches")
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -7054,6 +8098,7 @@ Task {
     await testV120RegressionSuite()
     await testV121RegressionSuite()
     await testV122RegressionSuite()
+    await testV123RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)

@@ -73,7 +73,7 @@ public enum PopoverTab: String, CaseIterable, Identifiable, Hashable, Sendable {
 @MainActor
 public final class AppStore: ObservableObject {
     public nonisolated static let bundleIdentifier = "com.rory.roryorbit"
-    public nonisolated static let appVersion = "1.2.2"
+    public nonisolated static let appVersion = "1.2.3"
 
     public nonisolated static var defaultAvatarCacheDirectoryURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("avatars", isDirectory: true)
@@ -142,6 +142,7 @@ public final class AppStore: ObservableObject {
     @Published public private(set) var liveTokenSpeed: LiveTokenSpeedSnapshot = .empty()
     @Published public private(set) var updatePhase: ReleaseUpdatePhase = .idle
     @Published public var isUpdateBannerDismissed: Bool = false
+    @Published public private(set) var antigravityCredentialDrift: AntigravityCredentialDrift? = nil
 
     public nonisolated static func makeDefaultAdapters(
         keychain: KeychainStore = .shared,
@@ -817,6 +818,7 @@ public final class AppStore: ObservableObject {
         let fetchedSnapshots: [(AccountRecord, QuotaSnapshot?)]
         let fetchedAvatarURLs: [String: String]
         let hasStoredAPIKey: Bool
+        let antigravityCredentialDrift: AntigravityCredentialDrift?
     }
 
     private final class UncheckedSendableBox<Value>: @unchecked Sendable {
@@ -1046,13 +1048,17 @@ public final class AppStore: ObservableObject {
             }
 
             let hasKey = currentAdapter.hasStoredAPIKey()
+            let agDrift: AntigravityCredentialDrift? = (provider == .antigravity)
+                ? (currentAdapter as? AntigravityProvider)?.currentCredentialDrift
+                : nil
             return ProviderRefreshBatchResult(
                 runtimeStatus: runtimeStatus,
                 syncedAccounts: effectiveAccounts,
                 syncedLiveId: syncedLiveId,
                 fetchedSnapshots: fetchedSnapshots,
                 fetchedAvatarURLs: fetchedAvatarURLs,
-                hasStoredAPIKey: hasKey
+                hasStoredAPIKey: hasKey,
+                antigravityCredentialDrift: agDrift
             )
         }
 
@@ -1077,6 +1083,9 @@ public final class AppStore: ObservableObject {
         }
 
         clientStatuses[provider] = batchResult.runtimeStatus
+        if provider == .antigravity {
+            antigravityCredentialDrift = batchResult.antigravityCredentialDrift
+        }
         let accountsChangedFromSync = mergeSyncedAccounts(
             provider: provider,
             syncedAccounts: batchResult.syncedAccounts,
@@ -1181,6 +1190,9 @@ public final class AppStore: ObservableObject {
         }
         switch result {
         case .switched(let reopenedApps):
+            if provider == .antigravity {
+                antigravityCredentialDrift = nil
+            }
             registry.setActiveLive(accountId: account.id, for: provider)
             persistRegistryQuietly()
             if reopenedApps.isEmpty {
@@ -1215,6 +1227,57 @@ public final class AppStore: ObservableObject {
 
         case .failed(let message):
             setBanner("切换失败：\(message)", isError: true, autoClearSeconds: nil)
+        }
+    }
+
+    /// Repairs Antigravity Keychain + mirror file drift for the active desktop account without restarting Antigravity.app.
+    public func repairAntigravityCredentialDrift() async {
+        guard let agAdapter = adapters[.antigravity] as? AntigravityProvider else { return }
+        guard busyActionLabel == nil else { return }
+
+        let drift = antigravityCredentialDrift ?? agAdapter.currentCredentialDrift
+        let agAccounts = accounts(for: .antigravity)
+        let targetAccount: AccountRecord? = {
+            if let drift {
+                if let desktopId = drift.desktopAccountId,
+                   let byId = agAccounts.first(where: { $0.id == desktopId }) {
+                    return byId
+                }
+                let desktopEmailLower = drift.desktopEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !desktopEmailLower.isEmpty,
+                   let byEmail = agAccounts.first(where: { $0.email.lowercased() == desktopEmailLower }) {
+                    return byEmail
+                }
+                // Fail closed when drift names an unregistered desktop account:
+                // never fall back to an unrelated existing account.
+                return nil
+            }
+            return primaryAccount(for: .antigravity)
+        }()
+
+        guard let targetAccount else {
+            let emailHint = drift?.desktopEmail ?? "当前桌面账号"
+            setBanner("未在 Pulsar 中找到 \(emailHint) 的账号凭证，请先添加或导入该账号", isError: true, autoClearSeconds: nil)
+            return
+        }
+
+        busyActionLabel = "正在无感修复 Antigravity 钥匙串与镜像凭证..."
+        defer { busyActionLabel = nil }
+
+        let result = await agAdapter.repairLiveCredentials(for: targetAccount)
+        switch result {
+        case .switched:
+            antigravityCredentialDrift = nil
+            registry.setActiveLive(accountId: targetAccount.id, for: .antigravity)
+            persistRegistryQuietly()
+            setBanner("已无感修复 Antigravity 钥匙串与镜像凭证（\(targetAccount.displayName)），未重启客户端", isError: false)
+            await refreshProvider(.antigravity)
+
+        case .needsForceQuitConfirmation:
+            setBanner("修复操作未完成：检测到冲突进程，请稍后重试", isError: true, autoClearSeconds: nil)
+
+        case .failed(let message):
+            setBanner("修复钥匙串失败：\(message)", isError: true, autoClearSeconds: nil)
         }
     }
 

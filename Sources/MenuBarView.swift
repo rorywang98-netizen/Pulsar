@@ -464,6 +464,13 @@ public struct MenuBarView: View {
                     .transition(OrbitMotion.panelTransition)
             }
 
+            if selectedProvider == .antigravity, let drift = store.antigravityCredentialDrift {
+                antigravityCredentialDriftBanner(drift)
+                    .padding(.horizontal, scrollInset)
+                    .padding(.bottom, 7)
+                    .transition(OrbitMotion.panelTransition)
+            }
+
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: isCompactCards ? 4.5 : 6) {
                     if selectedProvider.supportsAccountSwitch {
@@ -488,6 +495,7 @@ public struct MenuBarView: View {
         .animation(OrbitMotion.snappy, value: store.busyActionLabel != nil)
         .animation(OrbitMotion.snappy, value: store.operationBanner)
         .animation(OrbitMotion.snappy, value: store.pendingForceQuit?.id)
+        .animation(OrbitMotion.snappy, value: store.antigravityCredentialDrift)
         .animation(OrbitMotion.snappy, value: store.effectiveAntigravityPool())
     }
 
@@ -2502,6 +2510,93 @@ public struct MenuBarView: View {
                 .stroke(tint.opacity(0.32), lineWidth: 0.7)
         )
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func antigravityCredentialDriftBanner(_ drift: AntigravityCredentialDrift) -> some View {
+        let isDark = (colorScheme == .dark)
+        let orange = Color(nsColor: .systemOrange)
+        let isBusy = (store.busyActionLabel != nil || store.refreshingProviders.contains(.antigravity))
+        let title: String = {
+            switch drift.reason {
+            case .desktopKeychainMismatch:
+                return "钥匙串与桌面账号不一致"
+            case .mirrorFileMismatch:
+                return "本地镜像凭证不一致"
+            case .staleMetadata:
+                return "钥匙串元数据不一致"
+            }
+        }()
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(orange)
+
+                Text(title)
+                    .font(.system(size: isNarrowLayout ? 11 : 11.5, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.86)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 4)
+
+                Button {
+                    Task { await store.repairAntigravityCredentialDrift() }
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "wrench.and.screwdriver.fill")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("一键修复钥匙串")
+                            .font(.system(size: isNarrowLayout ? 10 : 10.5, weight: .semibold))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(orange)
+                .controlSize(.small)
+                .disabled(isBusy)
+                .help("无感同步钥匙串与本地镜像至 \(drift.desktopEmail)（不重启 Antigravity）")
+            }
+
+            Text(drift.summaryMessage)
+                .font(.system(size: 10.5))
+                .foregroundColor(isDark ? Color.white.opacity(0.84) : Color.black.opacity(0.76))
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !drift.staleBackgroundAgyPids.isEmpty {
+                let pidList = drift.staleBackgroundAgyPids.map(String.init).joined(separator: ", ")
+                HStack(spacing: 4.5) {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(orange)
+                    Text("后台进程 PID \(pidList)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(isDark ? Color.white.opacity(0.78) : Color.black.opacity(0.68))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                        .fill(orange.opacity(isDark ? 0.18 : 0.12))
+                )
+            }
+        }
+        .padding(.horizontal, isNarrowLayout ? 9 : 10.5)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .orbitCardStyle(
+            cornerRadius: 11,
+            isHighlighted: true,
+            highlightColor: orange,
+            fillColor: orange.opacity(isDark ? 0.16 : 0.11),
+            hoverLift: false
+        )
     }
 
     // MARK: - Multi-Account Switchable View (Antigravity & Codex)

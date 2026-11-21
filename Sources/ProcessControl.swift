@@ -108,8 +108,14 @@ public final class LiveProcessInspector: ProcessInspectorProtocol, @unchecked Se
             let gui = guiByPid[intPid]
 
             var execPath = Self.executablePath(for: pid)
-            if execPath.isEmpty, let fallback = gui?.execPath {
+            if execPath.isEmpty, let fallback = gui?.execPath, !fallback.isEmpty {
                 execPath = fallback
+            }
+            if execPath.isEmpty {
+                execPath = Self.execPathFromProcArgs(for: pid)
+            }
+            if execPath.isEmpty {
+                execPath = Self.processShortName(for: pid)
             }
             guard !execPath.isEmpty else { continue }
 
@@ -132,50 +138,56 @@ public final class LiveProcessInspector: ProcessInspectorProtocol, @unchecked Se
         return processes
     }
 
-    public func processArguments(pid: Int) -> [String] {
-        guard pid > 1 else { return [] }
+    /// Parses a raw Darwin `KERN_PROCARGS2` buffer into `(execPath, arguments)` safely without
+    /// assuming buffer alignment, preserving unlinked executable paths (e.g. `agy.<ts>.old`) and `argv`.
+    public static func parseProcArgs2Buffer(_ data: Data) -> (execPath: String, arguments: [String]) {
+        let headerSize = MemoryLayout<Int32>.size
+        guard data.count > headerSize else { return ("", []) }
 
-        var argmax: Int32 = 0
-        var argmaxSize = MemoryLayout<Int32>.stride
-        var argmaxMib: [Int32] = [CTL_KERN, KERN_ARGMAX]
-        if sysctl(&argmaxMib, 2, &argmax, &argmaxSize, nil, 0) != 0 || argmax <= 0 {
-            argmax = 262_144
+        var argc: Int32 = 0
+        _ = withUnsafeMutableBytes(of: &argc) { dst in
+            data.copyBytes(to: dst, from: data.startIndex..<(data.startIndex + headerSize))
         }
+        guard argc >= 0, argc < 4096 else { return ("", []) }
 
-        var buffer = [UInt8](repeating: 0, count: Int(argmax))
-        var size = buffer.count
-        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid_t(pid)]
-        let rc = sysctl(&mib, 3, &buffer, &size, nil, 0)
-        guard rc == 0, size > MemoryLayout<Int32>.size else { return [] }
+        let bytes = [UInt8](data)
+        let size = bytes.count
+        var idx = headerSize
 
-        let argc: Int32 = buffer.withUnsafeBytes { raw in
-            raw.load(as: Int32.self)
-        }
-        guard argc > 0, argc < 4096 else { return [] }
-
-        var idx = MemoryLayout<Int32>.size
-        // Skip executable path.
-        while idx < size && buffer[idx] != 0 {
+        // Read exec_path (NUL-terminated string immediately following argc).
+        let execStart = idx
+        while idx < size && bytes[idx] != 0 {
             idx += 1
         }
+        let execPath = String(bytes: bytes[execStart..<idx], encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
         // Skip NUL padding between exec_path and argv[0].
-        while idx < size && buffer[idx] == 0 {
+        while idx < size && bytes[idx] == 0 {
             idx += 1
         }
 
         var args: [String] = []
-        args.reserveCapacity(Int(argc))
-        while idx < size && args.count < Int(argc) {
-            let start = idx
-            while idx < size && buffer[idx] != 0 {
+        if argc > 0 {
+            args.reserveCapacity(Int(argc))
+            while idx < size && args.count < Int(argc) {
+                let start = idx
+                while idx < size && bytes[idx] != 0 {
+                    idx += 1
+                }
+                if let str = String(bytes: bytes[start..<idx], encoding: .utf8) {
+                    args.append(str)
+                }
                 idx += 1
             }
-            if let str = String(bytes: buffer[start..<idx], encoding: .utf8) {
-                args.append(str)
-            }
-            idx += 1
         }
-        return args
+
+        return (execPath, args)
+    }
+
+    public func processArguments(pid: Int) -> [String] {
+        guard pid > 1 else { return [] }
+        return Self.readProcArgs2(for: pid_t(pid)).arguments
     }
 
     public func installedAppURLs(bundleIDs: [String], extraPaths: [String]) -> [URL] {
@@ -259,6 +271,56 @@ public final class LiveProcessInspector: ProcessInspectorProtocol, @unchecked Se
         let len = proc_pidpath(pid, &buf, UInt32(buf.count))
         guard len > 0 else { return "" }
         return String(cString: buf)
+    }
+
+    private static func readProcArgs2(for pid: pid_t) -> (execPath: String, arguments: [String]) {
+        guard pid > 1 else { return ("", []) }
+
+        var argmax: Int32 = 0
+        var argmaxSize = MemoryLayout<Int32>.stride
+        var argmaxMib: [Int32] = [CTL_KERN, KERN_ARGMAX]
+        if sysctl(&argmaxMib, 2, &argmax, &argmaxSize, nil, 0) != 0 || argmax <= 0 {
+            argmax = 262_144
+        }
+
+        var buffer = [UInt8](repeating: 0, count: Int(argmax))
+        var size = buffer.count
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        let rc = sysctl(&mib, 3, &buffer, &size, nil, 0)
+        guard rc == 0, size > MemoryLayout<Int32>.size else { return ("", []) }
+
+        return parseProcArgs2Buffer(Data(buffer[0..<size]))
+    }
+
+    private static func execPathFromProcArgs(for pid: pid_t) -> String {
+        let parsed = readProcArgs2(for: pid)
+        if !parsed.execPath.isEmpty {
+            return parsed.execPath
+        }
+        return parsed.arguments.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func processShortName(for pid: pid_t) -> String {
+        guard pid > 1 else { return "" }
+        var info = proc_bsdinfo()
+        let infoSize = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        let ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, infoSize)
+        guard ret == infoSize else { return "" }
+
+        let name = cStringFromTuple(info.pbi_name)
+        if !name.isEmpty {
+            return name
+        }
+        return cStringFromTuple(info.pbi_comm)
+    }
+
+    private static func cStringFromTuple<T>(_ tuple: T) -> String {
+        withUnsafeBytes(of: tuple) { raw in
+            let bytes = raw.prefix { $0 != 0 }
+            guard !bytes.isEmpty else { return "" }
+            return String(decoding: bytes, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     private static func hasControllingTTY(pid: pid_t) -> Bool {
