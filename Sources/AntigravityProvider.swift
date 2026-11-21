@@ -117,7 +117,7 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         self.keychain = keychain
         self.processController = processController
         self.paths = paths
-        self.session = session ?? HTTPFactory.makeSession(policy: .systemProxy, timeout: 20.0)
+        self.session = session ?? HTTPFactory.makeSession(policy: .systemProxy, timeout: 10.0)
 
         let delegate = LocalhostSelfSignedDelegate()
         self.localRPCDelegate = delegate
@@ -125,6 +125,7 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         localCfg.timeoutIntervalForRequest = 4.0
         localCfg.timeoutIntervalForResource = 8.0
         localCfg.waitsForConnectivity = false
+        localCfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         localCfg.urlCache = nil
         localCfg.httpCookieStorage = nil
         localCfg.httpShouldSetCookies = false
@@ -560,6 +561,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         var req = URLRequest(url: URL(string: Self.googleTokenURL)!)
         req.httpMethod = "POST"
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.timeoutInterval = 10
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.httpBody = Data(form.utf8)
@@ -630,6 +634,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
     private func performTokenRequest(formBody: String) async throws -> TokenResponse {
         var req = URLRequest(url: URL(string: Self.googleTokenURL)!)
         req.httpMethod = "POST"
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.timeoutInterval = 10
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.httpBody = Data(formBody.utf8)
@@ -678,6 +685,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         if let accessToken, !accessToken.isEmpty {
             var req = URLRequest(url: URL(string: Self.googleUserInfoURL)!)
             req.httpMethod = "GET"
+            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            req.timeoutInterval = 10
+            req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
             req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -921,12 +931,25 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
     public func fetchQuota(for account: AccountRecord, isActiveLive: Bool) async -> QuotaSnapshot {
         // Tier 1: Local language_server Connect RPC when querying the active live account.
+        // If local RPC holds an expired pre-reset cache (`isStale == true`), fall through to Tier 2
+        // to query Google Cloud Code directly, keeping the local snapshot only as a network-error fallback.
+        var staleLocalFallback: QuotaSnapshot?
         if isActiveLive, let localSnap = await fetchLocalRPCQuota(for: account) {
-            return localSnap
+            if !localSnap.status.isStale {
+                return localSnap
+            }
+            staleLocalFallback = localSnap
         }
 
         // Tier 2: Remote Cloud Code via Google OAuth refresh token (works for all inactive & active accounts).
-        return await fetchRemoteCloudCodeQuota(for: account, isActiveLive: isActiveLive)
+        let remoteSnap = await fetchRemoteCloudCodeQuota(for: account, isActiveLive: isActiveLive)
+        if remoteSnap.status.isReady {
+            return remoteSnap
+        }
+        if let staleLocalFallback {
+            return staleLocalFallback
+        }
+        return remoteSnap
     }
 
     // MARK: Tier 1 — Local `language_server` Connect RPC
@@ -992,15 +1015,17 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                         csrfToken: endpoint.csrfToken,
                         body: [:]
                     ) {
-                        let windows = Self.parseQuotaSummaryWindows(from: summaryJSON)
+                        let now = Date()
+                        let windows = Self.parseQuotaSummaryWindows(from: summaryJSON, now: now)
                         if !windows.isEmpty {
+                            let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
                             return QuotaSnapshot(
                                 provider: .antigravity,
                                 accountId: account.id,
                                 plan: resolvedPlan,
                                 windows: windows,
                                 balance: nil,
-                                status: .ready(fetchedAt: Date(), stale: false),
+                                status: .ready(fetchedAt: now, stale: isStale),
                                 sourceLabel: "本地 RPC"
                             )
                         }
@@ -1008,15 +1033,17 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
                     // 4. Fallback to GetUserStatus model configs or GetCommandModelConfigs.
                     if let userStatusObj {
-                        let windows = Self.parseModelConfigWindows(from: userStatusObj)
+                        let now = Date()
+                        let windows = Self.parseModelConfigWindows(from: userStatusObj, now: now)
                         if !windows.isEmpty {
+                            let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
                             return QuotaSnapshot(
                                 provider: .antigravity,
                                 accountId: account.id,
                                 plan: resolvedPlan,
                                 windows: windows,
                                 balance: nil,
-                                status: .ready(fetchedAt: Date(), stale: false),
+                                status: .ready(fetchedAt: now, stale: isStale),
                                 sourceLabel: "本地 RPC"
                             )
                         }
@@ -1027,15 +1054,17 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                         csrfToken: endpoint.csrfToken,
                         body: [:]
                     ) {
-                        let windows = Self.parseModelConfigWindows(from: cmdConfigsJSON)
+                        let now = Date()
+                        let windows = Self.parseModelConfigWindows(from: cmdConfigsJSON, now: now)
                         if !windows.isEmpty {
+                            let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
                             return QuotaSnapshot(
                                 provider: .antigravity,
                                 accountId: account.id,
                                 plan: resolvedPlan,
                                 windows: windows,
                                 balance: nil,
-                                status: .ready(fetchedAt: Date(), stale: false),
+                                status: .ready(fetchedAt: now, stale: isStale),
                                 sourceLabel: "本地 RPC"
                             )
                         }
@@ -1138,6 +1167,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.timeoutInterval = 4
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
@@ -1191,7 +1223,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         switch primaryResult {
         case .success(let json):
-            let windows = Self.parseQuotaSummaryWindows(from: json)
+            let now = Date()
+            let windows = Self.parseQuotaSummaryWindows(from: json, now: now)
             if !windows.isEmpty {
                 let needsPlanRefresh = resolvedPlan == nil
                     || resolvedPlan?.kind == .unknown
@@ -1200,13 +1233,14 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                    let refreshedPlan = await fetchLoadCodeAssist(accessToken: accessToken)?.plan {
                     resolvedPlan = refreshedPlan
                 }
+                let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
                 return QuotaSnapshot(
                     provider: .antigravity,
                     accountId: account.id,
                     plan: resolvedPlan,
                     windows: windows,
                     balance: nil,
-                    status: .ready(fetchedAt: Date(), stale: false),
+                    status: .ready(fetchedAt: now, stale: isStale),
                     sourceLabel: "Cloud Code"
                 )
             }
@@ -1250,15 +1284,17 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             body: projectBody
         )
         if case .success(let modelsJSON) = modelsResult {
-            let windows = Self.parseAvailableModelsWindows(from: modelsJSON)
+            let now = Date()
+            let windows = Self.parseAvailableModelsWindows(from: modelsJSON, now: now)
             if !windows.isEmpty {
+                let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
                 return QuotaSnapshot(
                     provider: .antigravity,
                     accountId: account.id,
                     plan: resolvedPlan,
                     windows: windows,
                     balance: nil,
-                    status: .ready(fetchedAt: Date(), stale: false),
+                    status: .ready(fetchedAt: now, stale: isStale),
                     sourceLabel: "Cloud Code"
                 )
             }
@@ -1273,15 +1309,17 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         )
         switch userQuotaResult {
         case .success(let quotaJSON):
-            let windows = Self.parseRetrieveUserQuotaWindows(from: quotaJSON)
+            let now = Date()
+            let windows = Self.parseRetrieveUserQuotaWindows(from: quotaJSON, now: now)
             if !windows.isEmpty {
+                let isStale = Self.containsExpiredQuotaWindows(windows, now: now)
                 return QuotaSnapshot(
                     provider: .antigravity,
                     accountId: account.id,
                     plan: resolvedPlan,
                     windows: windows,
                     balance: nil,
-                    status: .ready(fetchedAt: Date(), stale: false),
+                    status: .ready(fetchedAt: now, stale: isStale),
                     sourceLabel: "Cloud Code"
                 )
             }
@@ -1452,6 +1490,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.timeoutInterval = 10
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1523,6 +1564,7 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             )
         }
         if lower.contains("gpt")
+            || lower.contains("openai")
             || lower.contains("partner")
             || lower.contains("third")
             || lower.contains("anthropic")
@@ -1568,7 +1610,12 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                 || lower == "five hour"
                 || lower == "5 hour"
                 || lower.contains("5-hour")
-                || lower.contains("five hour") {
+                || lower.contains("5_hour")
+                || lower.contains("five hour")
+                || lower.contains("five_hour")
+                || lower.contains("five-hour")
+                || lower.hasSuffix("_5h")
+                || lower.hasSuffix("-5h") {
                 return WindowSpec(idSuffix: "5h", tag: "5小时", windowSeconds: 18_000, sortOrder: 0)
             }
             if lower == "weekly"
@@ -1579,7 +1626,11 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                 || lower == "seven_day"
                 || lower == "seven-day"
                 || lower == "1w"
-                || lower.contains("week") {
+                || lower.contains("week")
+                || lower.contains("7-day")
+                || lower.contains("7_day")
+                || lower.contains("seven_day")
+                || lower.contains("seven-day") {
                 return WindowSpec(idSuffix: "weekly", tag: "周", windowSeconds: 604_800, sortOrder: 1)
             }
             if lower == "daily" || lower == "day" || lower == "24h" || lower == "1d" {
@@ -1618,7 +1669,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             ?? nonEmptyStatic(dict["label"] as? String)
             ?? ""
         let hint = "\(bucketId) \(bucketDisplay)".lowercased()
-        if hint.contains("-5h")
+        let bucketIdLower = bucketId.lowercased()
+        if bucketIdLower == "5h"
+            || hint.contains("-5h")
             || hint.contains("_5h")
             || hint.contains("5-hour")
             || hint.contains("five hour")
@@ -1627,7 +1680,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             || hint.contains("5 hour") {
             return WindowSpec(idSuffix: "5h", tag: "5小时", windowSeconds: 18_000, sortOrder: 0)
         }
-        if hint.contains("weekly")
+        if bucketIdLower == "weekly"
+            || hint.contains("weekly")
             || hint.contains("-week")
             || hint.contains("_week")
             || hint.contains("7-day")
@@ -1648,7 +1702,7 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
     /// Parses `retrieveUserQuotaSummary` / local `RetrieveUserQuotaSummary` JSON responses,
     /// splitting each model group cleanly into separate `5小时` and `周` (`QuotaWindow`) entries.
     /// Remember proto3 JSON omits `0.0`: missing `remainingFraction` inside an active bucket/group means `0.0` (exhausted)!
-    public static func parseQuotaSummaryWindows(from json: [String: Any]) -> [QuotaWindow] {
+    public static func parseQuotaSummaryWindows(from json: [String: Any], now: Date = Date()) -> [QuotaWindow] {
         let summaryObj = (json["summary"] as? [String: Any])
             ?? (json["response"] as? [String: Any])
             ?? json
@@ -1676,6 +1730,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                     if let disabled = bucket["disabled"] as? Bool, disabled { continue }
 
                     let hasBucketSignal = bucket["window"] != nil
+                        || bucket["windowType"] != nil
+                        || bucket["window_type"] != nil
                         || bucket["bucketId"] != nil
                         || bucket["bucket_id"] != nil
                         || bucket["displayName"] != nil
@@ -1683,6 +1739,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                         || bucket["remaining_fraction"] != nil
                         || bucket["resetTime"] != nil
                         || bucket["reset_time"] != nil
+                        || bucket["resetsAt"] != nil
+                        || bucket["resets_at"] != nil
                     guard hasBucketSignal else { continue }
 
                     let bucketId = nonEmptyStatic(bucket["bucketId"] as? String)
@@ -1718,7 +1776,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                         window: windowSpec,
                         remaining: fraction,
                         resetAt: resetAt,
-                        detail: detail
+                        detail: detail,
+                        now: now
                     )
                 }
             } else {
@@ -1727,6 +1786,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                     || group["remaining_fraction"] != nil
                     || group["resetTime"] != nil
                     || group["reset_time"] != nil
+                    || group["resetsAt"] != nil
+                    || group["resets_at"] != nil
                     || group["window"] != nil
                 guard hasQuotaSignal else { continue }
 
@@ -1743,7 +1804,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                     window: windowSpec,
                     remaining: fraction,
                     resetAt: resetAt,
-                    detail: detail
+                    detail: detail,
+                    now: now
                 )
             }
         }
@@ -1752,7 +1814,7 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     /// Parses local `GetUserStatus` / `GetCommandModelConfigs` `clientModelConfigs` arrays.
-    public static func parseModelConfigWindows(from json: [String: Any]) -> [QuotaWindow] {
+    public static func parseModelConfigWindows(from json: [String: Any], now: Date = Date()) -> [QuotaWindow] {
         let userStatus = (json["userStatus"] as? [String: Any]) ?? json
         let cascade = (userStatus["cascadeModelConfigData"] as? [String: Any]) ?? userStatus
         guard let configs = cascade["clientModelConfigs"] as? [[String: Any]], !configs.isEmpty else {
@@ -1761,13 +1823,21 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
         var pools: [String: PoolAggregate] = [:]
         for cfg in configs {
+            if let disabled = cfg["disabled"] as? Bool, disabled { continue }
             guard let quotaInfo = cfg["quotaInfo"] as? [String: Any] else { continue }
             let modelAlias = (cfg["modelOrAlias"] as? [String: Any])?["model"] as? String
+                ?? (cfg["modelOrAlias"] as? [String: Any])?["alias"] as? String
             let displayName = nonEmptyStatic(cfg["label"] as? String)
+                ?? nonEmptyStatic(cfg["displayName"] as? String)
             if isInternalHelperModel(modelId: modelAlias, displayName: displayName) {
                 continue
             }
-            let rawName = displayName ?? nonEmptyStatic(modelAlias) ?? "Gemini"
+            let rawName: String
+            if let alias = nonEmptyStatic(modelAlias), alias.lowercased().contains("argon") {
+                rawName = "Gemini 4 Argon"
+            } else {
+                rawName = displayName ?? nonEmptyStatic(modelAlias) ?? "Gemini"
+            }
             let fraction = extractProto3RemainingFraction(from: quotaInfo)
             let resetAt = extractResetDate(from: quotaInfo)
             let windowSpec = classifyWindow(from: quotaInfo)
@@ -1777,14 +1847,15 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                 window: windowSpec,
                 remaining: fraction,
                 resetAt: resetAt,
-                detail: nil
+                detail: nil,
+                now: now
             )
         }
         return finalizePoolWindows(pools)
     }
 
     /// Parses `cloudcode-pa:fetchAvailableModels` responses (supports dictionary or array `models`).
-    public static func parseAvailableModelsWindows(from json: [String: Any]) -> [QuotaWindow] {
+    public static func parseAvailableModelsWindows(from json: [String: Any], now: Date = Date()) -> [QuotaWindow] {
         var pools: [String: PoolAggregate] = [:]
 
         if let modelsDict = json["models"] as? [String: Any] {
@@ -1793,12 +1864,15 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                       let quotaInfo = entry["quotaInfo"] as? [String: Any] else {
                     continue
                 }
+                if let disabled = entry["disabled"] as? Bool, disabled { continue }
                 let displayName = nonEmptyStatic(entry["displayName"] as? String)
                     ?? nonEmptyStatic(entry["label"] as? String)
                 if isInternalHelperModel(modelId: modelId, displayName: displayName) {
                     continue
                 }
-                let rawName = displayName ?? modelId
+                let rawName = modelId.lowercased().contains("argon")
+                    ? "Gemini 4 Argon"
+                    : (displayName ?? modelId)
                 let fraction = extractProto3RemainingFraction(from: quotaInfo)
                 let resetAt = extractResetDate(from: quotaInfo)
                 let windowSpec = classifyWindow(from: quotaInfo)
@@ -1808,11 +1882,13 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                     window: windowSpec,
                     remaining: fraction,
                     resetAt: resetAt,
-                    detail: nil
+                    detail: nil,
+                    now: now
                 )
             }
         } else if let modelsArr = json["models"] as? [[String: Any]] {
             for entry in modelsArr {
+                if let disabled = entry["disabled"] as? Bool, disabled { continue }
                 guard let quotaInfo = entry["quotaInfo"] as? [String: Any] else { continue }
                 let displayName = nonEmptyStatic(entry["displayName"] as? String)
                     ?? nonEmptyStatic(entry["label"] as? String)
@@ -1821,7 +1897,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                 if isInternalHelperModel(modelId: modelId, displayName: displayName) {
                     continue
                 }
-                let rawName = displayName ?? modelId ?? "Gemini"
+                let rawName = (modelId?.lowercased().contains("argon") == true)
+                    ? "Gemini 4 Argon"
+                    : (displayName ?? modelId ?? "Gemini")
                 let fraction = extractProto3RemainingFraction(from: quotaInfo)
                 let resetAt = extractResetDate(from: quotaInfo)
                 let windowSpec = classifyWindow(from: quotaInfo)
@@ -1831,7 +1909,8 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                     window: windowSpec,
                     remaining: fraction,
                     resetAt: resetAt,
-                    detail: nil
+                    detail: nil,
+                    now: now
                 )
             }
         }
@@ -1840,13 +1919,14 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     /// Parses `cloudcode-pa:retrieveUserQuota` `buckets[]` responses.
-    public static func parseRetrieveUserQuotaWindows(from json: [String: Any]) -> [QuotaWindow] {
+    public static func parseRetrieveUserQuotaWindows(from json: [String: Any], now: Date = Date()) -> [QuotaWindow] {
         guard let buckets = json["buckets"] as? [[String: Any]], !buckets.isEmpty else {
             return []
         }
 
         var pools: [String: PoolAggregate] = [:]
         for bucket in buckets {
+            if let disabled = bucket["disabled"] as? Bool, disabled { continue }
             let modelId = nonEmptyStatic(bucket["modelId"] as? String)
             let displayName = nonEmptyStatic(bucket["displayName"] as? String)
             if isInternalHelperModel(modelId: modelId, displayName: displayName) {
@@ -1865,10 +1945,42 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                 window: windowSpec,
                 remaining: fraction,
                 resetAt: resetAt,
-                detail: nil
+                detail: nil,
+                now: now
             )
         }
         return finalizePoolWindows(pools)
+    }
+
+    /// Returns true if any non-full window (`remainingFraction < 0.9999`) carries a `resetAt` strictly in the past
+    /// (beyond `graceSeconds`), indicating the response came from a stale pre-reset cache rather than fresh data.
+    public static func containsExpiredQuotaWindows(
+        _ windows: [QuotaWindow],
+        now: Date = Date(),
+        graceSeconds: TimeInterval = 5.0
+    ) -> Bool {
+        let cutoff = now.addingTimeInterval(-max(0.0, graceSeconds))
+        return windows.contains { window in
+            guard window.remainingFraction < 0.9999,
+                  let resetAt = window.resetAt else {
+                return false
+            }
+            return resetAt <= cutoff
+        }
+    }
+
+    private static func sanitizeResetDate(
+        _ resetAt: Date?,
+        remainingFraction: Double,
+        now: Date
+    ) -> Date? {
+        guard let resetAt else { return nil }
+        // If remote/local already reports full reset quota (1.0) paired with a past resetTime from the prior cycle,
+        // drop the stale timestamp so UI never displays negative countdowns or poisons sibling models in the pool.
+        if remainingFraction >= 0.9999 && resetAt <= now {
+            return nil
+        }
+        return resetAt
     }
 
     private static func accumulatePool(
@@ -1877,9 +1989,12 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         window: WindowSpec?,
         remaining: Double,
         resetAt: Date?,
-        detail: String?
+        detail: String?,
+        now: Date
     ) {
         let clamped = min(max(remaining, 0.0), 1.0)
+        let sanitizedReset = sanitizeResetDate(resetAt, remainingFraction: clamped, now: now)
+        let effectiveDetail = (resetAt != nil && sanitizedReset == nil) ? nil : detail
         let pool = classifyPool(rawName: rawName)
 
         let keyId: String
@@ -1902,15 +2017,15 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             if clamped < existing.minRemaining {
                 existing.minRemaining = clamped
             }
-            if let resetAt {
+            if let sanitizedReset {
                 if let curReset = existing.earliestReset {
-                    if resetAt < curReset { existing.earliestReset = resetAt }
+                    if sanitizedReset < curReset { existing.earliestReset = sanitizedReset }
                 } else {
-                    existing.earliestReset = resetAt
+                    existing.earliestReset = sanitizedReset
                 }
             }
-            if existing.detail == nil, let detail {
-                existing.detail = detail
+            if existing.detail == nil, let effectiveDetail {
+                existing.detail = effectiveDetail
             }
             pools[keyId] = existing
         } else {
@@ -1920,9 +2035,9 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
                 poolSortOrder: pool.sortOrder,
                 windowSortOrder: windowSortOrder,
                 minRemaining: clamped,
-                earliestReset: resetAt,
+                earliestReset: sanitizedReset,
                 windowSeconds: windowSeconds,
-                detail: detail
+                detail: effectiveDetail
             )
         }
     }
@@ -1956,14 +2071,17 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
     private static func extractProto3RemainingFraction(from dict: [String: Any]) -> Double {
         // Proto3 JSON omits 0.0: if remainingFraction is absent/null on a present quota object, treat as 0.0.
-        if let val = dict["remainingFraction"] as? NSNumber {
-            return min(max(val.doubleValue, 0.0), 1.0)
-        }
-        if let val = dict["remaining_fraction"] as? NSNumber {
-            return min(max(val.doubleValue, 0.0), 1.0)
-        }
-        if let str = dict["remainingFraction"] as? String, let parsed = Double(str) {
-            return min(max(parsed, 0.0), 1.0)
+        for key in ["remainingFraction", "remaining_fraction"] {
+            if let val = dict[key] as? NSNumber,
+               CFGetTypeID(val) != CFBooleanGetTypeID(),
+               val.doubleValue.isFinite {
+                return min(max(val.doubleValue, 0.0), 1.0)
+            }
+            if let str = dict[key] as? String,
+               let parsed = Double(str.trimmingCharacters(in: .whitespacesAndNewlines)),
+               parsed.isFinite {
+                return min(max(parsed, 0.0), 1.0)
+            }
         }
         return 0.0
     }
@@ -1973,10 +2091,30 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             if let str = dict[key] as? String, let parsed = Formatters.parseRFC3339(str) {
                 return parsed
             }
-            if let num = dict[key] as? NSNumber {
+            if let num = dict[key] as? NSNumber,
+               CFGetTypeID(num) != CFBooleanGetTypeID() {
                 let v = num.doubleValue
-                if v > 1_000_000_000 {
-                    return Date(timeIntervalSince1970: v)
+                if v.isFinite {
+                    if v > 1_000_000_000_000 {
+                        return Date(timeIntervalSince1970: v / 1000.0)
+                    }
+                    if v > 1_000_000_000 {
+                        return Date(timeIntervalSince1970: v)
+                    }
+                }
+            }
+            if let nested = dict[key] as? [String: Any] {
+                let secsVal: Double?
+                if let n = nested["seconds"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+                    secsVal = n.doubleValue
+                } else if let s = nested["seconds"] as? String, let parsed = Double(s) {
+                    secsVal = parsed
+                } else {
+                    secsVal = nil
+                }
+                if let secsVal, secsVal.isFinite, secsVal > 1_000_000_000 {
+                    let nanos = (nested["nanos"] as? NSNumber)?.doubleValue ?? 0.0
+                    return Date(timeIntervalSince1970: secsVal + nanos / 1_000_000_000.0)
                 }
             }
         }
@@ -2050,9 +2188,77 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         return PlanInfo.normalized(kindRaw: rawKind, name: rawName)
     }
 
+    // MARK: - Reopen URL Filtering (No Dual Stable+Insiders Launch by Default)
+
+    private static func isInsidersAppURL(_ url: URL, insidersAppURL: URL) -> Bool {
+        let std = url.standardizedFileURL
+        let baseName = std.deletingPathExtension().lastPathComponent.lowercased()
+        if baseName.contains("insiders") {
+            return true
+        }
+        let insidersPath = insidersAppURL.standardizedFileURL.path
+        if !insidersPath.isEmpty && std.path == insidersPath {
+            return true
+        }
+        if let bundleId = Bundle(url: std)?.bundleIdentifier?.lowercased(),
+           bundleId == insidersBundleId {
+            return true
+        }
+        return false
+    }
+
+    /// Filters previously running Antigravity bundle URLs before reopening so Stable + Insiders are never
+    /// launched simultaneously unless `includeInsiders == true`.
+    /// - `includeInsiders == true`: deduplicates and preserves all previously running apps.
+    /// - `includeInsiders == false` (default): filters out Insiders and returns at most one Stable URL;
+    ///   if only Insiders was running, falls back to `stableAppURL` when installed on disk, or `[urls[0]]` only if Stable is absent.
+    /// - Empty input always returns `[]`.
+    public static func filterReopenURLs(
+        _ urls: [URL],
+        includeInsiders: Bool,
+        stableAppURL: URL = URL(fileURLWithPath: "/Applications/Antigravity.app", isDirectory: true),
+        insidersAppURL: URL = URL(fileURLWithPath: "/Applications/Antigravity - Insiders.app", isDirectory: true),
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> [URL] {
+        var deduped: [URL] = []
+        var seen = Set<String>()
+        for url in urls {
+            let std = url.standardizedFileURL
+            if seen.insert(std.path).inserted {
+                deduped.append(std)
+            }
+        }
+        guard !deduped.isEmpty else {
+            return []
+        }
+
+        if includeInsiders {
+            return deduped
+        }
+
+        let nonInsiders = deduped.filter { !isInsidersAppURL($0, insidersAppURL: insidersAppURL) }
+        if let firstStable = nonInsiders.first {
+            return [firstStable]
+        }
+
+        let stdStable = stableAppURL.standardizedFileURL
+        if fileExists(stdStable.path) {
+            return [stdStable]
+        }
+        return [deduped[0]]
+    }
+
     // MARK: - Safe Account Switch (Transactional Verify -> GracefulStop -> AtomicWrite -> Readback -> Rollback)
 
     public func switchAccount(to account: AccountRecord, allowForceQuit: Bool) async -> SwitchResult {
+        await switchAccount(to: account, allowForceQuit: allowForceQuit, relaunchInsiders: false)
+    }
+
+    public func switchAccount(
+        to account: AccountRecord,
+        allowForceQuit: Bool,
+        relaunchInsiders: Bool
+    ) async -> SwitchResult {
         // Step 1: Mint & verify target token BEFORE stopping any running Antigravity process!
         guard let storedRefresh = try? keychain.readSecret(service: isolatedStoreNamespace, account: account.id),
               !storedRefresh.isEmpty else {
@@ -2115,7 +2321,12 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         case .stillRunning(let surviving):
             return .needsForceQuitConfirmation(surviving: surviving)
         case .stopped(let urls):
-            reopenURLs = urls
+            reopenURLs = Self.filterReopenURLs(
+                urls,
+                includeInsiders: relaunchInsiders,
+                stableAppURL: paths.stableAppURL,
+                insidersAppURL: paths.insidersAppURL
+            )
         }
 
         // Step 5: Atomic write Keychain `(gemini, antigravity)` + mirror `~/.gemini/jetski-standalone-oauth-token`.
@@ -2154,7 +2365,7 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             return .failed("写入或校验 Antigravity 凭证失败，已回滚原账号: \(error.localizedDescription)")
         }
 
-        // Step 7: Reopen ONLY previously running bundle(s).
+        // Step 7: Reopen ONLY filtered bundle(s) (by default Stable only; Insiders excluded unless explicitly enabled).
         await processController.reopenApps(urls: reopenURLs)
         let reopenedNames = reopenURLs.map { $0.deletingPathExtension().lastPathComponent }
         return .switched(reopenedApps: reopenedNames)
@@ -2226,6 +2437,14 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
     // MARK: - Safe Client Control
 
     public func controlClient(restart: Bool, allowForceQuit: Bool) async -> SwitchResult {
+        await controlClient(restart: restart, allowForceQuit: allowForceQuit, relaunchInsiders: false)
+    }
+
+    public func controlClient(
+        restart: Bool,
+        allowForceQuit: Bool,
+        relaunchInsiders: Bool
+    ) async -> SwitchResult {
         if !allowForceQuit {
             let status = await detectClientStatus()
             let interactiveCLI = status.runningProcesses.filter { $0.isInteractiveCLI }
@@ -2248,15 +2467,25 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             guard restart else {
                 return .switched(reopenedApps: [])
             }
-            var toOpen = previouslyRunning
-            if toOpen.isEmpty {
+            let toOpen: [URL]
+            if !previouslyRunning.isEmpty {
+                toOpen = Self.filterReopenURLs(
+                    previouslyRunning,
+                    includeInsiders: relaunchInsiders,
+                    stableAppURL: paths.stableAppURL,
+                    insidersAppURL: paths.insidersAppURL
+                )
+            } else {
                 let installed = processController.inspector.installedAppURLs(
                     bundleIDs: Self.bundleIDs,
                     extraPaths: [paths.stableAppURL.path, paths.insidersAppURL.path]
                 )
-                if let first = installed.first {
-                    toOpen = [first]
-                }
+                toOpen = Self.filterReopenURLs(
+                    installed,
+                    includeInsiders: false,
+                    stableAppURL: paths.stableAppURL,
+                    insidersAppURL: paths.insidersAppURL
+                )
             }
             await processController.reopenApps(urls: toOpen)
             return .switched(reopenedApps: toOpen.map { $0.deletingPathExtension().lastPathComponent })

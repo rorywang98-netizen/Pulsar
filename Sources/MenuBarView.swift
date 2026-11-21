@@ -211,6 +211,7 @@ public struct MenuBarView: View {
     @Environment(\.accessibilityReduceMotion) private var envReduceMotion
     @Namespace private var popoverTabNamespace
     @Namespace private var providerPillNamespace
+    @Namespace private var agPoolPillNamespace
 
     @State private var hoveredAccountId: String? = nil
     @State private var confirmRemoveAccountId: String? = nil
@@ -338,6 +339,13 @@ public struct MenuBarView: View {
                 headerBar
                 glassHairlineDivider
 
+                if shouldDisplayUpdateBanner {
+                    updateBannerView
+                        .padding(.horizontal, isNarrowLayout ? 10 : 12)
+                        .padding(.top, 7)
+                        .transition(OrbitMotion.panelTransition)
+                }
+
                 popoverTabSwitcherBar
                     .padding(.horizontal, isNarrowLayout ? 10 : 12)
                     .padding(.top, 7)
@@ -356,6 +364,8 @@ public struct MenuBarView: View {
                 .clipped()
                 .animation(OrbitMotion.snappy, value: store.selectedPopoverTab)
             }
+            .animation(OrbitMotion.snappy, value: shouldDisplayUpdateBanner)
+            .animation(OrbitMotion.snappy, value: store.updatePhase)
 
             if activeResizeEdge != nil || showTransientSizePill {
                 VStack {
@@ -421,6 +431,13 @@ public struct MenuBarView: View {
                 .padding(.horizontal, scrollInset)
                 .padding(.bottom, 4)
 
+            if selectedProvider == .antigravity {
+                antigravityPoolFilterBar
+                    .padding(.horizontal, scrollInset)
+                    .padding(.bottom, 5)
+                    .transition(OrbitMotion.panelTransition)
+            }
+
             if store.shouldShowMigrationBanner {
                 migrationBanner
                     .padding(.horizontal, scrollInset)
@@ -440,7 +457,7 @@ public struct MenuBarView: View {
                     .padding(.horizontal, scrollInset)
                     .padding(.bottom, 7)
                     .transition(OrbitMotion.panelTransition)
-            } else if let banner = store.operationBanner {
+            } else if let banner = store.operationBanner, !shouldSuppressDuplicateUpdateOperationBanner {
                 operationBannerView(banner, isError: store.operationBannerIsError)
                     .padding(.horizontal, scrollInset)
                     .padding(.bottom, 7)
@@ -471,6 +488,7 @@ public struct MenuBarView: View {
         .animation(OrbitMotion.snappy, value: store.busyActionLabel != nil)
         .animation(OrbitMotion.snappy, value: store.operationBanner)
         .animation(OrbitMotion.snappy, value: store.pendingForceQuit?.id)
+        .animation(OrbitMotion.snappy, value: store.effectiveAntigravityPool())
     }
 
     // MARK: - Top Dual-Tab Switcher (Liquid Glass Full-Width Segmented Capsule)
@@ -554,17 +572,17 @@ public struct MenuBarView: View {
             PulsarBrandIconView(size: 32, showGlowShadow: true)
 
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
+                HStack(spacing: isNarrowLayout ? 4 : 5.5) {
                     Text("Pulsar")
-                        .font(.system(size: 14.5, weight: .bold, design: .rounded))
+                        .font(.system(size: isNarrowLayout ? 14 : 14.5, weight: .bold, design: .rounded))
                         .foregroundColor(.primary)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
 
                     Text("v\(AppStore.appVersion)")
-                        .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                        .font(.system(size: isNarrowLayout ? 9 : 9.5, weight: .semibold, design: .monospaced))
                         .foregroundColor(.secondary)
-                        .padding(.horizontal, 5.5)
+                        .padding(.horizontal, isNarrowLayout ? 4.5 : 5.5)
                         .padding(.vertical, 1.5)
                         .background(
                             Capsule()
@@ -579,6 +597,8 @@ public struct MenuBarView: View {
                         )
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
+
+                    headerUpdatePill
                 }
 
                 HStack(spacing: 5) {
@@ -644,6 +664,17 @@ public struct MenuBarView: View {
                             Task { await store.refreshAll() }
                         }
                         Divider()
+                        Button("检查更新…") {
+                            Task {
+                                await store.checkForUpdates(userInitiated: true)
+                                if case .upToDate = store.updatePhase, store.selectedPopoverTab != .quota {
+                                    withAnimation(OrbitMotion.pill) {
+                                        store.selectPopoverTab(.quota)
+                                    }
+                                }
+                            }
+                        }
+                        .disabled(store.updatePhase.isBusy)
                         Button("偏好设置...") {
                             onOpenSettings()
                         }
@@ -674,6 +705,575 @@ public struct MenuBarView: View {
         .padding(.horizontal, isNarrowLayout ? 10 : 13)
         .padding(.top, 9)
         .padding(.bottom, 7)
+    }
+
+    // MARK: - Built-in GitHub Releases Update Badge & Liquid Glass Banner
+
+    private struct HeaderUpdateBadgeSpec {
+        let icon: String
+        let text: String
+        let tooltip: String
+        let lightTextColor: Color
+        let lightGradient: [Color]
+        let darkGradient: [Color]
+        let borderColor: Color
+    }
+
+    private var headerUpdateBadgeSpec: HeaderUpdateBadgeSpec? {
+        guard store.availableUpdateInfo != nil else { return nil }
+        switch store.updatePhase {
+        case .available(let info):
+            return HeaderUpdateBadgeSpec(
+                icon: "arrow.up.circle.fill",
+                text: isNarrowLayout ? "新 v\(info.version)" : "有新版本 v\(info.version)",
+                tooltip: "发现 Pulsar v\(info.version)，点击展开更新详情",
+                lightTextColor: Color(nsColor: .systemBlue),
+                lightGradient: [
+                    Color(nsColor: .systemBlue).opacity(0.18),
+                    Color(nsColor: .systemTeal).opacity(0.15),
+                ],
+                darkGradient: [
+                    Color(nsColor: .systemBlue).opacity(0.46),
+                    Color(nsColor: .systemTeal).opacity(0.36),
+                ],
+                borderColor: Color(nsColor: .systemBlue)
+            )
+        case .downloading(let info, let progress):
+            let pct = Int((min(max(progress, 0.0), 1.0) * 100.0).rounded())
+            return HeaderUpdateBadgeSpec(
+                icon: "arrow.down.circle.fill",
+                text: "下载中 \(pct)%",
+                tooltip: "正在下载 Pulsar v\(info.version)（\(pct)%）",
+                lightTextColor: Color(nsColor: .systemBlue),
+                lightGradient: [
+                    Color(nsColor: .systemBlue).opacity(0.16),
+                    Color(nsColor: .systemIndigo).opacity(0.14),
+                ],
+                darkGradient: [
+                    Color(nsColor: .systemBlue).opacity(0.42),
+                    Color(nsColor: .systemIndigo).opacity(0.34),
+                ],
+                borderColor: Color(nsColor: .systemBlue)
+            )
+        case .verifying(let info):
+            return HeaderUpdateBadgeSpec(
+                icon: "checkmark.shield.fill",
+                text: "校验中…",
+                tooltip: "正在校验 Pulsar v\(info.version) 的 SHA-256 与签名",
+                lightTextColor: Color(nsColor: .systemIndigo),
+                lightGradient: [
+                    Color(nsColor: .systemIndigo).opacity(0.16),
+                    Color(nsColor: .systemBlue).opacity(0.13),
+                ],
+                darkGradient: [
+                    Color(nsColor: .systemIndigo).opacity(0.44),
+                    Color(nsColor: .systemBlue).opacity(0.34),
+                ],
+                borderColor: Color(nsColor: .systemIndigo)
+            )
+        case .installing(let info):
+            return HeaderUpdateBadgeSpec(
+                icon: "gearshape.2.fill",
+                text: "安装中…",
+                tooltip: "正在安装 Pulsar v\(info.version)",
+                lightTextColor: Color(nsColor: .systemIndigo),
+                lightGradient: [
+                    Color(nsColor: .systemIndigo).opacity(0.16),
+                    Color(nsColor: .systemTeal).opacity(0.13),
+                ],
+                darkGradient: [
+                    Color(nsColor: .systemIndigo).opacity(0.44),
+                    Color(nsColor: .systemTeal).opacity(0.34),
+                ],
+                borderColor: Color(nsColor: .systemIndigo)
+            )
+        case .readyToRelaunch(let info):
+            return HeaderUpdateBadgeSpec(
+                icon: "arrow.triangle.2.circlepath",
+                text: "重启中…",
+                tooltip: "Pulsar v\(info.version) 已就绪，正在重启",
+                lightTextColor: Color(nsColor: .systemGreen),
+                lightGradient: [
+                    Color(nsColor: .systemGreen).opacity(0.18),
+                    Color(nsColor: .systemTeal).opacity(0.14),
+                ],
+                darkGradient: [
+                    Color(nsColor: .systemGreen).opacity(0.42),
+                    Color(nsColor: .systemTeal).opacity(0.34),
+                ],
+                borderColor: Color(nsColor: .systemGreen)
+            )
+        case .manualInstallOpened(let info, _):
+            return HeaderUpdateBadgeSpec(
+                icon: "externaldrive.fill",
+                text: isNarrowLayout ? "DMG" : "已打开 DMG",
+                tooltip: "已校验并打开 Pulsar v\(info.version) DMG，点击查看说明",
+                lightTextColor: Color(nsColor: .systemGreen),
+                lightGradient: [
+                    Color(nsColor: .systemGreen).opacity(0.18),
+                    Color(nsColor: .systemTeal).opacity(0.14),
+                ],
+                darkGradient: [
+                    Color(nsColor: .systemGreen).opacity(0.42),
+                    Color(nsColor: .systemTeal).opacity(0.34),
+                ],
+                borderColor: Color(nsColor: .systemGreen)
+            )
+        case .idle, .checking, .upToDate, .failed:
+            return nil
+        }
+    }
+
+    @ViewBuilder
+    private var headerUpdatePill: some View {
+        if let pill = headerUpdateBadgeSpec {
+            let isDark = (colorScheme == .dark)
+            Button {
+                withAnimation(OrbitMotion.snappy) {
+                    if let info = store.availableUpdateInfo,
+                       let skipped = store.registry.settings.skippedUpdateVersion,
+                       skipped.caseInsensitiveCompare(info.version) == .orderedSame {
+                        store.updateSettings { $0.skippedUpdateVersion = nil }
+                    }
+                    store.isUpdateBannerDismissed = false
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: pill.icon)
+                        .font(.system(size: isNarrowLayout ? 8.5 : 9, weight: .semibold))
+                    Text(pill.text)
+                        .font(.system(size: isNarrowLayout ? 9 : 9.5, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.84)
+                        .allowsTightening(true)
+                }
+                .foregroundColor(isDark ? Color.white.opacity(0.95) : pill.lightTextColor)
+                .padding(.horizontal, isNarrowLayout ? 5 : 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: isDark ? pill.darkGradient : pill.lightGradient,
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                )
+                .overlay(
+                    Capsule()
+                        .strokeBorder(
+                            pill.borderColor.opacity(isDark ? 0.56 : 0.36),
+                            lineWidth: 0.7
+                        )
+                )
+                .shadow(
+                    color: pill.borderColor.opacity(isDark ? 0.24 : 0.11),
+                    radius: 2,
+                    y: 0.8
+                )
+                .contentShape(Capsule())
+            }
+            .orbitInteractiveButton(pressedScale: 0.95, hoverTint: nil, cornerRadius: 99)
+            .help(pill.tooltip)
+            .transition(.opacity.combined(with: .scale(scale: 0.92)))
+        }
+    }
+
+    private var shouldDisplayUpdateBanner: Bool {
+        switch store.updatePhase {
+        case .available:
+            return store.shouldShowUpdateBanner
+        case .downloading, .verifying, .installing, .readyToRelaunch:
+            return true
+        case .manualInstallOpened, .failed:
+            return !store.isUpdateBannerDismissed
+        case .idle, .checking, .upToDate:
+            return false
+        }
+    }
+
+    private var shouldSuppressDuplicateUpdateOperationBanner: Bool {
+        guard shouldDisplayUpdateBanner, let banner = store.operationBanner else {
+            return false
+        }
+        switch store.updatePhase {
+        case .failed:
+            return banner.hasPrefix("检查更新失败") || banner.hasPrefix("自动更新失败")
+        case .manualInstallOpened:
+            return banner.hasPrefix("已校验并打开安装包")
+        default:
+            return false
+        }
+    }
+
+    private var updateBannerHighlightColor: Color {
+        switch store.updatePhase {
+        case .failed:
+            return Color(nsColor: .systemRed)
+        case .manualInstallOpened, .readyToRelaunch:
+            return Color(nsColor: .systemGreen)
+        case .available, .downloading, .verifying, .installing, .idle, .checking, .upToDate:
+            return Color.accentColor
+        }
+    }
+
+    private func closeUpdateBanner() {
+        withAnimation(OrbitMotion.snappy) {
+            let shouldClearOp = shouldSuppressDuplicateUpdateOperationBanner
+            store.dismissUpdateBanner()
+            if shouldClearOp {
+                store.dismissOperationBanner()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var updateBannerView: some View {
+        let isDark = (colorScheme == .dark)
+
+        VStack(alignment: .leading, spacing: 7) {
+            switch store.updatePhase {
+            case .available(let info):
+                let notesSummary = compactReleaseNotesSummary(from: info.releaseNotes)
+                HStack(alignment: .center, spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.accentColor)
+
+                    Text("发现新版本 v\(info.version)")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    if let bytes = info.assetSizeBytes, bytes > 0, !isNarrowLayout {
+                        Text(formattedByteSize(bytes))
+                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.primary.opacity(isDark ? 0.10 : 0.06))
+                            .clipShape(Capsule())
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        closeUpdateBanner()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("暂时收起")
+                }
+
+                if !notesSummary.isEmpty {
+                    Text(notesSummary)
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack(spacing: isNarrowLayout ? 5 : 6) {
+                    Button {
+                        store.startUpdateDownloadAndInstall()
+                    } label: {
+                        HStack(spacing: 3.5) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("一键更新")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+
+                    Button {
+                        store.openUpdateReleasePage()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text("Release")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 8.5, weight: .semibold))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        withAnimation(OrbitMotion.snappy) {
+                            store.skipAvailableUpdate()
+                        }
+                    } label: {
+                        Text("忽略")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.plain)
+                    .help("忽略 v\(info.version)，不再自动提示此版本")
+                }
+
+            case .downloading(let info, let progress):
+                let clamped = min(max(progress, 0.0), 1.0)
+                let pct = Int((clamped * 100.0).rounded())
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                    Text("正在下载 Pulsar v\(info.version)…")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    Text("\(pct)%")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .orbitNumericTransition()
+                        .foregroundColor(.accentColor)
+                }
+
+                OrbitAnimatedProgressBar(
+                    fraction: clamped,
+                    tint: .accentColor,
+                    trackColor: Color.primary.opacity(isDark ? 0.14 : 0.10),
+                    height: 5,
+                    minFillWidth: 4,
+                    animateOnAppear: false
+                )
+
+                Text("完成后将自动校验 SHA-256 哈希与代码签名")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+
+            case .verifying(let info):
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.76)
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text("正在校验 Pulsar v\(info.version)…")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                        Text("核对 SHA-256 校验和、Bundle ID 与代码签名")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 2)
+                }
+
+            case .installing(let info):
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.76)
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text("正在安装 Pulsar v\(info.version)…")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                        Text("正在安全替换应用包并保留本地账号与配置")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 2)
+                }
+
+            case .readyToRelaunch(let info):
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Color(nsColor: .systemGreen))
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text("Pulsar v\(info.version) 安装完成，正在重启…")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                        Text("片刻后将自动恢复菜单栏图标")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 2)
+                }
+
+            case .manualInstallOpened(let info, let dmgPath):
+                HStack(alignment: .center, spacing: 6) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color(nsColor: .systemGreen))
+                    Text("已打开 v\(info.version) 安装包")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button {
+                        closeUpdateBanner()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("关闭提示")
+                }
+
+                Text("已通过 SHA-256 校验并打开 DMG，请拖入 Applications 完成替换")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 6) {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: dmgPath)])
+                    } label: {
+                        Label("在访达中显示", systemImage: "folder")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        store.openUpdateReleasePage()
+                    } label: {
+                        Text("Release")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer(minLength: 2)
+                }
+
+            case .failed(let message):
+                HStack(alignment: .center, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color(nsColor: .systemRed))
+                    Text("更新失败")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button {
+                        closeUpdateBanner()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("关闭错误提示")
+                }
+
+                Text(message)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 6) {
+                    Button {
+                        Task { await store.checkForUpdates(userInitiated: true) }
+                    } label: {
+                        Label("重试", systemImage: "arrow.clockwise")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+
+                    Button {
+                        store.openUpdateReleasePage()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text("前往 GitHub 下载")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 8.5, weight: .semibold))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer(minLength: 2)
+                }
+
+            case .idle, .checking, .upToDate:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, isNarrowLayout ? 9.5 : 11)
+        .padding(.vertical, 8.5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .orbitCardStyle(
+            cornerRadius: 11,
+            isHighlighted: true,
+            highlightColor: updateBannerHighlightColor,
+            hoverLift: false
+        )
+    }
+
+    private func compactReleaseNotesSummary(from raw: String) -> String {
+        let lines = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: .newlines)
+            .map { line -> String in
+                var cleaned = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                while cleaned.hasPrefix("#") {
+                    cleaned = String(cleaned.dropFirst()).trimmingCharacters(in: .whitespaces)
+                }
+                if cleaned.hasPrefix("- ") || cleaned.hasPrefix("* ") || cleaned.hasPrefix("• ") {
+                    cleaned = "• " + String(cleaned.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                }
+                cleaned = cleaned
+                    .replacingOccurrences(of: "**", with: "")
+                    .replacingOccurrences(of: "__", with: "")
+                    .replacingOccurrences(of: "`", with: "")
+                return cleaned
+            }
+            .filter { !$0.isEmpty }
+        return lines.prefix(3).joined(separator: "  ")
+    }
+
+    private func formattedByteSize(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useKB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
     }
 
     @ViewBuilder
@@ -1043,12 +1643,127 @@ public struct MenuBarView: View {
         .frame(minHeight: 20)
     }
 
-    private var quotaCustomizePopoverView: some View {
+    // MARK: - Antigravity Pool Quick Filter Bar & Label Helpers
+
+    private func agPoolGridLabel(_ pool: AntigravityPoolPreference) -> String {
+        switch pool {
+        case .autoLowest: return "全部池最低"
+        case .gemini: return "Gemini (AGY)"
+        case .claude: return "Claude / GPT"
+        case .argon: return "Argon"
+        }
+    }
+
+    private func agPoolFilterChipLabel(_ pool: AntigravityPoolPreference) -> String {
+        switch pool {
+        case .autoLowest: return "全部"
+        case .gemini: return "Gemini"
+        case .claude: return "Claude / GPT"
+        case .argon: return "Argon"
+        }
+    }
+
+    private func agPoolHumanName(_ pool: AntigravityPoolPreference) -> String {
+        switch pool {
+        case .autoLowest: return "全部"
+        case .gemini: return "Gemini"
+        case .claude: return "Claude / GPT"
+        case .argon: return "Argon"
+        }
+    }
+
+    private var antigravityPoolFilterBar: some View {
+        let activePool = store.effectiveAntigravityPool()
+        let isDark = (colorScheme == .dark)
+
+        return HStack(spacing: isNarrowLayout ? 5 : 7) {
+            HStack(spacing: 3) {
+                if !isNarrowLayout {
+                    Image(systemName: "line.3.horizontal.decrease")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
+                Text("追踪池")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            OrbitGlassContainer(spacing: 2) {
+                HStack(spacing: 2) {
+                    ForEach(AntigravityPoolPreference.allCases) { pool in
+                        let isSelected = (activePool == pool)
+                        Button {
+                            withAnimation(OrbitMotion.pill) {
+                                store.setAntigravityPool(pool)
+                            }
+                        } label: {
+                            Text(agPoolFilterChipLabel(pool))
+                                .font(.system(
+                                    size: isNarrowLayout ? 10 : 10.5,
+                                    weight: isSelected ? .semibold : .medium
+                                ))
+                                .foregroundColor(
+                                    isSelected
+                                        ? (isDark ? Color.white : Color.accentColor)
+                                        : glassSecondaryInk
+                                )
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, isNarrowLayout ? 6 : 8)
+                                .padding(.vertical, 3.5)
+                                .frame(maxWidth: .infinity)
+                                .contentShape(Capsule())
+                                .background {
+                                    if isSelected {
+                                        Capsule()
+                                            .fill(
+                                                LinearGradient(
+                                                    colors: isDark
+                                                        ? [Color.accentColor.opacity(0.36), Color.accentColor.opacity(0.22)]
+                                                        : [Color.white.opacity(0.95), Color.accentColor.opacity(0.12)],
+                                                    startPoint: .top,
+                                                    endPoint: .bottom
+                                                )
+                                            )
+                                            .overlay(
+                                                Capsule()
+                                                    .strokeBorder(
+                                                        Color.accentColor.opacity(isDark ? 0.62 : 0.45),
+                                                        lineWidth: 0.75
+                                                    )
+                                            )
+                                            .shadow(
+                                                color: Color.black.opacity(isDark ? 0.24 : 0.07),
+                                                radius: 1.8,
+                                                y: 0.8
+                                            )
+                                            .matchedGeometryEffect(id: "activeAgPoolPill", in: agPoolPillNamespace)
+                                    }
+                                }
+                        }
+                        .orbitInteractiveButton(pressedScale: 0.96, hoverTint: nil, cornerRadius: 99)
+                        .help("追踪 \(agPoolGridLabel(pool))：同步作用于顶部状态栏、AGY 胶囊、预警色与「最多」角标")
+                    }
+                }
+                .padding(2)
+                .background(Capsule().fill(glassControlTintFill))
+                .overlay(Capsule().strokeBorder(glassControlSpecularBorder, lineWidth: 0.6))
+                .orbitGlassCapsule(interactive: false)
+            }
+        }
+        .padding(.horizontal, 1)
+    }
+
+    var quotaCustomizePopoverView: some View {
         let cfg = accountCardConfig
+        let activeAgPool = store.effectiveAntigravityPool()
+        let isSingleAgPoolSelected = (activeAgPool != .autoLowest)
         let currentW = Int(settings.popoverWidth.rounded())
         let currentH = Int(settings.popoverHeight.rounded())
 
-        return VStack(alignment: .leading, spacing: 11) {
+        return VStack(alignment: .leading, spacing: 8.5) {
             HStack(spacing: 6) {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 12, weight: .semibold))
@@ -1124,8 +1839,8 @@ public struct MenuBarView: View {
 
             Divider().opacity(0.45)
 
-            // 2. Account card display toggles
-            VStack(alignment: .leading, spacing: 5.5) {
+            // 2. Account card display toggles (strictly right-aligned switches)
+            VStack(alignment: .leading, spacing: 4.5) {
                 Text("额度卡片显示项")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.secondary)
@@ -1176,7 +1891,95 @@ public struct MenuBarView: View {
 
             Divider().opacity(0.45)
 
-            // 3. Popover size presets
+            // 3. Antigravity tracked pool selector (right below 紧凑密度布局)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text("Antigravity 追踪池")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    if isSingleAgPoolSelected {
+                        Text(agPoolHumanName(activeAgPool))
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.accentColor)
+                            .padding(.horizontal, 5.5)
+                            .padding(.vertical, 1.5)
+                            .background(Color.accentColor.opacity(0.13))
+                            .clipShape(Capsule())
+                    }
+                }
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 5),
+                        GridItem(.flexible(), spacing: 5),
+                    ],
+                    spacing: 5
+                ) {
+                    ForEach(AntigravityPoolPreference.allCases) { pool in
+                        let isSelected = (activeAgPool == pool)
+                        Button {
+                            withAnimation(OrbitMotion.snappy) {
+                                store.setAntigravityPool(pool)
+                            }
+                        } label: {
+                            Text(agPoolGridLabel(pool))
+                                .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                                .foregroundColor(isSelected ? .accentColor : .primary.opacity(0.85))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                                        .fill(
+                                            isSelected
+                                                ? Color.accentColor.opacity(0.15)
+                                                : Color.primary.opacity(0.05)
+                                        )
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                                        .stroke(
+                                            isSelected
+                                                ? Color.accentColor.opacity(0.55)
+                                                : Color.primary.opacity(0.08),
+                                            lineWidth: isSelected ? 1 : 0.6
+                                        )
+                                )
+                        }
+                        .orbitInteractiveButton(pressedScale: 0.96, hoverTint: nil, cornerRadius: 6.5)
+                    }
+                }
+
+                Text("同步作用于顶部状态栏、AGY 胶囊、预警色与「最多」角标（选 Gemini 时不再被 Claude/GPT 低周额拉黄）")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    customizeToggleRow(
+                        title: "卡片仅显示所选池",
+                        isOn: Binding(
+                            get: { store.registry.settings.accountCardConfig.filterAntigravityCardPools },
+                            set: { value in store.updateAccountCardConfig { $0.filterAntigravityCardPools = value } }
+                        ),
+                        disabled: !isSingleAgPoolSelected
+                    )
+                    .opacity(isSingleAgPoolSelected ? 1.0 : 0.72)
+
+                    if !isSingleAgPoolSelected {
+                        Text("选择单个追踪池后生效（当前为全部池最低）")
+                            .font(.system(size: 9.5))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.top, 2)
+            }
+
+            Divider().opacity(0.45)
+
+            // 4. Popover size presets
             VStack(alignment: .leading, spacing: 5) {
                 Text("弹窗尺寸预设")
                     .font(.system(size: 11, weight: .semibold))
@@ -1233,6 +2036,7 @@ public struct MenuBarView: View {
                 Button("恢复默认") {
                     withAnimation(OrbitMotion.snappy) {
                         store.resetAccountCardConfig()
+                        store.setAntigravityPool(.autoLowest)
                         store.resetWindowSizes()
                     }
                 }
@@ -1249,17 +2053,28 @@ public struct MenuBarView: View {
             }
         }
         .padding(12)
-        .frame(width: 274)
+        .frame(width: 286)
     }
 
-    private func customizeToggleRow(title: String, isOn: Binding<Bool>) -> some View {
-        Toggle(isOn: isOn) {
+    private func customizeToggleRow(
+        title: String,
+        isOn: Binding<Bool>,
+        disabled: Bool = false
+    ) -> some View {
+        HStack(alignment: .center, spacing: 8) {
             Text(title)
                 .font(.system(size: 11.5))
-                .foregroundColor(.primary)
+                .foregroundColor(disabled ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 8)
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(disabled)
         }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
+        .frame(maxWidth: .infinity)
     }
 
     private func applyPopoverSizePreset(width: Double, height: Double) {
@@ -1710,10 +2525,27 @@ public struct MenuBarView: View {
         let displayPlan = snap?.plan ?? account.plan
         let avatarTint = OrbitTheme.avatarColor(seed: account.email.isEmpty ? account.displayName : account.email)
         let cfg = accountCardConfig
-        let visibleWindows = filteredVisibleWindows(from: snap?.windows ?? [])
+        let activeAgPool: AntigravityPoolPreference = (provider == .antigravity)
+            ? store.effectiveAntigravityPool()
+            : .autoLowest
+        let isAgPoolFocused = (provider == .antigravity && activeAgPool != .autoLowest)
+        let isAgPoolFiltered = (isAgPoolFocused && cfg.filterAntigravityCardPools)
+        let rawWindows = snap?.windows ?? []
+        let poolScopedRawWindows = isAgPoolFiltered
+            ? rawWindows.filter { store.isAntigravityWindowMatchingPool($0) }
+            : rawWindows
+        let visibleWindows = filteredVisibleWindows(from: poolScopedRawWindows)
+        let missingFilteredAgPool = isAgPoolFiltered
+            && !rawWindows.isEmpty
+            && poolScopedRawWindows.isEmpty
         let focusFooter: (text: String, tooltip: String)? = {
             guard cfg.showResetFootnote, let snap, snap.status.isReady else { return nil }
-            return focusFooterSummary(for: snap, visibleWindows: visibleWindows)
+            return focusFooterSummary(
+                for: snap,
+                visibleWindows: visibleWindows,
+                preferredAntigravityPool: activeAgPool,
+                strictPoolFilter: isAgPoolFiltered
+            )
         }()
         let hasSourceBadge = cfg.showSourceBadge && (snap?.sourceLabel.isEmpty == false)
         let showStandaloneFooter = hasSourceBadge || isConfirmingRemove
@@ -1817,7 +2649,9 @@ public struct MenuBarView: View {
                 focusFooter: focusFooter,
                 showInlineRemoveOnFootnote: showRemoveInFootnoteRow,
                 isHovered: isHovered,
-                accountId: account.id
+                accountId: account.id,
+                focusedAntigravityPool: isAgPoolFocused ? activeAgPool : nil,
+                missingFilteredAntigravityPool: missingFilteredAgPool ? activeAgPool : nil
             )
 
             // Compact footer: source label + hover-revealed remove / inline confirmation
@@ -2193,6 +3027,28 @@ public struct MenuBarView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 
+    private func missingAntigravityPoolRow(pool: AntigravityPoolPreference) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "circle.slash")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.secondary.opacity(0.75))
+            Text("该账号不含 \(agPoolHumanName(pool)) 额度池")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 7.5)
+        .padding(.vertical, isCompactCards ? 3.5 : 4.5)
+        .background(Color.primary.opacity(colorScheme == .dark ? 0.05 : 0.035))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                .stroke(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), lineWidth: 0.6)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+    }
+
     @ViewBuilder
     private func accountQuotaBody(
         snapshot: QuotaSnapshot?,
@@ -2200,7 +3056,9 @@ public struct MenuBarView: View {
         focusFooter: (text: String, tooltip: String)?,
         showInlineRemoveOnFootnote: Bool,
         isHovered: Bool,
-        accountId: String
+        accountId: String,
+        focusedAntigravityPool: AntigravityPoolPreference? = nil,
+        missingFilteredAntigravityPool: AntigravityPoolPreference? = nil
     ) -> some View {
         if let snapshot {
             switch snapshot.status {
@@ -2222,12 +3080,21 @@ public struct MenuBarView: View {
                         .foregroundColor(.secondary)
                 } else {
                     let groups = groupAccountWindows(visibleWindows)
+                    let hasActivePoolFocus = (focusedAntigravityPool != nil)
                     VStack(alignment: .leading, spacing: isCompactCards ? 2.5 : 4) {
-                        if groups.isEmpty && !snapshot.windows.isEmpty {
+                        if let missingPool = missingFilteredAntigravityPool {
+                            missingAntigravityPoolRow(pool: missingPool)
+                        } else if groups.isEmpty && !snapshot.windows.isEmpty {
                             hiddenQuotaWindowsCompactRow
                         } else {
                             ForEach(groups) { group in
-                                accountMatrixGroupRows(group)
+                                let isFocusedRow = hasActivePoolFocus
+                                    && group.items.contains { store.isAntigravityWindowMatchingPool($0.window) }
+                                accountMatrixGroupRows(
+                                    group,
+                                    isFocusedPool: isFocusedRow,
+                                    hasPoolFocusContext: hasActivePoolFocus
+                                )
                             }
                         }
 
@@ -2273,25 +3140,45 @@ public struct MenuBarView: View {
     }
 
     @ViewBuilder
-    private func accountMatrixGroupRows(_ group: AccountWindowGroup) -> some View {
+    private func accountMatrixGroupRows(
+        _ group: AccountWindowGroup,
+        isFocusedPool: Bool = false,
+        hasPoolFocusContext: Bool = false
+    ) -> some View {
         let poolTitle = (group.poolName?.isEmpty == false) ? group.poolName! : "主额度"
         let rowChunks: [[ParsedWindowMeta]] = stride(from: 0, to: group.items.count, by: 2).map { start in
             Array(group.items[start..<min(start + 2, group.items.count)])
         }
-        let poolLabelWidth: CGFloat = isNarrowLayout ? 54 : (popoverWidth < 410 ? 64 : 74)
+        let baseLabelWidth: CGFloat = isNarrowLayout ? 54 : (popoverWidth < 410 ? 64 : 74)
+        let poolLabelWidth: CGFloat = hasPoolFocusContext ? (baseLabelWidth + 5) : baseLabelWidth
         let rowGap: CGFloat = isNarrowLayout ? 4 : 6
         let cellGap: CGFloat = isNarrowLayout ? 6 : (popoverWidth < 410 ? 8 : 10)
+        let isDark = (colorScheme == .dark)
 
         ForEach(Array(rowChunks.enumerated()), id: \.offset) { chunkIdx, chunk in
             HStack(alignment: .center, spacing: rowGap) {
                 if chunkIdx == 0 {
-                    Text(poolTitle)
-                        .font(.system(size: isNarrowLayout ? 10.5 : 11, weight: .medium))
-                        .foregroundColor(.primary.opacity(0.86))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(width: poolLabelWidth, alignment: .leading)
-                        .help(poolTitle)
+                    HStack(spacing: 4) {
+                        if isFocusedPool {
+                            Circle()
+                                .fill(Color.accentColor)
+                                .frame(width: 4.5, height: 4.5)
+                        }
+                        Text(poolTitle)
+                            .font(.system(
+                                size: isNarrowLayout ? 10.5 : 11,
+                                weight: isFocusedPool ? .semibold : .medium
+                            ))
+                            .foregroundColor(
+                                isFocusedPool
+                                    ? .primary
+                                    : (hasPoolFocusContext ? .primary.opacity(0.68) : .primary.opacity(0.86))
+                            )
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .frame(width: poolLabelWidth, alignment: .leading)
+                    .help(isFocusedPool ? "\(poolTitle)（当前追踪池）" : poolTitle)
                 } else {
                     Color.clear
                         .frame(width: poolLabelWidth, height: 1)
@@ -2326,6 +3213,14 @@ public struct MenuBarView: View {
                 }
             }
             .frame(minHeight: isCompactCards ? 13 : 15)
+            .background {
+                if isFocusedPool {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(Color.accentColor.opacity(isDark ? 0.13 : 0.075))
+                        .padding(.horizontal, -4)
+                        .padding(.vertical, -1.5)
+                }
+            }
         }
     }
 
@@ -2431,10 +3326,31 @@ public struct MenuBarView: View {
 
     private func focusFooterSummary(
         for snapshot: QuotaSnapshot,
-        visibleWindows: [QuotaWindow]
+        visibleWindows: [QuotaWindow],
+        preferredAntigravityPool: AntigravityPoolPreference = .autoLowest,
+        strictPoolFilter: Bool = false
     ) -> (text: String, tooltip: String)? {
-        let sourceWindows = visibleWindows.isEmpty ? snapshot.windows : visibleWindows
-        let resetCandidates = sourceWindows.filter { $0.resetAt != nil }
+        let baseWindows: [QuotaWindow]
+        if strictPoolFilter && preferredAntigravityPool != .autoLowest {
+            baseWindows = visibleWindows.isEmpty
+                ? snapshot.windows.filter { store.isAntigravityWindowMatchingPool($0) }
+                : visibleWindows
+        } else {
+            baseWindows = visibleWindows.isEmpty ? snapshot.windows : visibleWindows
+        }
+
+        let resetCandidates: [QuotaWindow]
+        if preferredAntigravityPool != .autoLowest && !strictPoolFilter {
+            let preferredCandidates = baseWindows.filter {
+                store.isAntigravityWindowMatchingPool($0) && $0.resetAt != nil
+            }
+            resetCandidates = preferredCandidates.isEmpty
+                ? baseWindows.filter { $0.resetAt != nil }
+                : preferredCandidates
+        } else {
+            resetCandidates = baseWindows.filter { $0.resetAt != nil }
+        }
+
         let nonFullCandidates = resetCandidates.filter { $0.remainingFraction < 0.999 }
         let poolToSearch = nonFullCandidates.isEmpty ? resetCandidates : nonFullCandidates
 

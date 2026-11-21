@@ -4582,7 +4582,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.1.0", "AppStore.appVersion must match v1.1.0")
+        T.expectEqual(AppStore.appVersion, "1.2.0", "AppStore.appVersion must match v1.2.0")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -4676,8 +4676,8 @@ private func testV110RegressionSuite() async {
             let plistData = try Data(contentsOf: plistURL)
             let plist = try PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any]
             T.expectEqual(plist?["CFBundleDisplayName"] as? String, "Pulsar")
-            T.expectEqual(plist?["CFBundleShortVersionString"] as? String, "1.1.0")
-            T.expectEqual(plist?["CFBundleVersion"] as? String, "1.1.0")
+            T.expectEqual(plist?["CFBundleShortVersionString"] as? String, AppStore.appVersion)
+            T.expectEqual(plist?["CFBundleVersion"] as? String, AppStore.appVersion)
             T.expectEqual(plist?["CFBundleIconFile"] as? String, "AppIcon")
         }
     }
@@ -5280,6 +5280,841 @@ private func testV110RegressionSuite() async {
     }
 }
 
+// MARK: - Test 16: v1.2.0 Regression Suite (Stable-Only Relaunch, Fresh Reset Sync, AGY Pool Unification, Zero False Warning & ReleaseUpdater)
+
+private func testV120RegressionSuite() async {
+    // 16.1 Antigravity Stable-Only Relaunch (filterReopenURLs & AppStore setting)
+    await T.asyncSuite("V120.AntigravityFilterReopenURLsAndSetting") {
+        let stableURL = URL(fileURLWithPath: "/Applications/Antigravity.app", isDirectory: true)
+        let insidersURL = URL(fileURLWithPath: "/Applications/Antigravity - Insiders.app", isDirectory: true)
+        let customStableURL = URL(fileURLWithPath: "/Users/example/Applications/Antigravity.app", isDirectory: true)
+        let customInsidersURL = URL(fileURLWithPath: "/Users/example/Applications/Antigravity-INSIDERS.app", isDirectory: true)
+
+        // Default includeInsiders == false: filters Insiders & keeps at most 1 Stable URL
+        let bothFiltered = AntigravityProvider.filterReopenURLs(
+            [insidersURL, stableURL],
+            includeInsiders: false,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { _ in true }
+        )
+        T.expectEqual(bothFiltered, [stableURL], "both running + includeInsiders=false must reopen only 1 Stable app")
+
+        // Stable + Insiders + duplicate Stable -> still strictly 1 Stable URL
+        let multiStableFiltered = AntigravityProvider.filterReopenURLs(
+            [stableURL, insidersURL, stableURL, customStableURL],
+            includeInsiders: false,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { _ in true }
+        )
+        T.expectEqual(multiStableFiltered, [stableURL], "must never relaunch multiple Stable bundles simultaneously")
+
+        // Only Insiders running + Stable exists on disk -> switches back to Stable
+        let insidersToStable = AntigravityProvider.filterReopenURLs(
+            [insidersURL],
+            includeInsiders: false,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { path in path == stableURL.path }
+        )
+        T.expectEqual(insidersToStable, [stableURL], "only Insiders running + Stable installed must reopen Stable")
+
+        // Case-insensitive insiders name detection + Stable exists -> switches to Stable
+        let customInsidersToStable = AntigravityProvider.filterReopenURLs(
+            [customInsidersURL],
+            includeInsiders: false,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { path in path == stableURL.path }
+        )
+        T.expectEqual(customInsidersToStable, [stableURL], "case-insensitive insiders bundle name must be recognized")
+
+        // Only Insiders running + Stable NOT installed -> fallback to [insidersURL] (never empty)
+        let insidersFallback = AntigravityProvider.filterReopenURLs(
+            [insidersURL],
+            includeInsiders: false,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { _ in false }
+        )
+        T.expectEqual(insidersFallback, [insidersURL], "when Stable does not exist, must fall back to existing Insiders instead of empty")
+
+        // Empty input -> returns [] (never launches GUI unsolicited)
+        let emptyResult = AntigravityProvider.filterReopenURLs(
+            [],
+            includeInsiders: false,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { _ in true }
+        )
+        T.expectEqual(emptyResult, [], "empty reopen list must stay empty")
+
+        let emptyIncludeInsiders = AntigravityProvider.filterReopenURLs(
+            [],
+            includeInsiders: true,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { _ in true }
+        )
+        T.expectEqual(emptyIncludeInsiders, [], "empty reopen list with includeInsiders=true must stay empty")
+
+        // includeInsiders == true -> keeps both Stable and Insiders (deduplicated)
+        let bothPreserved = AntigravityProvider.filterReopenURLs(
+            [stableURL, insidersURL, stableURL],
+            includeInsiders: true,
+            stableAppURL: stableURL,
+            insidersAppURL: insidersURL,
+            fileExists: { _ in true }
+        )
+        T.expectEqual(bothPreserved, [stableURL, insidersURL], "includeInsiders=true must preserve deduplicated Stable + Insiders")
+
+        // AppStore persistence for relaunchAntigravityInsiders (default false)
+        let dir = try makeTempDir(prefix: "pulsar-v120-relaunch")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let regURL = dir.appendingPathComponent("registry.json")
+        let store = await MainActor.run {
+            AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector()),
+                adapters: [:],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: TokenUsageEngine(homeDirectoryURL: dir, appSupportURL: dir),
+                accountPoolExporter: AccountPoolExporter(appSupportURL: dir),
+                persistAccountPoolExport: false
+            )
+        }
+        let defaultFlag = await MainActor.run { store.registry.settings.relaunchAntigravityInsiders }
+        T.expectEqual(defaultFlag, false, "relaunchAntigravityInsiders must default to false")
+        await MainActor.run { store.setRelaunchAntigravityInsiders(true) }
+        let reloaded = try RegistryData.load(from: regURL)
+        T.expectEqual(reloaded.settings.relaunchAntigravityInsiders, true)
+    }
+
+    // 16.2 Antigravity Freshness, Anti-Cache Reset Sanitization & Stale Refresh Detection
+    await T.asyncSuite("V120.AntigravityFreshnessAndExpiredResetDetection") {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let past10s = now.addingTimeInterval(-10)
+        let past2s = now.addingTimeInterval(-2)
+        let future1h = now.addingTimeInterval(3_600)
+
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        let past10sISO = fmt.string(from: past10s)
+        let future1hISO = fmt.string(from: future1h)
+
+        // containsExpiredQuotaWindows unit checks
+        let expiredWin = QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.40, resetAt: past10s)
+        let withinGraceWin = QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.40, resetAt: past2s)
+        let fullPastWin = QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 1.0, resetAt: past10s)
+        let futureWin = QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.40, resetAt: future1h)
+        let noResetWin = QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.40, resetAt: nil)
+
+        T.expectEqual(AntigravityProvider.containsExpiredQuotaWindows([expiredWin], now: now), true, "remaining < 1.0 & resetAt <= now - 5s must be flagged expired")
+        T.expectEqual(AntigravityProvider.containsExpiredQuotaWindows([withinGraceWin], now: now), false, "resetAt within 5s grace must not be flagged expired")
+        T.expectEqual(AntigravityProvider.containsExpiredQuotaWindows([fullPastWin], now: now), false, "full 1.0 window must not be flagged expired")
+        T.expectEqual(AntigravityProvider.containsExpiredQuotaWindows([futureWin], now: now), false, "future resetAt must not be flagged expired")
+        T.expectEqual(AntigravityProvider.containsExpiredQuotaWindows([noResetWin], now: now), false, "nil resetAt must not be flagged expired")
+
+        // parseQuotaSummaryWindows: remaining == 1.0 && resetAt <= now clears stale resetAt;
+        // remaining < 1.0 && resetAt <= now - 5s retains past resetAt & triggers containsExpiredQuotaWindows
+        let summaryJSON: [String: Any] = [
+            "summary": [
+                "groups": [
+                    [
+                        "displayName": "Gemini",
+                        "buckets": [
+                            [
+                                "window": "5h",
+                                "remainingFraction": 1.0,
+                                "resetTime": past10sISO,
+                            ],
+                            [
+                                "window": "weekly",
+                                "remainingFraction": 0.65,
+                                "resetTime": future1hISO,
+                            ],
+                        ],
+                    ],
+                    [
+                        "displayName": "Claude",
+                        "buckets": [
+                            [
+                                "window": "5h",
+                                "remainingFraction": 0.25,
+                                "resetTime": past10sISO,
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+        let summaryWindows = AntigravityProvider.parseQuotaSummaryWindows(from: summaryJSON, now: now)
+        let summaryGem5h = summaryWindows.first { $0.antigravityPoolKind == .gemini && $0.windowSeconds == 18_000 }
+        let summaryGemWk = summaryWindows.first { $0.antigravityPoolKind == .gemini && $0.windowSeconds == 604_800 }
+        let summaryClaude5h = summaryWindows.first { $0.antigravityPoolKind == .claude }
+        T.expect(summaryGem5h != nil, "expected Gemini 5h window from summary parser")
+        T.expectEqual(summaryGem5h?.remainingFraction, 1.0)
+        T.expectEqual(summaryGem5h?.resetAt, nil, "parseQuotaSummaryWindows must clear past resetAt when remaining == 1.0")
+        T.expect(summaryGemWk?.resetAt != nil, "future resetAt must be preserved")
+        T.expect(summaryClaude5h != nil, "expected Claude 5h window from summary parser")
+        T.expect(summaryClaude5h?.resetAt != nil, "past resetAt must remain when remaining < 1.0 so expiry is detected")
+        T.expectEqual(
+            AntigravityProvider.containsExpiredQuotaWindows([summaryGem5h!, summaryGemWk!], now: now),
+            false,
+            "fresh Gemini windows must not trigger expired check"
+        )
+        T.expectEqual(
+            AntigravityProvider.containsExpiredQuotaWindows(summaryWindows, now: now),
+            true,
+            "summary windows with remaining < 1.0 & past resetAt must be marked expired"
+        )
+
+        // parseModelConfigWindows: same sanitization & expiry detection
+        let modelConfigJSON: [String: Any] = [
+            "userStatus": [
+                "cascadeModelConfigData": [
+                    "clientModelConfigs": [
+                        [
+                            "label": "Gemini 3 Pro",
+                            "modelOrAlias": ["model": "gemini-3-pro"],
+                            "quotaInfo": [
+                                "remainingFraction": 1.0,
+                                "resetTime": past10sISO,
+                            ],
+                        ],
+                        [
+                            "label": "Claude Sonnet",
+                            "modelOrAlias": ["model": "claude-sonnet"],
+                            "quotaInfo": [
+                                "remainingFraction": 0.50,
+                                "resetTime": past10sISO,
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+        let cfgWindows = AntigravityProvider.parseModelConfigWindows(from: modelConfigJSON, now: now)
+        let cfgGem = cfgWindows.first { $0.antigravityPoolKind == .gemini }
+        let cfgClaude = cfgWindows.first { $0.antigravityPoolKind == .claude }
+        T.expect(cfgGem != nil && cfgClaude != nil, "expected Gemini and Claude windows from modelConfig parser")
+        T.expectEqual(cfgGem?.resetAt, nil, "parseModelConfigWindows must clear past resetAt when remaining == 1.0")
+        T.expect(cfgClaude?.resetAt != nil, "parseModelConfigWindows must preserve past resetAt when remaining < 1.0")
+        T.expectEqual(AntigravityProvider.containsExpiredQuotaWindows(cfgWindows, now: now), true)
+
+        // AppStore.hasExpiredResetWindow
+        let snapJustExpired = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "ag:a",
+            windows: [QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.30, resetAt: now.addingTimeInterval(-30))],
+            status: .ready(fetchedAt: now.addingTimeInterval(-120), stale: false),
+            primaryRemainingPercent: 30
+        )
+        let snapFetchedAfterReset = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "ag:b",
+            windows: [QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 1.0, resetAt: now.addingTimeInterval(-30))],
+            status: .ready(fetchedAt: now.addingTimeInterval(-5), stale: false),
+            primaryRemainingPercent: 100
+        )
+        let snapFutureReset = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "ag:c",
+            windows: [QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.70, resetAt: future1h)],
+            status: .ready(fetchedAt: now.addingTimeInterval(-10), stale: false),
+            primaryRemainingPercent: 70
+        )
+        let snapFailed = QuotaSnapshot.failed(provider: .antigravity, accountId: "ag:d", message: "timeout")
+
+        T.expectEqual(AppStore.hasExpiredResetWindow(in: snapJustExpired, now: now), true, "fetchedAt < resetAt <= now must trigger hasExpiredResetWindow")
+        T.expectEqual(AppStore.hasExpiredResetWindow(in: snapFetchedAfterReset, now: now), false, "fetchedAt >= resetAt must not trigger hasExpiredResetWindow")
+        T.expectEqual(AppStore.hasExpiredResetWindow(in: snapFutureReset, now: now), false, "future resetAt must not trigger hasExpiredResetWindow")
+        T.expectEqual(AppStore.hasExpiredResetWindow(in: snapFailed, now: now), false, "non-ready snapshot must not trigger hasExpiredResetWindow")
+
+        // AppStore.providersNeedingStaleRefresh
+        struct StubAdapter: ProviderAdapter {
+            let id: ProviderID
+            let capabilities: ProviderCapability = [.quota]
+            func syncLiveAccount(registry: inout RegistryData) async -> String? { nil }
+            func fetchQuota(for account: AccountRecord, isActiveLive: Bool) async -> QuotaSnapshot {
+                QuotaSnapshot.unconfigured(provider: id, accountId: account.id, message: "stub")
+            }
+        }
+
+        let dir = try makeTempDir(prefix: "pulsar-v120-stale")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let regURL = dir.appendingPathComponent("registry.json")
+        let store = await MainActor.run {
+            AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector()),
+                adapters: [
+                    .antigravity: StubAdapter(id: .antigravity),
+                    .codex: StubAdapter(id: .codex),
+                    .grok: StubAdapter(id: .grok),
+                ],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: TokenUsageEngine(homeDirectoryURL: dir, appSupportURL: dir),
+                accountPoolExporter: AccountPoolExporter(appSupportURL: dir),
+                persistAccountPoolExport: false
+            )
+        }
+
+        let (freshList, expiredAndStaleList, oldAgeList) = await MainActor.run { () -> ([ProviderID], [ProviderID], [ProviderID]) in
+            store.lastRefreshedAt = now.addingTimeInterval(-10)
+            store.snapshots[AppStore.snapshotKey(provider: .antigravity, accountId: "ag:1")] = QuotaSnapshot(
+                provider: .antigravity,
+                accountId: "ag:1",
+                windows: [QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.9, resetAt: future1h)],
+                status: .ready(fetchedAt: now.addingTimeInterval(-10), stale: false),
+                primaryRemainingPercent: 90
+            )
+            store.snapshots[AppStore.snapshotKey(provider: .codex, accountId: "cx:1")] = QuotaSnapshot(
+                provider: .codex,
+                accountId: "cx:1",
+                windows: [QuotaWindow(id: "5h", label: "5小时", remainingFraction: 0.8, resetAt: future1h)],
+                status: .ready(fetchedAt: now.addingTimeInterval(-10), stale: false),
+                primaryRemainingPercent: 80
+            )
+            store.snapshots[AppStore.snapshotKey(provider: .grok, accountId: "gk:1")] = QuotaSnapshot(
+                provider: .grok,
+                accountId: "gk:1",
+                windows: [QuotaWindow(id: "primary", label: "主窗口", remainingFraction: 0.8, resetAt: future1h)],
+                status: .ready(fetchedAt: now.addingTimeInterval(-10), stale: false),
+                primaryRemainingPercent: 80
+            )
+            let l1 = store.providersNeedingStaleRefresh(maxAgeSeconds: 45, providers: [.antigravity, .codex, .grok, .cursor], now: now)
+
+            // Mark AGY expired reset and Grok stale, keep Codex fresh
+            store.snapshots[AppStore.snapshotKey(provider: .antigravity, accountId: "ag:1")] = snapJustExpired
+            store.snapshots[AppStore.snapshotKey(provider: .grok, accountId: "gk:1")] = QuotaSnapshot(
+                provider: .grok,
+                accountId: "gk:1",
+                windows: [QuotaWindow(id: "primary", label: "主窗口", remainingFraction: 0.8, resetAt: future1h)],
+                status: .ready(fetchedAt: now.addingTimeInterval(-10), stale: true),
+                primaryRemainingPercent: 80
+            )
+            let l2 = store.providersNeedingStaleRefresh(maxAgeSeconds: 45, providers: [.antigravity, .codex, .grok, .cursor], now: now)
+
+            // Age exceeds 45s -> Codex also becomes eligible, while .cursor without adapter is excluded
+            store.lastRefreshedAt = now.addingTimeInterval(-60)
+            let l3 = store.providersNeedingStaleRefresh(maxAgeSeconds: 45, providers: [.antigravity, .codex, .grok, .cursor], now: now)
+            return (l1, l2, l3)
+        }
+        T.expectEqual(freshList, [], "fresh non-expired providers must not require stale refresh")
+        T.expectEqual(expiredAndStaleList, [.antigravity, .grok], "expired-reset AGY and stale Grok must require refresh; fresh Codex and adapterless Cursor excluded")
+        T.expectEqual(oldAgeList, [.antigravity, .codex, .grok], "providers older than maxAgeSeconds must require refresh; adapterless Cursor excluded")
+    }
+
+    // 16.3 Antigravity Pool Unification, Backward-Compat Config Decode & Zero False Warning
+    await T.asyncSuite("V120.AntigravityPoolUnificationAndZeroFalseWarning") {
+        // 1. Backward-compatible decode of AccountCardConfig.filterAntigravityCardPools & AppSettings v1.2.0 fields
+        let legacyCardJSON = #"{"showAvatar":true,"showPlanBadge":true,"pillQuotaWindow":"weeklyFirst"}"#
+        let decodedLegacyCard = try JSONDecoder().decode(AccountCardConfig.self, from: Data(legacyCardJSON.utf8))
+        T.expectEqual(decodedLegacyCard.filterAntigravityCardPools, false, "legacy AccountCardConfig must default filterAntigravityCardPools to false")
+
+        let customCard = AccountCardConfig(filterAntigravityCardPools: true)
+        let cardRoundTrip = try JSONDecoder().decode(AccountCardConfig.self, from: JSONEncoder().encode(customCard))
+        T.expectEqual(cardRoundTrip.filterAntigravityCardPools, true)
+
+        let legacySettingsJSON = #"{"selectedProvider":"antigravity"}"#
+        let decodedLegacySettings = try JSONDecoder().decode(AppSettings.self, from: Data(legacySettingsJSON.utf8))
+        T.expectEqual(decodedLegacySettings.relaunchAntigravityInsiders, false)
+        T.expectEqual(decodedLegacySettings.autoCheckUpdates, true)
+        T.expectEqual(decodedLegacySettings.skippedUpdateVersion, nil)
+        T.expectEqual(decodedLegacySettings.lastUpdateCheckAt, nil)
+
+        let checkDate = Date(timeIntervalSince1970: 1_800_000_500)
+        let v12Settings = AppSettings(
+            relaunchAntigravityInsiders: true,
+            autoCheckUpdates: false,
+            skippedUpdateVersion: "  1.2.1  ",
+            lastUpdateCheckAt: checkDate
+        )
+        T.expectEqual(v12Settings.skippedUpdateVersion, "1.2.1")
+        let settingsEncoder = JSONEncoder()
+        settingsEncoder.dateEncodingStrategy = .iso8601
+        let settingsDecoder = JSONDecoder()
+        settingsDecoder.dateDecodingStrategy = .iso8601
+        let settingsRoundTrip = try settingsDecoder.decode(AppSettings.self, from: settingsEncoder.encode(v12Settings))
+        T.expectEqual(settingsRoundTrip.relaunchAntigravityInsiders, true)
+        T.expectEqual(settingsRoundTrip.autoCheckUpdates, false)
+        T.expectEqual(settingsRoundTrip.skippedUpdateVersion, "1.2.1")
+        T.expectEqual(settingsRoundTrip.lastUpdateCheckAt, checkDate)
+
+        let whitespaceSkippedJSON = #"{"skippedUpdateVersion":"   "}"#
+        let whitespaceDecoded = try JSONDecoder().decode(AppSettings.self, from: Data(whitespaceSkippedJSON.utf8))
+        T.expectEqual(whitespaceDecoded.skippedUpdateVersion, nil, "whitespace-only skippedUpdateVersion must normalize to nil")
+
+        // 2. Pool unification: AGY Gemini 100% + Claude/GPT weekly 2% with antigravityPool == .gemini
+        let dir = try makeTempDir(prefix: "pulsar-v120-pool-unify")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let regURL = dir.appendingPathComponent("registry.json")
+
+        let now = Date()
+        let agyAcc1 = AccountRecord(id: "ag:acct1", provider: .antigravity, email: "alpha@example.com", displayName: "Alpha", isActiveLive: true)
+        let agyAcc2 = AccountRecord(id: "ag:acct2", provider: .antigravity, email: "beta@example.com", displayName: "Beta", isActiveLive: false)
+        let cursorAcc = AccountRecord(id: "cursor:default", provider: .cursor, email: "", displayName: "Cursor", isActiveLive: true)
+
+        let gem5hFull = QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 1.0, usedPercent: 0.0, windowSeconds: 18_000, isPrimary: true)
+        let gemWkFull = QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 1.0, usedPercent: 0.0, windowSeconds: 604_800, isPrimary: false)
+        let claudeWkLow = QuotaWindow(id: "claude_weekly", label: "Claude / GPT · 周", remainingFraction: 0.02, usedPercent: 98.0, windowSeconds: 604_800, isPrimary: false)
+        let argonWkMid = QuotaWindow(id: "argon_weekly", label: "Argon · 周", remainingFraction: 0.55, usedPercent: 45.0, windowSeconds: 604_800, isPrimary: false)
+
+        let snapAgy1 = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: agyAcc1.id,
+            windows: [gem5hFull, gemWkFull, claudeWkLow, argonWkMid],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 2
+        )
+        let snapAgy2 = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: agyAcc2.id,
+            windows: [
+                QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.45, usedPercent: 55.0, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 0.40, usedPercent: 60.0, windowSeconds: 604_800, isPrimary: false),
+                QuotaWindow(id: "claude_weekly", label: "Claude / GPT · 周", remainingFraction: 0.90, usedPercent: 10.0, windowSeconds: 604_800, isPrimary: false),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 40
+        )
+        let snapCursorReauth = QuotaSnapshot(
+            provider: .cursor,
+            accountId: cursorAcc.id,
+            windows: [],
+            status: .reauthRequired("Cursor needs login"),
+            primaryRemainingPercent: nil
+        )
+
+        // Direct AccountRecord.bestRemainingAccountId verification per pool
+        let snapByAccountId: [String: QuotaSnapshot] = [
+            agyAcc1.id: snapAgy1,
+            agyAcc2.id: snapAgy2,
+        ]
+        T.expectEqual(
+            AccountRecord.bestRemainingAccountId(for: .antigravity, accounts: [agyAcc1, agyAcc2], snapshots: snapByAccountId, antigravityPool: .gemini),
+            agyAcc1.id,
+            "antigravityPool == .gemini must pick acct1 (Gemini 100% > 40%)"
+        )
+        T.expectEqual(
+            AccountRecord.bestRemainingAccountId(for: .antigravity, accounts: [agyAcc1, agyAcc2], snapshots: snapByAccountId, antigravityPool: .claude),
+            agyAcc2.id,
+            "antigravityPool == .claude must pick acct2 (Claude 90% > 2%)"
+        )
+        T.expectEqual(
+            AccountRecord.bestRemainingAccountId(for: .antigravity, accounts: [agyAcc1, agyAcc2], snapshots: snapByAccountId, antigravityPool: .autoLowest),
+            agyAcc2.id,
+            "antigravityPool == .autoLowest must pick acct2 (min 40% > min 2%)"
+        )
+
+        let store = await MainActor.run {
+            AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector()),
+                adapters: [:],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: TokenUsageEngine(homeDirectoryURL: dir, appSupportURL: dir),
+                accountPoolExporter: AccountPoolExporter(appSupportURL: dir),
+                persistAccountPoolExport: false
+            )
+        }
+
+        let (
+            geminiSelectedDetail,
+            geminiPillText,
+            geminiPillPercent,
+            geminiMatch,
+            claudeMatch,
+            bestIdUnderGemini,
+            lowestCustomWithSidelineCursor,
+            lowestModeWithSidelineCursor,
+            claudePoolDetail,
+            claudePillText,
+            allErroredLowestDetail
+        ) = await MainActor.run {
+            () -> (
+                MenuBarSummary,
+                String,
+                Double?,
+                Bool,
+                Bool,
+                String?,
+                MenuBarSummary,
+                MenuBarSummary,
+                MenuBarSummary,
+                String,
+                MenuBarSummary
+            ) in
+            store.registry.accounts = [agyAcc1, agyAcc2, cursorAcc]
+            store.registry.settings.enabledProviders = [.antigravity, .cursor]
+            store.registry.settings.selectedProvider = .antigravity
+            store.registry.settings.showRemainingPercent = true
+            store.snapshots[AppStore.snapshotKey(provider: .antigravity, accountId: agyAcc1.id)] = snapAgy1
+            store.snapshots[AppStore.snapshotKey(provider: .antigravity, accountId: agyAcc2.id)] = snapAgy2
+            store.snapshots[AppStore.snapshotKey(provider: .cursor, accountId: cursorAcc.id)] = snapCursorReauth
+
+            // Select Gemini pool
+            store.setAntigravityPool(.gemini)
+            store.registry.settings.menuBarDisplayMode = .selectedProvider
+            let selDetail = store.menuBarSummaryDetail()
+            let pillGem = store.pillBadgeInfo(for: .antigravity)
+            let isGemMatch = store.isAntigravityWindowMatchingPool(gemWkFull)
+            let isClaudeMatch = store.isAntigravityWindowMatchingPool(claudeWkLow)
+            let bestGem = store.registry.accounts.first(where: { $0.provider == .antigravity && $0.isBestRemaining })?.id
+
+            // Custom mode + quotaSource == .lowest with sideline Cursor .reauthRequired -> MUST NOT warn yellow!
+            store.registry.settings.menuBarDisplayMode = .custom
+            store.updateMenuBarCustom { cfg in
+                cfg.modules = [.quota]
+                cfg.quotaSource = .lowest
+                cfg.quotaWindow = .weeklyFirst
+                cfg.antigravityPool = .gemini
+                cfg.showProviderPrefix = true
+            }
+            let lowestCustom = store.menuBarSummaryDetail()
+
+            // Built-in .lowestQuota mode with sideline Cursor .reauthRequired -> MUST NOT warn yellow!
+            store.registry.settings.menuBarDisplayMode = .lowestQuota
+            let lowestBuiltIn = store.menuBarSummaryDetail()
+
+            // Switch to Claude pool -> now AGY 2% must warn yellow and pill returns 2%
+            store.setAntigravityPool(.claude)
+            store.registry.settings.menuBarDisplayMode = .selectedProvider
+            let claudeDetail = store.menuBarSummaryDetail()
+            let pillClaude = store.pillBadgeInfo(for: .antigravity)
+
+            // When ALL enabled providers fail, quotaSource == .lowest MUST warn
+            store.registry.settings.menuBarDisplayMode = .custom
+            store.updateMenuBarCustom { cfg in
+                cfg.modules = [.quota]
+                cfg.quotaSource = .lowest
+                cfg.antigravityPool = .gemini
+            }
+            store.snapshots[AppStore.snapshotKey(provider: .antigravity, accountId: agyAcc1.id)] = QuotaSnapshot.failed(
+                provider: .antigravity,
+                accountId: agyAcc1.id,
+                message: "offline"
+            )
+            let allErr = store.menuBarSummaryDetail()
+
+            return (
+                selDetail,
+                pillGem.text,
+                pillGem.remainingPercent,
+                isGemMatch,
+                isClaudeMatch,
+                bestGem,
+                lowestCustom,
+                lowestBuiltIn,
+                claudeDetail,
+                pillClaude.text,
+                allErr
+            )
+        }
+
+        T.expectEqual(geminiSelectedDetail.title, "AGY 100%", "Gemini pool must display AGY 100% despite Claude weekly 2%")
+        T.expectEqual(geminiSelectedDetail.isWarning, false, "Gemini 100% must have isWarning == false")
+        T.expectEqual(geminiPillText, "100%", "pillBadgeInfo(for: .antigravity) must display 100% under Gemini pool")
+        T.expectEqual(geminiPillPercent, 100.0)
+        T.expectEqual(geminiMatch, true)
+        T.expectEqual(claudeMatch, false)
+        T.expectEqual(bestIdUnderGemini, agyAcc1.id, "AppStore best-remaining badge must follow antigravityPool == .gemini")
+
+        T.expectEqual(lowestCustomWithSidelineCursor.title, "AGY 100%")
+        T.expectEqual(lowestCustomWithSidelineCursor.isWarning, false, "quotaSource == .lowest with healthy AGY 100% and sideline Cursor .reauthRequired must NOT false-warn yellow")
+        T.expectEqual(lowestModeWithSidelineCursor.title, "AGY 100%")
+        T.expectEqual(lowestModeWithSidelineCursor.isWarning, false, ".lowestQuota with healthy AGY 100% and sideline Cursor .reauthRequired must NOT false-warn yellow")
+
+        T.expectEqual(claudePoolDetail.title, "AGY 2%")
+        T.expectEqual(claudePoolDetail.isWarning, true)
+        T.expectEqual(claudePillText, "2%")
+        T.expectEqual(allErroredLowestDetail.isWarning, true, "when all enabled providers error, isWarning must be true")
+    }
+
+    // 16.4 GitHub Releases Auto-Update Engine (ReleaseUpdater)
+    await T.asyncSuite("V120.ReleaseUpdaterEngine") {
+        // 1. PulsarSemVer comparison & invalid parsing
+        guard let v110 = PulsarSemVer.parse("1.1.0"),
+              let v120 = PulsarSemVer.parse("v1.2.0"),
+              let v120Plain = PulsarSemVer.parse("1.2.0"),
+              let v120Build = PulsarSemVer.parse("1.2.0+build.99"),
+              let v120Alpha = PulsarSemVer.parse("1.2.0-alpha"),
+              let v120Beta1 = PulsarSemVer.parse("1.2.0-beta.1"),
+              let v120Beta2 = PulsarSemVer.parse("1.2.0-beta.2"),
+              let v120RC1 = PulsarSemVer.parse("v1.2.0-rc.1"),
+              let v130 = PulsarSemVer.parse("V1.3.0") else {
+            T.expect(false, "valid SemVer strings must parse")
+            return
+        }
+        T.expect(v120 > v110, "v1.2.0 must be > 1.1.0")
+        T.expect(v130 > v120, "1.3.0 must be > v1.2.0")
+        T.expectEqual(v120, v120Plain)
+        T.expectEqual(v120, v120Build, "+build metadata must not change SemVer equality")
+        T.expect(v120 > v120RC1, "final release must strictly outrank same-core prerelease")
+        T.expect(v120RC1 > v120Beta2)
+        T.expect(v120Beta2 > v120Beta1)
+        T.expect(v120Beta1 > v120Alpha)
+        T.expectEqual(v120.isPrerelease, false)
+        T.expectEqual(v120Beta1.isPrerelease, true)
+
+        for invalid in ["", "   ", "v", "abc", "1", "1.2.3.4", "1.2.x", "1.2.0-", "1.2.0-bad_pre", "-1.0.0"] {
+            T.expectEqual(PulsarSemVer.parse(invalid), nil, "invalid SemVer '\(invalid)' must return nil")
+        }
+        let semverRoundTrip = try JSONDecoder().decode(PulsarSemVer.self, from: JSONEncoder().encode(v120Beta2))
+        T.expectEqual(semverRoundTrip, v120Beta2)
+
+        // 2. Strict 4-host HTTPS allowlist
+        let allowedURLs = [
+            "https://api.github.com/repos/rorywang98-netizen/Pulsar/releases/latest",
+            "https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.2.0/Pulsar-v1.2.0-macOS-arm64.dmg",
+            "https://objects.githubusercontent.com/github-production-release-asset/12345/Pulsar.dmg",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/12345/Pulsar.dmg",
+            "HTTPS://API.GITHUB.COM/repos/rorywang98-netizen/Pulsar/releases/latest",
+        ]
+        for raw in allowedURLs {
+            T.expectEqual(ReleaseUpdater.isAllowedHost(URL(string: raw)!), true, "must allow \(raw)")
+        }
+        let blockedHostA = "api." + "anthropic" + ".com"
+        let blockedHostB = "claude" + ".ai"
+        let blockedURLs = [
+            "http://api.github.com/repos/rorywang98-netizen/Pulsar/releases/latest",
+            "http://github.com/rorywang98-netizen/Pulsar/releases",
+            "https://\(blockedHostA)/v1/messages",
+            "https://\(blockedHostB)/api/organizations",
+            "https://example.com/Pulsar.dmg",
+            "https://api.github.com.evil.example/releases/latest",
+            "https://evil-github.com/Pulsar.dmg",
+            "https://user:pass@github.com/rorywang98-netizen/Pulsar/releases",
+            "file:///tmp/Pulsar.dmg",
+        ]
+        for raw in blockedURLs {
+            T.expectEqual(ReleaseUpdater.isAllowedHost(URL(string: raw)!), false, "must reject \(raw)")
+        }
+
+        // 3. parseLatestReleaseJSON (new version with arm64 .dmg + .sha256, up-to-date, draft/prerelease, disallowed hosts)
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let newReleaseJSON = """
+        {
+          "tag_name": "v1.3.0",
+          "name": "Pulsar v1.3.0",
+          "body": "New features and fixes.",
+          "html_url": "https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.3.0",
+          "published_at": "2026-11-22T08:00:00Z",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "Pulsar-v1.3.0-macOS-x86_64.dmg",
+              "size": 5000000,
+              "browser_download_url": "https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.3.0/Pulsar-v1.3.0-macOS-x86_64.dmg"
+            },
+            {
+              "name": "Pulsar-v1.3.0-macOS-arm64.dmg",
+              "size": 4567890,
+              "browser_download_url": "https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.3.0/Pulsar-v1.3.0-macOS-arm64.dmg"
+            },
+            {
+              "name": "Pulsar-v1.3.0-macOS-arm64.dmg.sha256",
+              "size": 99,
+              "browser_download_url": "https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.3.0/Pulsar-v1.3.0-macOS-arm64.dmg.sha256"
+            },
+            {
+              "name": "bad-host-arm64.dmg",
+              "size": 123,
+              "browser_download_url": "https://evil.example.com/bad-host-arm64.dmg"
+            }
+          ]
+        }
+        """
+        let parsedNew = try ReleaseUpdater.parseLatestReleaseJSON(Data(newReleaseJSON.utf8), currentVersion: "1.2.0", checkedAt: fixedNow)
+        if case .updateAvailable(let info) = parsedNew {
+            T.expectEqual(info.version, "1.3.0")
+            T.expectEqual(info.tagName, "v1.3.0")
+            T.expectEqual(info.title, "Pulsar v1.3.0")
+            T.expectEqual(info.releaseNotes, "New features and fixes.")
+            T.expectEqual(info.dmgFileName, "Pulsar-v1.3.0-macOS-arm64.dmg", "must prefer arm64 .dmg over other arches")
+            T.expectEqual(
+                info.dmgDownloadURL?.absoluteString,
+                "https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.3.0/Pulsar-v1.3.0-macOS-arm64.dmg"
+            )
+            T.expectEqual(
+                info.sha256DownloadURL?.absoluteString,
+                "https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.3.0/Pulsar-v1.3.0-macOS-arm64.dmg.sha256"
+            )
+            T.expectEqual(info.assetSizeBytes, 4_567_890)
+            T.expect(info.publishedAt != nil)
+        } else {
+            T.expect(false, "expected .updateAvailable for v1.3.0 vs 1.2.0, got \(parsedNew)")
+        }
+
+        // Up-to-date when current >= remote
+        let parsedSame = try ReleaseUpdater.parseLatestReleaseJSON(Data(newReleaseJSON.utf8), currentVersion: "1.3.0", checkedAt: fixedNow)
+        T.expectEqual(parsedSame, .upToDate(latestVersion: "1.3.0", checkedAt: fixedNow))
+        let parsedAhead = try ReleaseUpdater.parseLatestReleaseJSON(Data(newReleaseJSON.utf8), currentVersion: "1.4.0", checkedAt: fixedNow)
+        T.expectEqual(parsedAhead, .upToDate(latestVersion: "1.3.0", checkedAt: fixedNow))
+
+        // Draft and prerelease must be ignored
+        let draftJSON = #"{"tag_name":"v2.0.0","draft":true,"prerelease":false,"html_url":"https://github.com/rorywang98-netizen/Pulsar/releases/tag/v2.0.0"}"#
+        let parsedDraft = try ReleaseUpdater.parseLatestReleaseJSON(Data(draftJSON.utf8), currentVersion: "1.2.0", checkedAt: fixedNow)
+        T.expectEqual(parsedDraft, .upToDate(latestVersion: nil, checkedAt: fixedNow), "draft release must be ignored")
+
+        let preJSON = #"{"tag_name":"v2.0.0","draft":false,"prerelease":true,"html_url":"https://github.com/rorywang98-netizen/Pulsar/releases/tag/v2.0.0"}"#
+        let parsedPre = try ReleaseUpdater.parseLatestReleaseJSON(Data(preJSON.utf8), currentVersion: "1.2.0", checkedAt: fixedNow)
+        T.expectEqual(parsedPre, .upToDate(latestVersion: nil, checkedAt: fixedNow), "prerelease must be ignored")
+
+        // Disallowed html_url must throw disallowedHost
+        let badHTMLJSON = #"{"tag_name":"v2.0.0","draft":false,"prerelease":false,"html_url":"https://evil.example.com/release"}"#
+        var threwDisallowedHTML = false
+        do {
+            _ = try ReleaseUpdater.parseLatestReleaseJSON(Data(badHTMLJSON.utf8), currentVersion: "1.2.0", checkedAt: fixedNow)
+        } catch ReleaseUpdaterError.disallowedHost {
+            threwDisallowedHTML = true
+        }
+        T.expectEqual(threwDisallowedHTML, true, "non-allowlisted html_url must throw disallowedHost")
+
+        // 4. parseSHA256Text & streaming sha256Hex(ofFileAt:) & mismatch rejection
+        let hexA = String(repeating: "a", count: 64)
+        let hexB = String(repeating: "b", count: 64)
+        T.expectEqual(
+            ReleaseUpdater.parseSHA256Text("\(hexA.uppercased())  Pulsar-v1.3.0-macOS-arm64.dmg\n", expectedFileName: "Pulsar-v1.3.0-macOS-arm64.dmg"),
+            hexA
+        )
+        T.expectEqual(
+            ReleaseUpdater.parseSHA256Text("\(hexA) *./Pulsar-v1.3.0-macOS-arm64.dmg\n", expectedFileName: "Pulsar-v1.3.0-macOS-arm64.dmg"),
+            hexA
+        )
+        T.expectEqual(
+            ReleaseUpdater.parseSHA256Text("SHA256 (Pulsar-v1.3.0-macOS-arm64.dmg) = \(hexA)\n", expectedFileName: "Pulsar-v1.3.0-macOS-arm64.dmg"),
+            hexA
+        )
+        T.expectEqual(
+            ReleaseUpdater.parseSHA256Text("\(hexA)\n", expectedFileName: "Pulsar-v1.3.0-macOS-arm64.dmg"),
+            hexA,
+            "bare single hash must be accepted"
+        )
+        T.expectEqual(
+            ReleaseUpdater.parseSHA256Text("\(hexA)  other.dmg\n\(hexB)  Pulsar-v1.3.0-macOS-arm64.dmg\n", expectedFileName: "Pulsar-v1.3.0-macOS-arm64.dmg"),
+            hexB
+        )
+        T.expectEqual(
+            ReleaseUpdater.parseSHA256Text("\(hexA)  other.dmg\n", expectedFileName: "Pulsar-v1.3.0-macOS-arm64.dmg"),
+            nil,
+            "named checksum file referencing only a different file must be rejected"
+        )
+        T.expectEqual(ReleaseUpdater.parseSHA256Text("not-a-valid-sha256\n", expectedFileName: "Pulsar.dmg"), nil)
+
+        // Streaming sha256Hex on >128KB multi-chunk temp file
+        let tmpDir = try makeTempDir(prefix: "pulsar-v120-updater")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let sampleFile = tmpDir.appendingPathComponent("sample.bin")
+        var sampleBytes = Data(capacity: 150_000)
+        for i in 0..<150_000 {
+            sampleBytes.append(UInt8(i & 0xFF))
+        }
+        try sampleBytes.write(to: sampleFile)
+        let expectedDigest = CryptoKit.SHA256.hash(data: sampleBytes).map { String(format: "%02x", $0) }.joined()
+        let streamedDigest = try ReleaseUpdater.sha256Hex(ofFileAt: sampleFile)
+        T.expectEqual(streamedDigest, expectedDigest, "streaming sha256Hex must match CryptoKit.SHA256")
+
+        // Offline ETag + 304 Not Modified reuse & SHA-256 mismatch rejection via StubURLProtocol
+        let mockSession = makeMockSession()
+        let updater = ReleaseUpdater(
+            session: mockSession,
+            runningAppBundleURL: tmpDir.appendingPathComponent("Pulsar.app", isDirectory: true),
+            downloadsDirectoryURL: tmpDir.appendingPathComponent("Downloads", isDirectory: true),
+            relaunchTerminator: {},
+            openManualInstaller: { _ in }
+        )
+
+        var apiCallCount = 0
+        StubURLProtocol.reset { request, _ in
+            let url = request.url!
+            if url.host == "api.github.com" {
+                apiCallCount += 1
+                if apiCallCount == 1 {
+                    let resp = HTTPURLResponse(
+                        url: url,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["ETag": "\"v130-etag\""]
+                    )!
+                    return (resp, Data(newReleaseJSON.utf8))
+                } else {
+                    T.expectEqual(request.value(forHTTPHeaderField: "If-None-Match"), "\"v130-etag\"")
+                    let resp = HTTPURLResponse(url: url, statusCode: 304, httpVersion: "HTTP/1.1", headerFields: nil)!
+                    return (resp, Data())
+                }
+            }
+            if url.lastPathComponent.hasSuffix(".dmg") {
+                let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data("tampered-dmg-payload".utf8))
+            }
+            if url.lastPathComponent.hasSuffix(".sha256") {
+                let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data("\(hexA)  Pulsar-v1.3.0-macOS-arm64.dmg\n".utf8))
+            }
+            let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
+            return (resp, Data())
+        }
+
+        let check1 = try await updater.checkLatestRelease(currentVersion: "1.2.0")
+        let check2 = try await updater.checkLatestRelease(currentVersion: "1.2.0")
+        guard case .updateAvailable(let info1) = check1,
+              case .updateAvailable(let info2) = check2 else {
+            T.expect(false, "both initial 200 and subsequent 304 ETag check must yield .updateAvailable")
+            return
+        }
+        T.expectEqual(info1.version, "1.3.0")
+        T.expectEqual(info2.version, "1.3.0")
+
+        var threwChecksumMismatch = false
+        do {
+            _ = try await updater.downloadAndInstall(info1, onPhase: { _ in })
+        } catch ReleaseUpdaterError.checksumMismatch {
+            threwChecksumMismatch = true
+        }
+        T.expectEqual(threwChecksumMismatch, true, "downloadAndInstall must reject mismatched SHA-256 and abort")
+
+        // 5. shellSingleQuote, canInstallInPlace & buildSwapScript (`sh -n` syntax validation)
+        T.expectEqual(ReleaseUpdater.shellSingleQuote("/Applications/Pulsar.app"), "'/Applications/Pulsar.app'")
+        T.expectEqual(ReleaseUpdater.shellSingleQuote("/tmp/O'Brien's App $(rm -rf /).app"), "'/tmp/O'\\''Brien'\\''s App $(rm -rf /).app'")
+
+        let writableAppURL = tmpDir.appendingPathComponent("Pulsar.app", isDirectory: true)
+        T.expectEqual(ReleaseUpdater.canInstallInPlace(currentAppURL: writableAppURL), true, "writable parent dir .app must allow in-place install")
+        T.expectEqual(ReleaseUpdater.canInstallInPlace(currentAppURL: URL(fileURLWithPath: "/Volumes/Pulsar 1.2.0/Pulsar.app")), false, "/Volumes/ read-only mount must forbid in-place install")
+        T.expectEqual(ReleaseUpdater.canInstallInPlace(currentAppURL: URL(fileURLWithPath: "/private/var/folders/xx/AppTranslocation/abc/d/Pulsar.app")), false, "AppTranslocation path must forbid in-place install")
+        T.expectEqual(ReleaseUpdater.canInstallInPlace(currentAppURL: tmpDir.appendingPathComponent("RoryOrbit")), false, "non-.app binary must forbid in-place install")
+
+        let swapScript = ReleaseUpdater.buildSwapScript(
+            pid: 99_999,
+            targetAppPath: "/Applications/Pulsar O'Brien.app",
+            stagingAppPath: "/Applications/.Pulsar O'Brien.app.updating.123",
+            backupAppPath: "/Applications/.Pulsar O'Brien.app.backup.123",
+            tempDirPath: "/tmp/pulsar update 'dir'"
+        )
+        T.expect(swapScript.contains("#!/bin/sh"))
+        T.expect(swapScript.contains("launchctl kickstart -k"))
+        T.expect(swapScript.contains("/bin/mv \"$BACKUP\" \"$TARGET\""))
+
+        let scriptURL = tmpDir.appendingPathComponent("swap-syntax-check.sh")
+        try Data(swapScript.utf8).write(to: scriptURL)
+        let shCheck = Process()
+        shCheck.executableURL = URL(fileURLWithPath: "/bin/sh")
+        shCheck.arguments = ["-n", scriptURL.path]
+        let shErr = Pipe()
+        shCheck.standardError = shErr
+        try shCheck.run()
+        shCheck.waitUntilExit()
+        let shErrMsg = String(data: shErr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        T.expectEqual(shCheck.terminationStatus, 0, "buildSwapScript must pass `/bin/sh -n` syntax validation (stderr: \(shErrMsg))")
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -5299,6 +6134,7 @@ Task {
     await testLiveTokenSpeedEngine()
     await testPhase2RegressionSuite()
     await testV110RegressionSuite()
+    await testV120RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)

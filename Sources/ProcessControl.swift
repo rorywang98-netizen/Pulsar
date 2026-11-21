@@ -244,6 +244,7 @@ public final class LiveProcessInspector: ProcessInspectorProtocol, @unchecked Se
     public func openApplication(at url: URL) async throws {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = false
+        config.createsNewApplicationInstance = false
         _ = try await NSWorkspace.shared.openApplication(at: url, configuration: config)
     }
 
@@ -323,10 +324,10 @@ public final class ProcessController: @unchecked Sendable {
         let bundleIDSet = Set(bundleIDs)
         let initialGUI = inspector.runningApplications(bundleIDs: bundleIDs)
 
-        // Capture ONLY apps that were actually running so we reopen the exact same set afterwards.
+        // Capture ONLY apps that were actually running so callers can decide which bundle(s) to reopen.
         var reopenURLs: [URL] = []
         var seenReopen = Set<String>()
-        for app in initialGUI {
+        for app in initialGUI where app.pid > 1 && app.pid != selfPid {
             if let url = app.bundleURL?.standardizedFileURL,
                seenReopen.insert(url.path).inserted {
                 reopenURLs.append(url)
@@ -348,7 +349,7 @@ public final class ProcessController: @unchecked Sendable {
 
         // Phase 1: Request native graceful quit for running GUI apps.
         var requestedGUIPids = Set<Int>()
-        for app in initialGUI where app.pid != selfPid {
+        for app in initialGUI where app.pid > 1 && app.pid != selfPid {
             requestedGUIPids.insert(app.pid)
             _ = inspector.requestGracefulTerminate(pid: app.pid, bundleId: app.bundleId)
         }
@@ -369,7 +370,7 @@ public final class ProcessController: @unchecked Sendable {
         }
 
         for proc in afterGUITick {
-            guard proc.id != selfPid else { continue }
+            guard proc.id > 1, proc.id != selfPid else { continue }
             if let bid = proc.bundleId, bundleIDSet.contains(bid) {
                 continue
             }
@@ -433,6 +434,7 @@ public final class ProcessController: @unchecked Sendable {
         var seen = Set<String>()
         for url in urls {
             let std = url.standardizedFileURL
+            guard std.isFileURL, !std.path.isEmpty else { continue }
             guard seen.insert(std.path).inserted else { continue }
             try? await inspector.openApplication(at: std)
         }
@@ -466,13 +468,13 @@ public final class ProcessController: @unchecked Sendable {
     ) -> [String] {
         var prefixes = Set<String>()
         for app in runningGUI {
-            if let path = app.bundleURL?.standardizedFileURL.path, !path.isEmpty {
+            if let path = app.bundleURL?.standardizedFileURL.path, !path.isEmpty, path != "/" {
                 prefixes.insert(path.hasSuffix("/") ? path : path + "/")
             }
         }
         for url in installedURLs {
             let path = url.standardizedFileURL.path
-            if !path.isEmpty {
+            if !path.isEmpty, path != "/" {
                 prefixes.insert(path.hasSuffix("/") ? path : path + "/")
             }
         }

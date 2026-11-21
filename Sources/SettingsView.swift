@@ -69,6 +69,7 @@ public struct SettingsView: View {
         ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 14) {
                 settingsBrandHeader
+                softwareUpdateCard
                 startupAndRefreshCard
                 menuBarCustomizationCard
                 windowSizeAndCardsCard
@@ -136,21 +137,487 @@ public struct SettingsView: View {
         .orbitCardStyle(cornerRadius: 11, hoverLift: false)
     }
 
+    // MARK: - Software Update Card (GitHub Releases)
+
+    private var effectiveLastUpdateCheckAt: Date? {
+        if case .upToDate(let checkedAt) = store.updatePhase {
+            return checkedAt
+        }
+        return store.registry.settings.lastUpdateCheckAt
+    }
+
+    private func formattedVersionTag(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("v") || trimmed.hasPrefix("V") {
+            return "v" + trimmed.dropFirst()
+        }
+        return "v\(trimmed)"
+    }
+
+    private func isUpdateVersionSkipped(_ version: String) -> Bool {
+        guard let skipped = store.registry.settings.skippedUpdateVersion else {
+            return false
+        }
+        return skipped.caseInsensitiveCompare(version) == .orderedSame
+    }
+
+    private func briefReleaseNotes(for info: ReleaseUpdateInfo) -> String? {
+        let rawLines = info.releaseNotes
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var cleaned: [String] = []
+        cleaned.reserveCapacity(4)
+
+        for rawLine in rawLines {
+            var line = rawLine
+            while line.hasPrefix("#") {
+                line.removeFirst()
+            }
+            line = line.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("- ") || line.hasPrefix("* ") {
+                line = "• " + String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            }
+            guard !line.isEmpty else { continue }
+            cleaned.append(line)
+            if cleaned.count >= 4 {
+                break
+            }
+        }
+
+        if !cleaned.isEmpty {
+            let joined = cleaned.joined(separator: "\n")
+            if joined.count > 260 {
+                return String(joined.prefix(259)) + "…"
+            }
+            return joined
+        }
+
+        let trimmedTitle = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTitle.isEmpty,
+           trimmedTitle.caseInsensitiveCompare(info.tagName) != .orderedSame,
+           trimmedTitle.caseInsensitiveCompare(info.version) != .orderedSame {
+            return trimmedTitle
+        }
+        return nil
+    }
+
+    private var softwareUpdateCard: some View {
+        let lastChecked = effectiveLastUpdateCheckAt
+        let lastCheckedSummary: String = {
+            if let lastChecked {
+                return "上次检查：\(store.relativeTimeAgoString(since: lastChecked))"
+            }
+            return "上次检查：尚未检查"
+        }()
+
+        return settingsCard(title: "软件更新（GitHub Releases）", icon: "arrow.down.circle") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text("当前版本")
+                                .font(.system(size: 12, weight: .medium))
+                            Text(formattedVersionTag(AppStore.appVersion))
+                                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundColor(.accentColor)
+                                .padding(.horizontal, 6.5)
+                                .padding(.vertical, 1.5)
+                                .background(Color.accentColor.opacity(0.12))
+                                .clipShape(Capsule())
+                        }
+
+                        Text(lastCheckedSummary)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                            .help(lastChecked.map { "检查时间：\($0.formatted(date: .numeric, time: .shortened))" } ?? "尚未执行过更新检查")
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        Task { await store.checkForUpdates(userInitiated: true) }
+                    } label: {
+                        Label(
+                            store.updatePhase == .checking ? "检查中…" : "立即检查更新",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                        .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(store.updatePhase.isBusy)
+                    .fixedSize()
+                }
+
+                updatePhaseStatusBox
+                    .animation(OrbitMotion.snappy, value: store.updatePhase)
+
+                Divider().opacity(0.35)
+
+                settingsSwitchRow(
+                    title: "自动检查更新（每 12 小时）",
+                    isOn: Binding(
+                        get: { store.registry.settings.autoCheckUpdates },
+                        set: { enabled in
+                            store.setAutoCheckUpdates(enabled)
+                        }
+                    )
+                )
+
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color(nsColor: .systemGreen))
+                        .padding(.top, 1.5)
+                    Text("仅访问 GitHub Releases（HTTPS 白名单），下载前强制校验 SHA-256，零 Claude 联网")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var updatePhaseStatusBox: some View {
+        switch store.updatePhase {
+        case .idle, .upToDate:
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12.5))
+                    .foregroundColor(Color(nsColor: .systemGreen))
+                Text("当前已是最新版本")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(.primary)
+                Spacer(minLength: 6)
+                Button("前往 Release 页面") {
+                    store.openUpdateReleasePage()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.accentColor)
+                .fixedSize()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .systemGreen).opacity(0.07))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(nsColor: .systemGreen).opacity(0.22), lineWidth: 0.7)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+        case .checking:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.75)
+                Text("正在检查 GitHub Releases…")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.035))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+        case .available(let info):
+            let versionLabel = formattedVersionTag(info.version)
+            let notesPreview = briefReleaseNotes(for: info)
+            let skipped = isUpdateVersionSkipped(info.version)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                    Text("发现新版本 \(versionLabel)")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.primary)
+                    if let bytes = info.assetSizeBytes, bytes > 0 {
+                        Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 5.5)
+                            .padding(.vertical, 1.5)
+                            .background(Color.primary.opacity(0.06))
+                            .clipShape(Capsule())
+                            .fixedSize()
+                    }
+                    Spacer(minLength: 4)
+                    if skipped {
+                        Text("已忽略横幅提醒")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 5.5)
+                            .padding(.vertical, 1.5)
+                            .background(Color.primary.opacity(0.06))
+                            .clipShape(Capsule())
+                            .fixedSize()
+                    }
+                }
+
+                if let notesPreview {
+                    Text(notesPreview)
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        store.startUpdateDownloadAndInstall()
+                    } label: {
+                        Label("一键下载并更新", systemImage: "arrow.down.to.line")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .fixedSize()
+
+                    Button("前往 Release 页面") {
+                        store.openUpdateReleasePage()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+
+                    Spacer(minLength: 4)
+
+                    if !skipped {
+                        Button("忽略此版本") {
+                            store.skipAvailableUpdate()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize()
+                    }
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.08))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.accentColor.opacity(0.28), lineWidth: 0.8)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+        case .downloading(let info, let progress):
+            let clamped = min(max(progress.isFinite ? progress : 0.0, 0.0), 1.0)
+            let percent = Int((clamped * 100.0).rounded())
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.accentColor)
+                    Text("正在下载 Pulsar \(formattedVersionTag(info.version))…")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary)
+                    Spacer(minLength: 8)
+                    Text("\(percent)%")
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .orbitNumericTransition()
+                        .foregroundColor(.accentColor)
+                }
+
+                OrbitAnimatedProgressBar(
+                    fraction: clamped,
+                    tint: .accentColor,
+                    height: 6,
+                    animateOnAppear: false
+                )
+
+                Text("下载完成后将强制校验 SHA-256 摘要，校验通过后自动安全替换。")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.07))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.accentColor.opacity(0.24), lineWidth: 0.75)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+        case .verifying(let info):
+            updateStageProgressBox(
+                title: "正在校验 \(formattedVersionTag(info.version)) SHA-256…",
+                detail: "强制核对官方发布的 SHA-256 摘要与安装包完整性，不匹配将立即中止。",
+                tint: .accentColor
+            )
+
+        case .installing(let info):
+            updateStageProgressBox(
+                title: "正在安全替换并重启至 \(formattedVersionTag(info.version))…",
+                detail: "SHA-256 与签名校验通过，正在挂载安装包并准备原地替换应用。",
+                tint: .accentColor
+            )
+
+        case .readyToRelaunch(let info):
+            updateStageProgressBox(
+                title: "Pulsar \(formattedVersionTag(info.version)) 已就绪，正在安全替换并重启…",
+                detail: "应用将自动关闭并在数秒内以新版本重新启动，请稍候。",
+                tint: Color(nsColor: .systemGreen)
+            )
+
+        case .manualInstallOpened(let info, let dmgPath):
+            let fileName = URL(fileURLWithPath: dmgPath).lastPathComponent
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 12.5))
+                        .foregroundColor(Color(nsColor: .systemGreen))
+                        .padding(.top, 1)
+                    VStack(alignment: .leading, spacing: 2.5) {
+                        Text("已通过 SHA-256 校验并打开 DMG（\(formattedVersionTag(info.version))）")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("已自动打开安装包 \(fileName)，请将 Pulsar 拖入 Applications 完成更新。")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("在 Finder 中显示") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: dmgPath)])
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+
+                    Button("前往 Release 页面") {
+                        store.openUpdateReleasePage()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .systemGreen).opacity(0.08))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(nsColor: .systemGreen).opacity(0.25), lineWidth: 0.75)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+        case .failed(let message):
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12.5))
+                        .foregroundColor(Color(nsColor: .systemRed))
+                        .padding(.top, 1)
+                    VStack(alignment: .leading, spacing: 2.5) {
+                        Text("更新失败")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(Color(nsColor: .systemRed))
+                        Text(message)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.primary.opacity(0.88))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await store.checkForUpdates(userInitiated: true) }
+                    } label: {
+                        Label("重试", systemImage: "arrow.clockwise")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .fixedSize()
+
+                    Button("前往 GitHub 页面") {
+                        store.openUpdateReleasePage()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .systemRed).opacity(0.08))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(nsColor: .systemRed).opacity(0.28), lineWidth: 0.75)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+    }
+
+    private func updateStageProgressBox(title: String, detail: String, tint: Color) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+                .scaleEffect(0.75)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2.5) {
+                Text(title)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.07))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(tint.opacity(0.24), lineWidth: 0.75)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
     private var startupAndRefreshCard: some View {
         settingsCard(title: "启动与刷新", icon: "clock.arrow.circlepath") {
-            VStack(alignment: .leading, spacing: 12) {
-                Toggle("登录 macOS 时自动启动 Pulsar", isOn: Binding(
-                    get: { store.registry.settings.launchAtLogin },
-                    set: { enabled in
-                        store.updateSettings { $0.launchAtLogin = enabled }
-                    }
-                ))
+            VStack(alignment: .leading, spacing: 11) {
+                settingsSwitchRow(
+                    title: "登录 macOS 时自动启动 Pulsar",
+                    isOn: Binding(
+                        get: { store.registry.settings.launchAtLogin },
+                        set: { enabled in
+                            store.updateSettings { $0.launchAtLogin = enabled }
+                        }
+                    )
+                )
 
                 Divider().opacity(0.4)
 
-                HStack {
+                HStack(spacing: 10) {
                     Text("后台自动刷新频率")
-                    Spacer()
+                        .font(.system(size: 12))
+                        .fixedSize()
+                    Spacer(minLength: 8)
                     Picker("", selection: Binding(
                         get: { store.registry.settings.refreshCadence },
                         set: { cadence in
@@ -165,12 +632,17 @@ public struct SettingsView: View {
                     .frame(width: 165)
                 }
 
-                Toggle("打开菜单栏弹窗时自动刷新过期数据", isOn: Binding(
-                    get: { store.registry.settings.refreshOnMenuOpen },
-                    set: { enabled in
-                        store.updateSettings { $0.refreshOnMenuOpen = enabled }
-                    }
-                ))
+                Divider().opacity(0.35)
+
+                settingsSwitchRow(
+                    title: "打开菜单栏弹窗时自动刷新过期数据",
+                    isOn: Binding(
+                        get: { store.registry.settings.refreshOnMenuOpen },
+                        set: { enabled in
+                            store.updateSettings { $0.refreshOnMenuOpen = enabled }
+                        }
+                    )
+                )
             }
         }
     }
@@ -214,20 +686,28 @@ public struct SettingsView: View {
 
     private var displayAndAlertsCard: some View {
         settingsCard(title: "显示与预警", icon: "slider.horizontal.3") {
-            VStack(alignment: .leading, spacing: 12) {
-                Toggle("优先显示剩余百分比（关闭则显示已使用百分比）", isOn: Binding(
-                    get: { store.registry.settings.showRemainingPercent },
-                    set: { enabled in
-                        store.updateSettings { $0.showRemainingPercent = enabled }
-                    }
-                ))
+            VStack(alignment: .leading, spacing: 11) {
+                settingsSwitchRow(
+                    title: "优先显示剩余百分比（关闭则显示已使用百分比）",
+                    isOn: Binding(
+                        get: { store.registry.settings.showRemainingPercent },
+                        set: { enabled in
+                            store.updateSettings { $0.showRemainingPercent = enabled }
+                        }
+                    )
+                )
 
-                Toggle("使用相对倒计时显示重置时间（如「2小时15分后重置」）", isOn: Binding(
-                    get: { store.registry.settings.showResetRelative },
-                    set: { enabled in
-                        store.updateSettings { $0.showResetRelative = enabled }
-                    }
-                ))
+                Divider().opacity(0.35)
+
+                settingsSwitchRow(
+                    title: "使用相对倒计时显示重置时间（如「2小时15分后重置」）",
+                    isOn: Binding(
+                        get: { store.registry.settings.showResetRelative },
+                        set: { enabled in
+                            store.updateSettings { $0.showResetRelative = enabled }
+                        }
+                    )
+                )
 
                 Divider().opacity(0.4)
 
@@ -583,13 +1063,17 @@ public struct SettingsView: View {
                 antigravityPoolSelectorRow
 
                 // Provider Short Prefix Toggle
-                Toggle("显示服务缩写前缀（如 AGY、Codex、DS）", isOn: Binding(
-                    get: { store.registry.settings.menuBarCustom.showProviderPrefix },
-                    set: { showPrefix in
-                        store.updateMenuBarCustom { $0.showProviderPrefix = showPrefix }
-                    }
-                ))
-                .font(.system(size: 11.5))
+                settingsSwitchRow(
+                    title: "显示服务缩写前缀（如 AGY、Codex、DS）",
+                    fontSize: 11.5,
+                    controlSize: .mini,
+                    isOn: Binding(
+                        get: { store.registry.settings.menuBarCustom.showProviderPrefix },
+                        set: { showPrefix in
+                            store.updateMenuBarCustom { $0.showProviderPrefix = showPrefix }
+                        }
+                    )
+                )
             }
             .padding(10)
             .background(Color.primary.opacity(0.025))
@@ -663,13 +1147,17 @@ public struct SettingsView: View {
                     .frame(width: 195)
                 }
 
-                Toggle("空闲无生成时自动隐藏 tok/s", isOn: Binding(
-                    get: { store.registry.settings.menuBarCustom.hideRateWhenIdle },
-                    set: { hideIdle in
-                        store.updateMenuBarCustom { $0.hideRateWhenIdle = hideIdle }
-                    }
-                ))
-                .font(.system(size: 11.5))
+                settingsSwitchRow(
+                    title: "空闲无生成时自动隐藏 tok/s",
+                    fontSize: 11.5,
+                    controlSize: .mini,
+                    isOn: Binding(
+                        get: { store.registry.settings.menuBarCustom.hideRateWhenIdle },
+                        set: { hideIdle in
+                            store.updateMenuBarCustom { $0.hideRateWhenIdle = hideIdle }
+                        }
+                    )
+                )
             }
             .padding(10)
             .background(Color.primary.opacity(0.025))
@@ -758,7 +1246,7 @@ public struct SettingsView: View {
             Picker("", selection: Binding(
                 get: { store.registry.settings.menuBarCustom.antigravityPool },
                 set: { pool in
-                    store.updateMenuBarCustom { $0.antigravityPool = pool }
+                    store.setAntigravityPool(pool)
                 }
             )) {
                 ForEach(AntigravityPoolPreference.allCases) { pool in
@@ -768,7 +1256,7 @@ public struct SettingsView: View {
             .labelsHidden()
             .pickerStyle(.segmented)
             .controlSize(.small)
-            .frame(maxWidth: 230)
+            .frame(maxWidth: 256)
         }
     }
 
@@ -1404,6 +1892,55 @@ public struct SettingsView: View {
                     )
                 )
             }
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2.5) {
+                        HStack(spacing: 5) {
+                            ProviderBrandIconView(provider: .antigravity, size: 13)
+                            Text("AGY 卡片仅显示所选追踪池")
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundColor(.primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text("关闭时显示全部模型池；开启后 Antigravity 账号卡片仅显示当前追踪池（\(store.registry.settings.menuBarCustom.antigravityPool.displayName)）对应配额")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .layoutPriority(1)
+
+                    Spacer(minLength: 8)
+
+                    Toggle("", isOn: Binding(
+                        get: { store.registry.settings.accountCardConfig.filterAntigravityCardPools },
+                        set: { val in
+                            withAnimation(OrbitMotion.snappy) {
+                                store.updateAccountCardConfig { $0.filterAntigravityCardPools = val }
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .padding(.top, 1)
+                }
+
+                if cfg.filterAntigravityCardPools {
+                    Divider().opacity(0.3)
+                    antigravityPoolSelectorRow
+                        .transition(.opacity)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.03))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.6)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .padding(10)
         .background(Color.primary.opacity(0.025))
@@ -1420,6 +1957,7 @@ public struct SettingsView: View {
                 .font(.system(size: 11))
                 .foregroundColor(.primary)
                 .lineLimit(1)
+                .minimumScaleFactor(0.9)
             Spacer(minLength: 4)
             Toggle("", isOn: isOn)
                 .labelsHidden()
@@ -1427,7 +1965,8 @@ public struct SettingsView: View {
                 .controlSize(.mini)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.vertical, 5.5)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.03))
         .overlay(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -1498,8 +2037,10 @@ public struct SettingsView: View {
             )
             .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
 
-            Toggle(
-                "Token 用量卡片使用紧凑密度",
+            settingsSwitchRow(
+                title: "Token 用量卡片使用紧凑密度",
+                fontSize: 11.5,
+                controlSize: .mini,
                 isOn: Binding(
                     get: { store.registry.settings.tokenDashboardCards.compactDensity },
                     set: { compact in
@@ -1507,7 +2048,6 @@ public struct SettingsView: View {
                     }
                 )
             )
-            .font(.system(size: 11.5))
         }
         .padding(10)
         .background(Color.primary.opacity(0.025))
@@ -1854,6 +2394,8 @@ public struct SettingsView: View {
                     }
                 }
 
+                antigravityBehaviorCard
+
                 settingsCard(title: "API Key 安全配置（系统钥匙串）", icon: "key.fill") {
                     VStack(alignment: .leading, spacing: 12) {
                         apiKeyConfigRow(
@@ -1912,6 +2454,30 @@ public struct SettingsView: View {
             .padding(.leading, 2)
             .padding(.trailing, 8)
         }
+    }
+
+    private var antigravityBehaviorCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                ProviderBrandIconView(provider: .antigravity, size: 15)
+                Text("Antigravity 切号与重启行为")
+                    .font(.system(size: 12.5, weight: .bold))
+            }
+
+            settingsSwitchRow(
+                title: "切换 / 重启时同时打开 Antigravity 预览版（Insiders）",
+                subtitle: "默认关闭：切换账号或重启后仅启动正式版 Antigravity，避免同时弹出两个窗口",
+                isOn: Binding(
+                    get: { store.registry.settings.relaunchAntigravityInsiders },
+                    set: { enabled in
+                        store.setRelaunchAntigravityInsiders(enabled)
+                    }
+                )
+            )
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .orbitCardStyle(cornerRadius: 11, hoverLift: false)
     }
 
     private func providerToggleRow(for provider: ProviderID) -> some View {
@@ -2154,6 +2720,53 @@ public struct SettingsView: View {
 
             Divider().opacity(0.35)
 
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(aboutUpdateStatusHeadline)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundColor(aboutUpdateStatusColor)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("仅访问 GitHub Releases（HTTPS 白名单），下载前强制校验 SHA-256")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                if case .available = store.updatePhase {
+                    Button("一键下载并更新") {
+                        store.startUpdateDownloadAndInstall()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .fixedSize()
+                } else {
+                    Button {
+                        Task { await store.checkForUpdates(userInitiated: true) }
+                    } label: {
+                        Label(
+                            store.updatePhase == .checking ? "检查中…" : "检查更新",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                        .font(.system(size: 11, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(store.updatePhase.isBusy)
+                    .fixedSize()
+                }
+
+                Button("Release 页面") {
+                    store.openUpdateReleasePage()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
+            }
+
+            Divider().opacity(0.35)
+
             Text("底层数据目录（RoryOrbit）、钥匙串命名空间（com.rory.roryorbit.*）及后台服务均保持兼容沿用，原有授权与号池采集链路不受影响。")
                 .font(.system(size: 10.5))
                 .foregroundColor(.secondary)
@@ -2162,6 +2775,42 @@ public struct SettingsView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .orbitCardStyle(cornerRadius: 11, hoverLift: false)
+    }
+
+    private var aboutUpdateStatusHeadline: String {
+        switch store.updatePhase {
+        case .idle, .upToDate:
+            if let checkedAt = effectiveLastUpdateCheckAt {
+                return "当前已是最新版本 · 上次检查 \(store.relativeTimeAgoString(since: checkedAt))"
+            }
+            return "当前已是最新版本"
+        case .checking:
+            return "正在检查 GitHub Releases…"
+        case .available(let info):
+            return "发现新版本 \(formattedVersionTag(info.version))"
+        case .downloading(let info, let progress):
+            let pct = Int((min(max(progress.isFinite ? progress : 0.0, 0.0), 1.0) * 100.0).rounded())
+            return "正在下载 \(formattedVersionTag(info.version))（\(pct)%）"
+        case .verifying(let info):
+            return "正在校验 \(formattedVersionTag(info.version)) SHA-256…"
+        case .installing(let info), .readyToRelaunch(let info):
+            return "正在安全替换并重启至 \(formattedVersionTag(info.version))…"
+        case .manualInstallOpened(let info, _):
+            return "已校验并打开 \(formattedVersionTag(info.version)) 安装包"
+        case .failed:
+            return "检查或安装更新失败，可在「通用」页查看详情"
+        }
+    }
+
+    private var aboutUpdateStatusColor: Color {
+        switch store.updatePhase {
+        case .available:
+            return .accentColor
+        case .failed:
+            return Color(nsColor: .systemRed)
+        case .idle, .upToDate, .checking, .downloading, .verifying, .installing, .readyToRelaunch, .manualInstallOpened:
+            return .primary
+        }
     }
 
     private var localTokenStatsCard: some View {
@@ -2272,7 +2921,41 @@ public struct SettingsView: View {
         }
     }
 
-    // MARK: - Section Card Helper
+    // MARK: - Section Card & Switch Row Helpers
+
+    private func settingsSwitchRow(
+        title: String,
+        subtitle: String? = nil,
+        fontSize: CGFloat = 12,
+        controlSize: ControlSize = .small,
+        isOn: Binding<Bool>
+    ) -> some View {
+        HStack(alignment: subtitle == nil ? .center : .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2.5) {
+                Text(title)
+                    .font(.system(size: fontSize, weight: subtitle == nil ? .regular : .medium))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .layoutPriority(1)
+
+            Spacer(minLength: 10)
+
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(controlSize)
+                .padding(.top, subtitle == nil ? 0 : 1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 
     private func settingsCard<Content: View>(
         title: String,

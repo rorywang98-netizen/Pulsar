@@ -668,6 +668,14 @@ final class RoryOrbitAppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        let checkUpdatesItem = NSMenuItem(
+            title: "检查更新…",
+            action: #selector(menuCheckForUpdates),
+            keyEquivalent: ""
+        )
+        checkUpdatesItem.target = self
+        menu.addItem(checkUpdatesItem)
+
         let settingsItem = NSMenuItem(
             title: "偏好设置…",
             action: #selector(menuOpenSettings),
@@ -794,12 +802,23 @@ final class RoryOrbitAppDelegate: NSObject, NSApplicationDelegate {
         togglePopover(sender)
     }
 
-    private func showPopover(from button: NSStatusBarButton) {
+    private func showPopover(from button: NSStatusBarButton, triggerStaleRefresh: Bool = true) {
         syncPopoverContentSize(clampedPopoverSize(from: store.registry.settings))
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
-        store.refreshIfStaleOnMenuOpen()
+
+        if triggerStaleRefresh {
+            Task { @MainActor [weak self] in
+                guard let self, let store = self.store else { return }
+                let settings = store.registry.settings
+                if settings.refreshOnMenuOpen || settings.refreshCadence == .onMenuOpen {
+                    store.refreshStaleQuotasIfNeeded(maxAgeSeconds: 45)
+                } else {
+                    store.checkAndRefreshExpiredResetWindows()
+                }
+            }
+        }
     }
 
     private func togglePopover(_ sender: NSStatusBarButton) {
@@ -859,6 +878,27 @@ final class RoryOrbitAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuRefreshAll() {
         Task { [weak self] in
             await self?.store.refreshAll()
+        }
+    }
+
+    @objc private func menuCheckForUpdates() {
+        Task { @MainActor [weak self] in
+            guard let self, let store = self.store else { return }
+            await store.checkForUpdates(userInitiated: true)
+            if let settingsWindow = self.settingsWindow, settingsWindow.isVisible {
+                NSApp.activate(ignoringOtherApps: true)
+                settingsWindow.makeKeyAndOrderFront(nil)
+            } else if let button = self.statusItem?.button {
+                if case .upToDate = store.updatePhase, store.selectedPopoverTab != .quota {
+                    store.selectPopoverTab(.quota)
+                }
+                if !self.popover.isShown {
+                    self.showPopover(from: button, triggerStaleRefresh: false)
+                } else {
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.popover.contentViewController?.view.window?.makeKey()
+                }
+            }
         }
     }
 

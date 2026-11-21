@@ -2,15 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_VERSION="${APP_VERSION:-1.1.0}"
 SOURCE_APP="$ROOT/RoryOrbit.app"
 DIST_APP_NAME="Pulsar.app"
 BUNDLE_ID="com.rory.roryorbit"
-VOL_NAME="Pulsar ${APP_VERSION}"
 DIST_DIR="$ROOT/dist"
-DMG_NAME="Pulsar-v${APP_VERSION}-macOS-arm64.dmg"
-DMG_PATH="$DIST_DIR/$DMG_NAME"
-SHA_PATH="${DMG_PATH}.sha256"
 
 # Use physical path (pwd -P) so /var -> /private/var matches hdiutil/mount paths reliably.
 RAW_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pulsar-dmg.XXXXXX")"
@@ -50,18 +45,34 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  echo "==> [1/4] Building latest RoryOrbit.app (v${APP_VERSION})..."
-  APP_VERSION="$APP_VERSION" bash "$ROOT/build.sh"
+  if [[ -n "${APP_VERSION:-}" ]]; then
+    echo "==> [1/4] Building latest RoryOrbit.app (v${APP_VERSION})..."
+    APP_VERSION="$APP_VERSION" bash "$ROOT/build.sh"
+  else
+    echo "==> [1/4] Building latest RoryOrbit.app..."
+    bash "$ROOT/build.sh"
+  fi
 else
   echo "==> [1/4] Skipping build (--skip-build); using existing RoryOrbit.app..."
 fi
 
-if [[ ! -d "$SOURCE_APP" ]]; then
-  echo "Error: expected app bundle not found at $SOURCE_APP" >&2
+if [[ ! -d "$SOURCE_APP" || ! -f "$SOURCE_APP/Contents/Info.plist" ]]; then
+  echo "Error: expected app bundle/Info.plist not found at $SOURCE_APP" >&2
   exit 1
 fi
 
-echo "==> [2/4] Staging ${DIST_APP_NAME} and signing..."
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE_APP/Contents/Info.plist")"
+if [[ -z "$VERSION" ]]; then
+  echo "Error: CFBundleShortVersionString is empty in $SOURCE_APP/Contents/Info.plist" >&2
+  exit 1
+fi
+APP_VERSION="$VERSION"
+VOL_NAME="Pulsar ${VERSION}"
+DMG_NAME="Pulsar-v${VERSION}-macOS-arm64.dmg"
+DMG_PATH="$DIST_DIR/$DMG_NAME"
+SHA_PATH="${DMG_PATH}.sha256"
+
+echo "==> [2/4] Staging ${DIST_APP_NAME} (v${VERSION}) and signing..."
 mkdir -p "$STAGING_DIR" "$DIST_DIR"
 ditto "$SOURCE_APP" "$STAGING_DIR/$DIST_APP_NAME"
 xattr -cr "$STAGING_DIR/$DIST_APP_NAME" 2>/dev/null || true

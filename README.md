@@ -3,7 +3,7 @@
   <h1>Pulsar</h1>
   <p><strong>原生 macOS Liquid Glass 菜单栏 AI 配额监控、多账号安全切换、纯本地 Token 分析与实时 <code>tok/s</code> 测速工具</strong></p>
   <p>
-    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.1.0"><img src="https://img.shields.io/badge/version-v1.1.0-6366F1?style=flat-square" alt="Version v1.1.0" /></a>
+    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/version-v1.2.0-6366F1?style=flat-square" alt="Version v1.2.0" /></a>
     <img src="https://img.shields.io/badge/macOS-13%2B%20%7C%20Liquid%20Glass%2026%2F27-0EA5E9?style=flat-square" alt="macOS 13+" />
     <img src="https://img.shields.io/badge/arch-Apple%20Silicon%20(arm64)-10B981?style=flat-square" alt="Apple Silicon" />
     <img src="https://img.shields.io/badge/Swift-AppKit%20%2B%20SwiftUI%20(Zero%20Deps)-F97316?style=flat-square" alt="Pure Swift" />
@@ -15,13 +15,13 @@
 
 ## 立即下载安装包（macOS Apple Silicon）
 
-> **推荐安装方式**：直接下载打包好的 DMG 镜像，将 **`Pulsar.app`** 拖入 `Applications` 即可使用，零第三方运行时依赖。
+> **推荐安装方式**：直接下载打包好的 DMG 镜像，将 **`Pulsar.app`** 拖入 `Applications` 即可使用，零第三方运行时依赖。内置 **GitHub Releases 自动检查更新**（每 12 小时自动轻检 + SHA-256 强制校验 + 一键原地安全升级），后续发布新版时本地自动收到提醒！
 
 | 下载项 | 链接 / 信息 |
 |---|---|
-| **DMG 直链下载（最新 v1.1.0）** | [**Pulsar-v1.1.0-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.1.0-macOS-arm64.dmg) |
-| **GitHub Release 发布页** | [Releases · v1.1.0](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.1.0) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
-| **SHA-256 校验值** | `d5a8b2f91bebd6cbb0b5ae78de856f55bd18aa9d41980fa34a27ff260c4dbc74` |
+| **DMG 直链下载（最新 v1.2.0）** | [**Pulsar-v1.2.0-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.2.0-macOS-arm64.dmg) |
+| **GitHub Release 发布页** | [Releases · v1.2.0](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.0) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
+| **SHA-256 校验值** | `d07e9d1999e42ada56fa4e7d93717593b200e5fb12a17bb1a6e70cf4d4ad501f` |
 | **系统要求** | macOS 13.0+（Apple Silicon `arm64`），macOS 26/27 自动启用原生 Liquid Glass 液态玻璃材质 |
 
 ### 首次打开说明（本地 Ad-hoc 签名）
@@ -35,9 +35,25 @@ xattr -dr com.apple.quarantine /Applications/Pulsar.app
 可选校验下载完整性：
 
 ```bash
-shasum -a 256 Pulsar-v1.1.0-macOS-arm64.dmg
-# 应输出: d5a8b2f91bebd6cbb0b5ae78de856f55bd18aa9d41980fa34a27ff260c4dbc74  Pulsar-v1.1.0-macOS-arm64.dmg
+shasum -a 256 Pulsar-v1.2.0-macOS-arm64.dmg
+# 应输出: d07e9d1999e42ada56fa4e7d93717593b200e5fb12a17bb1a6e70cf4d4ad501f  Pulsar-v1.2.0-macOS-arm64.dmg
 ```
+
+---
+
+## v1.2.0 新特性
+
+- **内置 GitHub Releases 自动检查更新与一键原地升级**：
+  - 启动后自动轻检并每 **12 小时**通过 ETag (`If-None-Match`) 零流量检查 `releases/latest`；发现新版本时在顶栏版本胶囊旁显示醒目更新徽章与可折叠 Liquid Glass 横幅，支持随时在顶栏 `…`、状态栏右键菜单与「设置 → 通用 / 关于」手动检查。
+  - 仅允许 **4 个 GitHub HTTPS 白名单域名**（`api.github.com`、`github.com`、`objects.githubusercontent.com`、`release-assets.githubusercontent.com`），下载后强制流式 **SHA-256 校验**、校验 Bundle ID 与 `codesign --verify --deep --strict`，并在可写 `/Applications` 目录执行原子替换与失败自动回滚（只读卷自动保存校验后 DMG 至 `~/Downloads` 引导拖拽安装），全程零第三方依赖、零 Claude 联网。
+- **Antigravity 追踪池一键快捷筛选与根治状态栏误爆黄**：
+  - Antigravity 账号页顶栏下方新增紧凑 Liquid Glass **「追踪池」快捷筛选条**（`全部 | Gemini | Claude / GPT | Argon`），`自定义额度视图` 与「设置」同步新增 **「卡片仅显示所选池」** 开关，340pt 极窄宽度零截断。
+  - 顶部状态栏、AGY 胶囊、预警色与「最多」最佳账号角标全部严格对齐当前追踪池；同时修复 `最低预警` 模式下旁路未授权服务（如 Cursor `.reauthRequired`）误将健康 `AGY 100%` 状态栏染黄的问题。
+- **弹窗打开自动保鲜与重置到期即时刷新**：
+  - 每次打开菜单栏主弹窗自动静默保鲜（数据超 45 秒、存在 stale 快照或窗口已跨过 `resetAt` 时自动刷新），并新增每 30 秒纯本地重置到期守望器，额度重置瞬间秒级同步。
+  - Antigravity 全部请求显式禁用缓存（`reloadIgnoringLocalAndRemoteCacheData` + `Cache-Control: no-cache`）并增加单账号独立超时隔离，彻底解决非当前账号额度重置不及时或单号拖垮整批刷新的问题。
+- **切换账号默认仅拉起正式版，不双开 Insiders 预览版**：
+  - 切换 Antigravity 账号或重启客户端时仍温和停止 Stable + Insiders 防止旧凭据残留，但重新拉起阶段默认过滤预览版、至多拉起 1 个正式版 `Antigravity.app`（仅装预览版时自动安全兜底）；如需同时恢复预览版，可在「设置 → 服务与密钥」按需开启。
 
 ---
 
@@ -96,8 +112,9 @@ shasum -a 256 Pulsar-v1.1.0-macOS-arm64.dmg
 
 - **严格零 Claude 联网与零凭据触碰**：
   - 配额监控与快照导出仅覆盖 Antigravity / Codex / Grok / Cursor / Kimi / DeepSeek 6 个非 Claude 服务；
-  - 本地 Token 用量与实时 `tok/s` 测速引擎（`TokenUsageModels.swift` / `TokenUsageEngine.swift` / `TokenUsageViews.swift`）全程 **0 `URLSession`、0 `Process(`**，仅离线只读本机已落盘会话日志，**零网络请求 Anthropic 接口、零拉起 Claude CLI、零读取 Claude 钥匙串凭据**。
-- **绝不自动 `SIGKILL`**：多账号切换控制客户端时先验证目标凭证有效，再优雅调用 `NSRunningApplication.terminate()` / `SIGTERM` 并等待 12 秒；超时直接中止并提示，仅用户显式确认才允许强制结束，切换后仅重启切换前运行过的应用。
+  - 本地 Token 用量与实时 `tok/s` 测速引擎（`TokenUsageModels.swift` / `TokenUsageEngine.swift` / `TokenUsageViews.swift`）全程 **0 `URLSession`、0 `Process(`**，仅离线只读本机已落盘会话日志，**零网络请求 Anthropic 接口、零拉起 Claude CLI、零读取 Claude 钥匙串凭据**；
+  - 内置更新器（`ReleaseUpdater.swift`）严格锁定 4 个 GitHub Releases HTTPS 白名单域名并校验重定向目标，下载后强制 SHA-256 + Bundle ID + `codesign --verify --deep --strict` 三重校验，CLI 子命令零联网触发。
+- **绝不自动 `SIGKILL`**：多账号切换控制客户端时先验证目标凭证有效，再优雅调用 `NSRunningApplication.terminate()` / `SIGTERM` 并等待 12 秒；超时直接中止并提示，仅用户显式确认才允许强制结束，Antigravity 切换后默认仅拉起正式版不双开 Insiders 预览版。
 - **保护 Codex 单次 Refresh Token**：后台轮询严格只读当前活跃 Codex 账号，非活跃账号刷新经内存门控 + 跨进程 `flock` 锁串行执行并即时轮换落盘。
 - **零命令行明文与严格权限**：钥匙串写入通过 `/usr/bin/security -i` stdin 通道完成（绝不经 `argv` 传参）；大凭证采用分片 + SHA-256 校验与代际轮换；本地状态、头像缓存、归档与快照均按目录 `0700` / 文件 `0600` 原子 `fsync + rename` 落盘。
 

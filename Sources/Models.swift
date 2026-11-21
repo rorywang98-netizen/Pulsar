@@ -676,12 +676,37 @@ public struct AccountRecord: Codable, Equatable, Identifiable, Hashable, Sendabl
         try container.encodeIfPresent(avatarURL, forKey: .avatarURL)
     }
 
-    /// Computes the account ID with the highest primary remaining quota among eligible accounts for a provider.
+    /// Computes the remaining percentage used for ranking best-remaining accounts for a provider.
+    /// For Antigravity, strictly honors `antigravityPool` when window data is present so a low
+    /// unrelated pool (e.g. Claude/GPT weekly 2%) never distorts a Gemini-tracked ranking.
+    public static func bestRankingRemainingPercent(
+        for provider: ProviderID,
+        snapshot: QuotaSnapshot,
+        antigravityPool: AntigravityPoolPreference = .autoLowest
+    ) -> Int? {
+        guard snapshot.status.isReady else { return nil }
+        if provider == .antigravity, !snapshot.windows.isEmpty {
+            let candidates: [QuotaWindow]
+            if antigravityPool == .autoLowest {
+                candidates = snapshot.windows
+            } else {
+                let matched = snapshot.windows.filter { $0.antigravityPoolKind == antigravityPool }
+                candidates = matched.isEmpty ? snapshot.windows : matched
+            }
+            if let lowest = candidates.map(\.remainingPercent).min() {
+                return lowest
+            }
+        }
+        return snapshot.primaryRemainingPercent
+    }
+
+    /// Computes the account ID with the highest remaining quota among eligible accounts for a provider.
     /// Returns nil when fewer than 2 accounts exist or no ready percentage snapshot is available.
     public static func bestRemainingAccountId(
         for provider: ProviderID,
         accounts: [AccountRecord],
-        snapshots: [String: QuotaSnapshot]
+        snapshots: [String: QuotaSnapshot],
+        antigravityPool: AntigravityPoolPreference = .autoLowest
     ) -> String? {
         let providerAccounts = accounts.filter { $0.provider == provider }
         guard providerAccounts.count >= 2 else { return nil }
@@ -690,8 +715,11 @@ public struct AccountRecord: Codable, Equatable, Identifiable, Hashable, Sendabl
         var bestPct: Int = -1
         for account in providerAccounts {
             guard let snap = snapshots[account.id],
-                  snap.status.isReady,
-                  let pct = snap.primaryRemainingPercent else {
+                  let pct = bestRankingRemainingPercent(
+                    for: provider,
+                    snapshot: snap,
+                    antigravityPool: antigravityPool
+                  ) else {
                 continue
             }
             if pct > bestPct {
@@ -704,9 +732,15 @@ public struct AccountRecord: Codable, Equatable, Identifiable, Hashable, Sendabl
 
     public func computeIsBestRemaining(
         among accounts: [AccountRecord],
-        snapshots: [String: QuotaSnapshot]
+        snapshots: [String: QuotaSnapshot],
+        antigravityPool: AntigravityPoolPreference = .autoLowest
     ) -> Bool {
-        Self.bestRemainingAccountId(for: provider, accounts: accounts, snapshots: snapshots) == id
+        Self.bestRemainingAccountId(
+            for: provider,
+            accounts: accounts,
+            snapshots: snapshots,
+            antigravityPool: antigravityPool
+        ) == id
     }
 }
 
@@ -1621,6 +1655,7 @@ public struct AccountCardConfig: Codable, Equatable, Hashable, Sendable {
     public var showSourceBadge: Bool
     public var compactDensity: Bool
     public var pillQuotaWindow: MenuBarQuotaWindow
+    public var filterAntigravityCardPools: Bool
 
     public init(
         showAvatar: Bool = true,
@@ -1629,7 +1664,8 @@ public struct AccountCardConfig: Codable, Equatable, Hashable, Sendable {
         showResetFootnote: Bool = true,
         showSourceBadge: Bool = true,
         compactDensity: Bool = false,
-        pillQuotaWindow: MenuBarQuotaWindow = .weeklyFirst
+        pillQuotaWindow: MenuBarQuotaWindow = .weeklyFirst,
+        filterAntigravityCardPools: Bool = false
     ) {
         self.showAvatar = showAvatar
         self.showFiveHour = showFiveHour
@@ -1638,6 +1674,7 @@ public struct AccountCardConfig: Codable, Equatable, Hashable, Sendable {
         self.showSourceBadge = showSourceBadge
         self.compactDensity = compactDensity
         self.pillQuotaWindow = pillQuotaWindow
+        self.filterAntigravityCardPools = filterAntigravityCardPools
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1648,6 +1685,7 @@ public struct AccountCardConfig: Codable, Equatable, Hashable, Sendable {
         case showSourceBadge
         case compactDensity
         case pillQuotaWindow
+        case filterAntigravityCardPools
     }
 
     public init(from decoder: Decoder) throws {
@@ -1659,6 +1697,7 @@ public struct AccountCardConfig: Codable, Equatable, Hashable, Sendable {
         self.showSourceBadge = try c.decodeIfPresent(Bool.self, forKey: .showSourceBadge) ?? true
         self.compactDensity = try c.decodeIfPresent(Bool.self, forKey: .compactDensity) ?? false
         self.pillQuotaWindow = (try? c.decodeIfPresent(MenuBarQuotaWindow.self, forKey: .pillQuotaWindow)) ?? .weeklyFirst
+        self.filterAntigravityCardPools = try c.decodeIfPresent(Bool.self, forKey: .filterAntigravityCardPools) ?? false
     }
 }
 
@@ -1697,6 +1736,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var tokenDashboardCards: DashboardTokenCardConfig
     public var accountCardConfig: AccountCardConfig
     public var tokenClientOrder: [String]
+    public var relaunchAntigravityInsiders: Bool
+    public var autoCheckUpdates: Bool
+    public var skippedUpdateVersion: String?
+    public var lastUpdateCheckAt: Date?
 
     public init(
         enabledProviders: [ProviderID] = ProviderID.allCases,
@@ -1717,7 +1760,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
         tokenPopoverCards: PopoverTokenCardConfig = .default,
         tokenDashboardCards: DashboardTokenCardConfig = .default,
         accountCardConfig: AccountCardConfig = .default,
-        tokenClientOrder: [String] = []
+        tokenClientOrder: [String] = [],
+        relaunchAntigravityInsiders: Bool = false,
+        autoCheckUpdates: Bool = true,
+        skippedUpdateVersion: String? = nil,
+        lastUpdateCheckAt: Date? = nil
     ) {
         self.enabledProviders = enabledProviders.isEmpty ? ProviderID.allCases : enabledProviders
         self.selectedProvider = selectedProvider
@@ -1738,6 +1785,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.tokenDashboardCards = tokenDashboardCards
         self.accountCardConfig = accountCardConfig
         self.tokenClientOrder = Self.normalizeTokenClientOrder(tokenClientOrder)
+        self.relaunchAntigravityInsiders = relaunchAntigravityInsiders
+        self.autoCheckUpdates = autoCheckUpdates
+        let trimmedSkipped = skippedUpdateVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.skippedUpdateVersion = (trimmedSkipped?.isEmpty == false) ? trimmedSkipped : nil
+        self.lastUpdateCheckAt = lastUpdateCheckAt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1760,6 +1812,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case tokenDashboardCards
         case accountCardConfig
         case tokenClientOrder
+        case relaunchAntigravityInsiders
+        case autoCheckUpdates
+        case skippedUpdateVersion
+        case lastUpdateCheckAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -1792,6 +1848,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.accountCardConfig = (try? c.decodeIfPresent(AccountCardConfig.self, forKey: .accountCardConfig)) ?? .default
         let rawClientOrder = (try? c.decodeIfPresent([String].self, forKey: .tokenClientOrder)) ?? []
         self.tokenClientOrder = Self.normalizeTokenClientOrder(rawClientOrder)
+        self.relaunchAntigravityInsiders = (try? c.decodeIfPresent(Bool.self, forKey: .relaunchAntigravityInsiders)) ?? false
+        self.autoCheckUpdates = (try? c.decodeIfPresent(Bool.self, forKey: .autoCheckUpdates)) ?? true
+        let rawSkipped = (try? c.decodeIfPresent(String.self, forKey: .skippedUpdateVersion))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.skippedUpdateVersion = (rawSkipped?.isEmpty == false) ? rawSkipped : nil
+        self.lastUpdateCheckAt = try? c.decodeIfPresent(Date.self, forKey: .lastUpdateCheckAt)
     }
 
     // MARK: - Token Client Filter Custom Ordering
@@ -2038,12 +2100,17 @@ public struct RegistryData: Codable, Equatable, Sendable {
         accounts.removeAll { $0.provider == provider && $0.id == id }
     }
 
-    public mutating func refreshBestRemainingFlags(snapshots: [String: QuotaSnapshot]) {
+    public mutating func refreshBestRemainingFlags(
+        snapshots: [String: QuotaSnapshot],
+        antigravityPool: AntigravityPoolPreference? = nil
+    ) {
+        let effectivePool = antigravityPool ?? settings.menuBarCustom.antigravityPool
         for provider in ProviderID.allCases {
             let bestId = AccountRecord.bestRemainingAccountId(
                 for: provider,
                 accounts: accounts,
-                snapshots: snapshots
+                snapshots: snapshots,
+                antigravityPool: effectivePool
             )
             for idx in accounts.indices where accounts[idx].provider == provider {
                 accounts[idx].isBestRemaining = (bestId != nil && accounts[idx].id == bestId)

@@ -73,19 +73,23 @@ public enum PopoverTab: String, CaseIterable, Identifiable, Hashable, Sendable {
 @MainActor
 public final class AppStore: ObservableObject {
     public nonisolated static let bundleIdentifier = "com.rory.roryorbit"
-    public nonisolated static let appVersion = "1.1.0"
+    public nonisolated static let appVersion = "1.2.0"
 
     public nonisolated static var defaultAvatarCacheDirectoryURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("avatars", isDirectory: true)
     }
 
     private nonisolated static let maxAvatarImageBytes = 4 * 1024 * 1024
+    private nonisolated static let autoStaleRefreshCooldownSeconds: TimeInterval = 30.0
+    private nonisolated static let updateCheckInitialDelayNanoseconds: UInt64 = 8_000_000_000
+    private nonisolated static let updateCheckIntervalNanoseconds: UInt64 = 12 * 3_600 * 1_000_000_000
 
     public let keychain: KeychainStore
     public let processController: ProcessController
     public let adapters: [ProviderID: any ProviderAdapter]
     public let tokenUsageEngine: TokenUsageEngine
     public let accountPoolExporter: AccountPoolExporter
+    public let releaseUpdater: ReleaseUpdater
 
     private let registryURL: URL
     private let migrationPaths: LegacyMigrationPaths
@@ -94,13 +98,18 @@ public final class AppStore: ObservableObject {
     private let ownsAvatarSession: Bool
     private let shouldPrewarmAvatars: Bool
     private let shouldPersistAccountPoolExport: Bool
+    private let isSchedulerEnabled: Bool
     private let providerRefreshTimeoutSeconds: TimeInterval
+    private let perAccountRefreshTimeoutSeconds: TimeInterval?
     private let accountPoolExportQueue = DispatchQueue(
         label: "com.rory.roryorbit.accountpool-export",
         qos: .utility
     )
     private var schedulerTask: Task<Void, Never>?
     private var liveSpeedTimerTask: Task<Void, Never>?
+    private var resetExpiryWatcherTask: Task<Void, Never>?
+    private var updateCheckSchedulerTask: Task<Void, Never>?
+    private var updateOperationTask: Task<Void, Never>?
     private var startupTokenScanTask: Task<Void, Never>?
     private var bannerClearTask: Task<Void, Never>?
     private var windowSizeSaveTask: Task<Void, Never>?
@@ -108,6 +117,8 @@ public final class AppStore: ObservableObject {
     private var hasSampledLiveSpeedOnce: Bool = false
     private var loadedAvatarURLByAccountId: [String: String] = [:]
     private var inFlightAvatarKeys: Set<String> = []
+    private var lastRefreshedAtByProvider: [ProviderID: Date] = [:]
+    private var lastAutoStaleRefreshAttemptByProvider: [ProviderID: Date] = [:]
 
     @Published public var registry: RegistryData
     @Published public var snapshots: [String: QuotaSnapshot] = [:]
@@ -129,6 +140,8 @@ public final class AppStore: ObservableObject {
     @Published public var selectedPopoverTab: PopoverTab = .quota
     @Published public private(set) var avatarImages: [String: NSImage] = [:]
     @Published public private(set) var liveTokenSpeed: LiveTokenSpeedSnapshot = .empty()
+    @Published public private(set) var updatePhase: ReleaseUpdatePhase = .idle
+    @Published public var isUpdateBannerDismissed: Bool = false
 
     public nonisolated static func makeDefaultAdapters(
         keychain: KeychainStore = .shared,
@@ -155,9 +168,11 @@ public final class AppStore: ObservableObject {
         tokenUsageEngine: TokenUsageEngine = .shared,
         accountPoolExporter: AccountPoolExporter = .shared,
         persistAccountPoolExport: Bool? = nil,
-        providerRefreshTimeoutSeconds: TimeInterval = 20.0,
+        providerRefreshTimeoutSeconds: TimeInterval = 28.0,
         avatarCacheDirectoryURL: URL? = nil,
-        avatarSession: URLSession? = nil
+        avatarSession: URLSession? = nil,
+        perAccountRefreshTimeoutSeconds: TimeInterval? = nil,
+        releaseUpdater: ReleaseUpdater? = nil
     ) {
         self.keychain = keychain
         self.processController = processController
@@ -167,6 +182,7 @@ public final class AppStore: ObservableObject {
         )
         self.tokenUsageEngine = tokenUsageEngine
         self.accountPoolExporter = accountPoolExporter
+        self.releaseUpdater = releaseUpdater ?? ReleaseUpdater()
         self.registryURL = registryURL
         self.migrationPaths = migrationPaths
         self.avatarCacheDirectoryURL = avatarCacheDirectoryURL
@@ -176,7 +192,9 @@ public final class AppStore: ObservableObject {
         self.shouldPrewarmAvatars = startScheduler || (avatarSession != nil)
         self.shouldPersistAccountPoolExport = persistAccountPoolExport
             ?? (registryURL.standardizedFileURL == RegistryData.defaultFileURL.standardizedFileURL)
+        self.isSchedulerEnabled = startScheduler
         self.providerRefreshTimeoutSeconds = max(0.5, providerRefreshTimeoutSeconds)
+        self.perAccountRefreshTimeoutSeconds = perAccountRefreshTimeoutSeconds
 
         let loadedRegistry: RegistryData
         var loadError: String? = nil
@@ -207,6 +225,8 @@ public final class AppStore: ObservableObject {
         if startScheduler {
             restartScheduler()
             startLiveSpeedPolling()
+            startResetExpiryWatcher()
+            restartUpdateCheckScheduler()
             startupTokenScanTask = Task { [weak self] in
                 await self?.refreshTokenUsage()
             }
@@ -216,6 +236,9 @@ public final class AppStore: ObservableObject {
     deinit {
         schedulerTask?.cancel()
         liveSpeedTimerTask?.cancel()
+        resetExpiryWatcherTask?.cancel()
+        updateCheckSchedulerTask?.cancel()
+        updateOperationTask?.cancel()
         startupTokenScanTask?.cancel()
         bannerClearTask?.cancel()
         windowSizeSaveTask?.cancel()
@@ -302,7 +325,204 @@ public final class AppStore: ObservableObject {
         operationBannerIsError = false
     }
 
-    // MARK: - Background Scheduler
+    // MARK: - Native GitHub Releases Auto-Update
+
+    public var availableUpdateInfo: ReleaseUpdateInfo? {
+        updatePhase.updateInfo
+    }
+
+    public var shouldShowUpdateBanner: Bool {
+        switch updatePhase {
+        case .available(let info):
+            if isUpdateBannerDismissed {
+                return false
+            }
+            if let skipped = registry.settings.skippedUpdateVersion,
+               skipped.caseInsensitiveCompare(info.version) == .orderedSame {
+                return false
+            }
+            return true
+        case .downloading, .verifying, .installing, .readyToRelaunch, .manualInstallOpened:
+            return true
+        case .idle, .checking, .upToDate, .failed:
+            return false
+        }
+    }
+
+    private func restartUpdateCheckScheduler() {
+        updateCheckSchedulerTask?.cancel()
+        updateCheckSchedulerTask = nil
+
+        guard isSchedulerEnabled, registry.settings.autoCheckUpdates else {
+            return
+        }
+
+        let initialDelay = Self.updateCheckInitialDelayNanoseconds
+        let repeatInterval = Self.updateCheckIntervalNanoseconds
+
+        updateCheckSchedulerTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: initialDelay)
+            guard !Task.isCancelled else { return }
+            if let self, self.registry.settings.autoCheckUpdates {
+                await self.checkForUpdates(userInitiated: false)
+            }
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: repeatInterval)
+                if Task.isCancelled { break }
+                guard let self else { break }
+                if self.registry.settings.autoCheckUpdates {
+                    await self.checkForUpdates(userInitiated: false)
+                }
+            }
+        }
+    }
+
+    public func checkForUpdates(userInitiated: Bool = true) async {
+        guard !updatePhase.isBusy else { return }
+        if userInitiated {
+            isUpdateBannerDismissed = false
+        }
+
+        let previousPhase = updatePhase
+        updatePhase = .checking
+
+        do {
+            let result = try await releaseUpdater.checkLatestRelease(currentVersion: Self.appVersion)
+            let checkedAt = Date()
+            registry.settings.lastUpdateCheckAt = checkedAt
+            persistRegistryQuietly()
+
+            switch result {
+            case .updateAvailable(let info):
+                if userInitiated,
+                   let skipped = registry.settings.skippedUpdateVersion,
+                   skipped.caseInsensitiveCompare(info.version) == .orderedSame {
+                    registry.settings.skippedUpdateVersion = nil
+                    persistRegistryQuietly()
+                }
+                updatePhase = .available(info)
+
+            case .upToDate(_, let ts):
+                updatePhase = .upToDate(checkedAt: ts)
+                if userInitiated {
+                    setBanner("当前已是最新版本 Pulsar v\(Self.appVersion)", isError: false)
+                }
+
+            case .notModified(let ts):
+                if case .available(let existingInfo) = previousPhase {
+                    updatePhase = .available(existingInfo)
+                } else {
+                    updatePhase = .upToDate(checkedAt: ts)
+                    if userInitiated {
+                        setBanner("当前已是最新版本 Pulsar v\(Self.appVersion)", isError: false)
+                    }
+                }
+            }
+        } catch {
+            if userInitiated {
+                let message = error.localizedDescription
+                updatePhase = .failed(message)
+                setBanner("检查更新失败：\(message)", isError: true)
+            } else {
+                // Silent background checks never disturb the user on transient network errors.
+                updatePhase = previousPhase.isBusy ? .idle : previousPhase
+            }
+        }
+    }
+
+    public func startUpdateDownloadAndInstall() {
+        guard let info = availableUpdateInfo else { return }
+        switch updatePhase {
+        case .downloading, .verifying, .installing, .readyToRelaunch:
+            return
+        default:
+            break
+        }
+
+        isUpdateBannerDismissed = false
+        updatePhase = .downloading(info, progress: 0.0)
+        updateOperationTask?.cancel()
+
+        let updater = self.releaseUpdater
+        updateOperationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let finalPhase = try await updater.downloadAndInstall(info) { [weak self] phase in
+                    Task { @MainActor [weak self] in
+                        self?.updatePhase = phase
+                    }
+                }
+                self.updatePhase = finalPhase
+                if case .manualInstallOpened(_, let dmgPath) = finalPhase {
+                    let fileName = URL(fileURLWithPath: dmgPath).lastPathComponent
+                    self.setBanner("已校验并打开安装包 \(fileName)，请拖入 Applications 完成更新", isError: false, autoClearSeconds: 8)
+                }
+            } catch {
+                let message = error.localizedDescription
+                self.updatePhase = .failed(message)
+                self.setBanner("自动更新失败：\(message)", isError: true, autoClearSeconds: nil)
+            }
+        }
+    }
+
+    public func openUpdateReleasePage() {
+        let targetURL = availableUpdateInfo?.htmlURL ?? ReleaseUpdater.releasesPageURL
+        guard ReleaseUpdater.isAllowedHost(targetURL) else { return }
+        NSWorkspace.shared.open(targetURL)
+    }
+
+    public func skipAvailableUpdate() {
+        guard let info = availableUpdateInfo else { return }
+        updateSettings { settings in
+            settings.skippedUpdateVersion = info.version
+        }
+        isUpdateBannerDismissed = true
+    }
+
+    public func dismissUpdateBanner() {
+        isUpdateBannerDismissed = true
+    }
+
+    public func setAutoCheckUpdates(_ enabled: Bool) {
+        updateSettings { settings in
+            settings.autoCheckUpdates = enabled
+        }
+    }
+
+    public func setAntigravityPool(_ pool: AntigravityPoolPreference) {
+        updateMenuBarCustom { custom in
+            custom.antigravityPool = pool
+        }
+    }
+
+    public func setRelaunchAntigravityInsiders(_ enabled: Bool) {
+        updateSettings { settings in
+            settings.relaunchAntigravityInsiders = enabled
+        }
+    }
+
+    public func effectiveAntigravityPool() -> AntigravityPoolPreference {
+        registry.settings.menuBarCustom.antigravityPool
+    }
+
+    public func isAntigravityWindowMatchingPool(_ window: QuotaWindow) -> Bool {
+        Self.isAntigravityWindowMatchingPool(window, pool: effectiveAntigravityPool())
+    }
+
+    public nonisolated static func isAntigravityWindowMatchingPool(
+        _ window: QuotaWindow,
+        pool: AntigravityPoolPreference
+    ) -> Bool {
+        switch pool {
+        case .autoLowest:
+            return true
+        case .gemini, .claude, .argon:
+            return window.antigravityPoolKind == pool
+        }
+    }
+
+    // MARK: - Background Scheduler & Reset-Expiry Freshness
 
     public func restartScheduler() {
         schedulerTask?.cancel()
@@ -324,20 +544,147 @@ public final class AppStore: ObservableObject {
         }
     }
 
-    public func refreshIfStaleOnMenuOpen(staleSeconds: TimeInterval = 45) {
-        let cadenceWantsMenuOpen = registry.settings.refreshCadence == .onMenuOpen
-        guard registry.settings.refreshOnMenuOpen || cadenceWantsMenuOpen else {
-            return
+    private func startResetExpiryWatcher() {
+        resetExpiryWatcherTask?.cancel()
+        resetExpiryWatcherTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                if Task.isCancelled { break }
+                guard let self else { break }
+                self.checkAndRefreshExpiredResetWindows()
+            }
         }
-        guard !isRefreshing else { return }
+    }
 
-        if let lastRefreshedAt, Date().timeIntervalSince(lastRefreshedAt) < staleSeconds {
-            return
+    /// Returns `true` when a ready snapshot contains at least one quota window whose `resetAt`
+    /// has already passed since `fetchedAt` (meaning quota has just reset on the server).
+    public nonisolated static func hasExpiredResetWindow(
+        in snapshot: QuotaSnapshot,
+        now: Date = Date()
+    ) -> Bool {
+        guard case .ready(let fetchedAt, _) = snapshot.status else {
+            return false
+        }
+        return snapshot.windows.contains { window in
+            guard let resetAt = window.resetAt else { return false }
+            return resetAt <= now && fetchedAt < resetAt
+        }
+    }
+
+    /// Computes which providers should be silently refreshed due to age (`>= maxAgeSeconds`),
+    /// stale status, or an expired quota window reset timestamp, honoring the 30s per-provider cooldown.
+    public func providersNeedingStaleRefresh(
+        maxAgeSeconds: TimeInterval = 45,
+        providers: [ProviderID]? = nil,
+        now: Date = Date()
+    ) -> [ProviderID] {
+        let targets = providers ?? enabledProvidersOrdered
+        let safeMaxAge = max(0.0, maxAgeSeconds)
+        var needing: [ProviderID] = []
+
+        for provider in targets {
+            guard adapters[provider] != nil,
+                  !refreshingProviders.contains(provider) else { continue }
+
+            if let lastAttempt = lastAutoStaleRefreshAttemptByProvider[provider],
+               now.timeIntervalSince(lastAttempt) < Self.autoStaleRefreshCooldownSeconds {
+                continue
+            }
+
+            let providerSnaps = snapshots.values.filter { $0.provider == provider }
+            let hasExpiredReset = providerSnaps.contains { Self.hasExpiredResetWindow(in: $0, now: now) }
+            let hasStaleSnapshot = providerSnaps.contains { $0.status.isStale }
+
+            let referenceDate = lastRefreshedAtByProvider[provider] ?? lastRefreshedAt
+            let isOlderThanMaxAge: Bool
+            if let referenceDate {
+                isOlderThanMaxAge = now.timeIntervalSince(referenceDate) >= safeMaxAge
+            } else {
+                isOlderThanMaxAge = true
+            }
+
+            if hasExpiredReset || hasStaleSnapshot || isOlderThanMaxAge {
+                needing.append(provider)
+            }
+        }
+        return needing
+    }
+
+    /// Silently refreshes providers whose cached quotas are older than `maxAgeSeconds`, marked stale,
+    /// or contain a quota window whose `resetAt` just elapsed (debounced with a 30s per-provider cooldown).
+    public func refreshStaleQuotasIfNeeded(
+        maxAgeSeconds: TimeInterval = 45,
+        providers: [ProviderID]? = nil
+    ) {
+        guard !isRefreshing else { return }
+        let now = Date()
+        let targets = providersNeedingStaleRefresh(
+            maxAgeSeconds: maxAgeSeconds,
+            providers: providers,
+            now: now
+        )
+        guard !targets.isEmpty else { return }
+
+        for provider in targets {
+            lastAutoStaleRefreshAttemptByProvider[provider] = now
         }
 
         Task { [weak self] in
-            await self?.refreshAll()
+            guard let self else { return }
+            await withTaskGroup(of: Void.self) { group in
+                for provider in targets {
+                    group.addTask { [weak self] in
+                        await self?.refreshProvider(provider, userInitiated: false, persistExport: true)
+                    }
+                }
+            }
         }
+    }
+
+    /// Pure local scan of in-memory snapshots for windows that just crossed `resetAt`; triggers immediate refresh.
+    public func checkAndRefreshExpiredResetWindows(now: Date = Date()) {
+        guard !isRefreshing else { return }
+        var expiredProviders: [ProviderID] = []
+
+        for provider in enabledProvidersOrdered {
+            guard adapters[provider] != nil,
+                  !refreshingProviders.contains(provider) else { continue }
+            if let lastAttempt = lastAutoStaleRefreshAttemptByProvider[provider],
+               now.timeIntervalSince(lastAttempt) < Self.autoStaleRefreshCooldownSeconds {
+                continue
+            }
+            let hasExpired = snapshots.values.contains { snap in
+                snap.provider == provider && Self.hasExpiredResetWindow(in: snap, now: now)
+            }
+            if hasExpired {
+                expiredProviders.append(provider)
+            }
+        }
+
+        guard !expiredProviders.isEmpty else { return }
+        for provider in expiredProviders {
+            lastAutoStaleRefreshAttemptByProvider[provider] = now
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            await withTaskGroup(of: Void.self) { group in
+                for provider in expiredProviders {
+                    group.addTask { [weak self] in
+                        await self?.refreshProvider(provider, userInitiated: false, persistExport: true)
+                    }
+                }
+            }
+        }
+    }
+
+    public func refreshIfStaleOnMenuOpen(staleSeconds: TimeInterval = 45) {
+        let cadenceWantsMenuOpen = registry.settings.refreshCadence == .onMenuOpen
+        guard registry.settings.refreshOnMenuOpen || cadenceWantsMenuOpen else {
+            checkAndRefreshExpiredResetWindows()
+            return
+        }
+        refreshStaleQuotasIfNeeded(maxAgeSeconds: staleSeconds)
     }
 
     // MARK: - Local Token Usage Scan & Live Speed Polling (100% Offline Read-Only)
@@ -456,7 +803,6 @@ public final class AppStore: ObservableObject {
         }
 
         refreshBestRemainingBadges()
-        lastRefreshedAt = Date()
         persistAccountPoolSnapshotQuietly()
 
         Task { [weak self] in
@@ -468,7 +814,7 @@ public final class AppStore: ObservableObject {
         let runtimeStatus: ClientRuntimeStatus
         let syncedAccounts: [AccountRecord]
         let syncedLiveId: String?
-        let fetchedSnapshots: [(AccountRecord, QuotaSnapshot)]
+        let fetchedSnapshots: [(AccountRecord, QuotaSnapshot?)]
         let fetchedAvatarURLs: [String: String]
         let hasStoredAPIKey: Bool
     }
@@ -613,6 +959,14 @@ public final class AppStore: ObservableObject {
         let timeoutSeconds: TimeInterval = isInteractiveCursorConsent
             ? max(providerRefreshTimeoutSeconds, 90.0)
             : providerRefreshTimeoutSeconds
+        let effectiveAccountTimeout: TimeInterval
+        if let explicit = perAccountRefreshTimeoutSeconds {
+            effectiveAccountTimeout = max(0.15, explicit)
+        } else if isInteractiveCursorConsent {
+            effectiveAccountTimeout = max(14.0, timeoutSeconds - 4.0)
+        } else {
+            effectiveAccountTimeout = min(14.0, max(0.25, timeoutSeconds * 0.55))
+        }
 
         let batchResult = await Self.runWithHardTimeout(seconds: timeoutSeconds) { () async -> ProviderRefreshBatchResult in
             let currentAdapter = adapterBox.value
@@ -658,18 +1012,27 @@ public final class AppStore: ObservableObject {
                 }
             }
 
-            var fetchedSnapshots: [(AccountRecord, QuotaSnapshot)] = []
+            var fetchedSnapshots: [(AccountRecord, QuotaSnapshot?)] = []
             var fetchedAvatarURLs: [String: String] = [:]
-            await withTaskGroup(of: (AccountRecord, QuotaSnapshot, String?).self) { group in
+            await withTaskGroup(of: (AccountRecord, QuotaSnapshot?, String?).self) { group in
                 for account in effectiveAccounts {
                     let isLive = account.isActiveLive
                     let needsAvatarFetch = (provider == .antigravity)
                         && (Formatters.sanitizedHTTPSURLString(account.avatarURL) == nil)
                     group.addTask {
-                        let snap = await adapterBox.value.fetchQuota(for: account, isActiveLive: isLive)
+                        // Isolate each account's fetch under its own hard timeout so 1 slow account
+                        // can never starve or discard fresh snapshots from all sibling accounts.
+                        let snap = await Self.runWithHardTimeout(seconds: effectiveAccountTimeout) {
+                            await adapterBox.value.fetchQuota(for: account, isActiveLive: isLive)
+                        }
                         var avatarURL: String? = nil
-                        if needsAvatarFetch, let agProvider = adapterBox.value as? AntigravityProvider {
-                            avatarURL = await agProvider.fetchUserPictureURL(for: account, isActiveLive: isLive)
+                        if snap != nil,
+                           needsAvatarFetch,
+                           let agProvider = adapterBox.value as? AntigravityProvider {
+                            let avatarTimeout = min(5.0, effectiveAccountTimeout)
+                            avatarURL = await Self.runWithHardTimeout(seconds: avatarTimeout) {
+                                await agProvider.fetchUserPictureURL(for: account, isActiveLive: isLive)
+                            } ?? nil
                         }
                         return (account, snap, avatarURL)
                     }
@@ -695,7 +1058,7 @@ public final class AppStore: ObservableObject {
 
         guard let batchResult else {
             // Hard timeout hit: never leave accounts stuck in `.loading` or block `isRefreshing`.
-            let timeoutInt = Int(timeoutSeconds.rounded())
+            let timeoutInt = max(1, Int(timeoutSeconds.rounded()))
             for account in registry.accounts(for: provider) {
                 let key = Self.snapshotKey(provider: provider, accountId: account.id)
                 if snapshots[key] == nil || snapshots[key]?.status == .loading {
@@ -721,16 +1084,33 @@ public final class AppStore: ObservableObject {
         )
 
         var metadataChanged = accountsChangedFromSync
-        for (account, snap) in batchResult.fetchedSnapshots {
-            let key = Self.snapshotKey(provider: provider, accountId: account.id)
-            snapshots[key] = snap
+        let accountTimeoutInt = max(1, Int(effectiveAccountTimeout.rounded()))
+        var freshSnapshotCount = 0
 
-            if let plan = snap.plan, plan.kind != .unknown {
-                if let idx = registry.accounts.firstIndex(where: { $0.provider == provider && $0.id == account.id }),
-                   registry.accounts[idx].plan != plan {
-                    registry.accounts[idx].plan = plan
-                    metadataChanged = true
+        for (account, maybeSnap) in batchResult.fetchedSnapshots {
+            let key = Self.snapshotKey(provider: provider, accountId: account.id)
+            if let snap = maybeSnap {
+                snapshots[key] = snap
+                freshSnapshotCount += 1
+
+                if let plan = snap.plan, plan.kind != .unknown {
+                    if let idx = registry.accounts.firstIndex(where: { $0.provider == provider && $0.id == account.id }),
+                       registry.accounts[idx].plan != plan {
+                        registry.accounts[idx].plan = plan
+                        metadataChanged = true
+                    }
                 }
+            } else if var existing = snapshots[key], case .ready(let fetchedAt, _) = existing.status {
+                // Keep prior ready quota visible while flagging it stale so next refresh retries.
+                existing.status = .ready(fetchedAt: fetchedAt, stale: true)
+                snapshots[key] = existing
+            } else {
+                snapshots[key] = QuotaSnapshot.failed(
+                    provider: provider,
+                    accountId: account.id,
+                    sourceLabel: "超时保护",
+                    message: "刷新超时（>\(accountTimeoutInt)秒），已自动跳过以免阻塞"
+                )
             }
         }
 
@@ -752,7 +1132,11 @@ public final class AppStore: ObservableObject {
         if shouldPrewarmAvatars {
             prewarmMissingAvatarImages(for: registry.accounts(for: provider))
         }
-        lastRefreshedAt = Date()
+        if freshSnapshotCount > 0 {
+            let now = Date()
+            lastRefreshedAt = now
+            lastRefreshedAtByProvider[provider] = now
+        }
         if persistExport {
             persistAccountPoolSnapshotQuietly()
         }
@@ -785,7 +1169,16 @@ public final class AppStore: ObservableObject {
         busyActionLabel = "正在切换 \(provider.displayName) 账号..."
         defer { busyActionLabel = nil }
 
-        let result = await adapter.switchAccount(to: account, allowForceQuit: allowForceQuit)
+        let result: SwitchResult
+        if provider == .antigravity, let agAdapter = adapter as? AntigravityProvider {
+            result = await agAdapter.switchAccount(
+                to: account,
+                allowForceQuit: allowForceQuit,
+                relaunchInsiders: registry.settings.relaunchAntigravityInsiders
+            )
+        } else {
+            result = await adapter.switchAccount(to: account, allowForceQuit: allowForceQuit)
+        }
         switch result {
         case .switched(let reopenedApps):
             registry.setActiveLive(accountId: account.id, for: provider)
@@ -907,7 +1300,16 @@ public final class AppStore: ObservableObject {
             : "正在优雅退出 \(provider.displayName)..."
         defer { busyActionLabel = nil }
 
-        let result = await adapter.controlClient(restart: restart, allowForceQuit: allowForceQuit)
+        let result: SwitchResult
+        if provider == .antigravity, let agAdapter = adapter as? AntigravityProvider {
+            result = await agAdapter.controlClient(
+                restart: restart,
+                allowForceQuit: allowForceQuit,
+                relaunchInsiders: registry.settings.relaunchAntigravityInsiders
+            )
+        } else {
+            result = await adapter.controlClient(restart: restart, allowForceQuit: allowForceQuit)
+        }
         switch result {
         case .switched(let reopenedApps):
             if restart {
@@ -947,6 +1349,27 @@ public final class AppStore: ObservableObject {
         case .failed(let message):
             setBanner("操作失败：\(message)", isError: true, autoClearSeconds: nil)
         }
+    }
+
+    /// Reopens provider app bundles, strictly filtering Antigravity Insiders unless explicitly enabled.
+    public func restartProviderApps(for provider: ProviderID, urls: [URL]) async {
+        let filteredURLs: [URL]
+        if provider == .antigravity {
+            let agAdapter = adapters[.antigravity] as? AntigravityProvider
+            let stableURL = agAdapter?.paths.stableAppURL
+                ?? AntigravityProvider.Paths.liveDefaults.stableAppURL
+            let insidersURL = agAdapter?.paths.insidersAppURL
+                ?? AntigravityProvider.Paths.liveDefaults.insidersAppURL
+            filteredURLs = AntigravityProvider.filterReopenURLs(
+                urls,
+                includeInsiders: registry.settings.relaunchAntigravityInsiders,
+                stableAppURL: stableURL,
+                insidersAppURL: insidersURL
+            )
+        } else {
+            filteredURLs = urls
+        }
+        await processController.reopenApps(urls: filteredURLs)
     }
 
     // MARK: - API Key Management (Kimi / DeepSeek)
@@ -1031,6 +1454,8 @@ public final class AppStore: ObservableObject {
     public func updateSettings(_ mutate: (inout AppSettings) -> Void) {
         let oldCadence = registry.settings.refreshCadence
         let oldLaunchAtLogin = registry.settings.launchAtLogin
+        let oldAutoCheckUpdates = registry.settings.autoCheckUpdates
+        let oldAntigravityPool = registry.settings.menuBarCustom.antigravityPool
 
         var updated = registry.settings
         mutate(&updated)
@@ -1072,6 +1497,8 @@ public final class AppStore: ObservableObject {
         updated.tokenDashboardCards.orderedCards = DashboardTokenCardConfig.normalizedOrder(updated.tokenDashboardCards.orderedCards)
         updated.tokenDashboardCards.enabledCards = DashboardTokenCardConfig.deduplicated(updated.tokenDashboardCards.enabledCards)
         updated.tokenClientOrder = AppSettings.normalizeTokenClientOrder(updated.tokenClientOrder)
+        let trimmedSkipped = updated.skippedUpdateVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.skippedUpdateVersion = (trimmedSkipped?.isEmpty == false) ? trimmedSkipped : nil
 
         windowSizeSaveTask?.cancel()
         windowSizeSaveTask = nil
@@ -1079,6 +1506,9 @@ public final class AppStore: ObservableObject {
 
         registry.settings = updated
         ensureDefaultAccountsForEnabledNonSwitchableProviders()
+        if updated.menuBarCustom.antigravityPool != oldAntigravityPool {
+            refreshBestRemainingBadges()
+        }
         persistRegistryQuietly()
 
         if updated.refreshCadence != oldCadence {
@@ -1086,6 +1516,9 @@ public final class AppStore: ObservableObject {
         }
         if updated.launchAtLogin != oldLaunchAtLogin {
             setLaunchAtLogin(updated.launchAtLogin)
+        }
+        if updated.autoCheckUpdates != oldAutoCheckUpdates {
+            restartUpdateCheckScheduler()
         }
     }
 
@@ -1720,12 +2153,12 @@ public final class AppStore: ObservableObject {
         case .lowestQuota:
             var lowestProvider: ProviderID?
             var lowestPct = Double.greatestFiniteMagnitude
-            var anyError = false
+            var allEnabledErrored = !enabled.isEmpty
 
             for provider in enabled {
                 let metrics = quotaMetrics(for: provider)
-                if metrics.isError {
-                    anyError = true
+                if !metrics.isError {
+                    allEnabledErrored = false
                 }
                 if metrics.isReady,
                    let pct = Self.effectiveRemainingPercent(for: metrics, window: .lowest),
@@ -1736,7 +2169,9 @@ public final class AppStore: ObservableObject {
             }
 
             if let lowestProvider {
-                var result = formatMenuBarSummaryForProvider(
+                // Only warn when the actually displayed lowest provider itself is low-quota or errored;
+                // never let an unrelated sideline `.reauthRequired` provider paint a healthy 100% bar yellow.
+                return formatMenuBarSummaryForProvider(
                     provider: lowestProvider,
                     window: .lowest,
                     dualFormat: .slash,
@@ -1745,8 +2180,6 @@ public final class AppStore: ObservableObject {
                     warnThresholdPct: warnThresholdPct,
                     tooltip: tooltip
                 )
-                result.isWarning = result.isWarning || anyError
-                return result
             }
 
             let fallbackProvider = enabled.contains(settings.selectedProvider)
@@ -1761,7 +2194,7 @@ public final class AppStore: ObservableObject {
                 warnThresholdPct: warnThresholdPct,
                 tooltip: tooltip
             )
-            fallback.isWarning = fallback.isWarning || anyError
+            fallback.isWarning = fallback.isWarning || allEnabledErrored
             return fallback
 
         case .compactDots:
@@ -1898,7 +2331,7 @@ public final class AppStore: ObservableObject {
         config: MenuBarCustomConfig,
         settings: AppSettings,
         enabledProviders: [ProviderID]
-    ) -> (provider: ProviderID, anyError: Bool) {
+    ) -> (provider: ProviderID, allEnabledErrored: Bool) {
         let selectedFallback = enabledProviders.contains(settings.selectedProvider)
             ? settings.selectedProvider
             : (enabledProviders.first ?? .antigravity)
@@ -1910,12 +2343,12 @@ public final class AppStore: ObservableObject {
         case .lowest:
             var lowestProvider: ProviderID?
             var lowestPct = Double.greatestFiniteMagnitude
-            var anyError = false
+            var allEnabledErrored = !enabledProviders.isEmpty
 
             for provider in enabledProviders {
                 let metrics = quotaMetrics(for: provider, agPool: config.antigravityPool)
-                if metrics.isError {
-                    anyError = true
+                if !metrics.isError {
+                    allEnabledErrored = false
                 }
                 if metrics.isReady,
                    let pct = Self.effectiveRemainingPercent(for: metrics, window: config.quotaWindow),
@@ -1925,9 +2358,9 @@ public final class AppStore: ObservableObject {
                 }
             }
             if let lowestProvider {
-                return (lowestProvider, anyError)
+                return (lowestProvider, allEnabledErrored)
             }
-            return (selectedFallback, anyError)
+            return (selectedFallback, allEnabledErrored)
 
         case .fixed:
             return (config.fixedQuotaProvider, false)
@@ -1935,10 +2368,7 @@ public final class AppStore: ObservableObject {
         case .multi:
             let providers = MenuBarCustomConfig.deduplicatedProviders(config.quotaMultiProviders)
             let primary = providers.first ?? selectedFallback
-            let anyError = (providers.isEmpty ? [primary] : providers).contains {
-                quotaMetrics(for: $0, agPool: config.antigravityPool).isError
-            }
-            return (primary, anyError)
+            return (primary, false)
         }
     }
 
@@ -1985,7 +2415,9 @@ public final class AppStore: ObservableObject {
                 if seg.isWarning {
                     isWarning = true
                 }
-                if module == .quota && (cfg.quotaSource == .lowest || cfg.quotaSource == .multi) && resolvedQuota.anyError {
+                // In `.lowest` mode, only warn from a sideline error when EVERY enabled provider errored;
+                // otherwise trust `seg.isWarning` of the actually displayed healthy provider(s).
+                if module == .quota && cfg.quotaSource == .lowest && resolvedQuota.allEnabledErrored {
                     isWarning = true
                 }
             }
@@ -2709,7 +3141,10 @@ public final class AppStore: ObservableObject {
                 byAccountId[account.id] = snap
             }
         }
-        registry.refreshBestRemainingFlags(snapshots: byAccountId)
+        registry.refreshBestRemainingFlags(
+            snapshots: byAccountId,
+            antigravityPool: registry.settings.menuBarCustom.antigravityPool
+        )
     }
 
     private func refreshAPIKeyStatuses() {

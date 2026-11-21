@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="RoryOrbit"
 DISPLAY_NAME="Pulsar"
-APP_VERSION="${APP_VERSION:-1.1.0}"
+APP_VERSION="${APP_VERSION:-1.2.0}"
 BUNDLE_ID="com.rory.roryorbit"
 APP="$ROOT/${APP_NAME}.app"
 BIN="$APP/Contents/MacOS/${APP_NAME}"
