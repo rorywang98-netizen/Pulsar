@@ -1,0 +1,11 @@
+RoryOrbit.app/
+Pulsar.app/
+dist/
+*.dmg
+*.dmg.sha256
+.DS_Store
+*.log
+*.tmp
+.build/
+.swiftpm/
+DerivedData/
