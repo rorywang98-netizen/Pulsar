@@ -3,7 +3,7 @@
   <h1>Pulsar</h1>
   <p><strong>原生 macOS Liquid Glass 菜单栏 AI 配额监控、多账号安全切换、纯本地 Token 分析与实时 <code>tok/s</code> 测速工具</strong></p>
   <p>
-    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.1"><img src="https://img.shields.io/badge/version-v1.2.1-6366F1?style=flat-square" alt="Version v1.2.1" /></a>
+    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.2"><img src="https://img.shields.io/badge/version-v1.2.2-6366F1?style=flat-square" alt="Version v1.2.2" /></a>
     <img src="https://img.shields.io/badge/macOS-13%2B%20%7C%20Liquid%20Glass%2026%2F27-0EA5E9?style=flat-square" alt="macOS 13+" />
     <img src="https://img.shields.io/badge/arch-Apple%20Silicon%20(arm64)-10B981?style=flat-square" alt="Apple Silicon" />
     <img src="https://img.shields.io/badge/Swift-AppKit%20%2B%20SwiftUI%20(Zero%20Deps)-F97316?style=flat-square" alt="Pure Swift" />
@@ -19,9 +19,9 @@
 
 | 下载项 | 链接 / 信息 |
 |---|---|
-| **DMG 直链下载（最新 v1.2.1）** | [**Pulsar-v1.2.1-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.2.1-macOS-arm64.dmg) |
-| **GitHub Release 发布页** | [Releases · v1.2.1](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.1) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
-| **SHA-256 校验值** | `ef31a939a48cb9584022c3b49859071b6590a60fbc5eb91517bfad72ed8d7bd8` |
+| **DMG 直链下载（最新 v1.2.2）** | [**Pulsar-v1.2.2-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.2.2-macOS-arm64.dmg) |
+| **GitHub Release 发布页** | [Releases · v1.2.2](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.2) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
+| **SHA-256 校验值** | `a1b6f4038bfead52821f98eac9a3d20cf8c0166b1b0d569ffbc70b0989ad435a` |
 | **系统要求** | macOS 13.0+（Apple Silicon `arm64`），macOS 26/27 自动启用原生 Liquid Glass 液态玻璃材质 |
 
 ### 首次打开说明（本地 Ad-hoc 签名）
@@ -35,9 +35,19 @@ xattr -dr com.apple.quarantine /Applications/Pulsar.app
 可选校验下载完整性：
 
 ```bash
-shasum -a 256 Pulsar-v1.2.1-macOS-arm64.dmg
-# 应输出: ef31a939a48cb9584022c3b49859071b6590a60fbc5eb91517bfad72ed8d7bd8  Pulsar-v1.2.1-macOS-arm64.dmg
+shasum -a 256 Pulsar-v1.2.2-macOS-arm64.dmg
+# 应输出: a1b6f4038bfead52821f98eac9a3d20cf8c0166b1b0d569ffbc70b0989ad435a  Pulsar-v1.2.2-macOS-arm64.dmg
 ```
+
+---
+
+## v1.2.2 新特性与优化
+
+- **账号卡片底部同时显示「5 小时 + 周」双重置倒计时**：
+  - 针对 Antigravity、Codex、Kimi 等多窗口服务，先智能锁定焦点池（优先匹配当前所选 Antigravity 追踪池，未指定时自动聚焦最低余量池；全满未动账号稳定聚焦主池 `Gemini`），并在同一行同时提取并展示最早的 **`5h` 重置倒计时** 与 **`周`（或 `月`）重置倒计时**（例如 `Gemini · 5h 3小时34分 · 周 6天17小时后重置` / `5h 3小时34分 · 周 6天17小时后重置`），不再因单窗余量较高而遗漏另一个窗口的重置时间。
+  - 仅单窗存在重置时间时（如 `Argon` 池）自动保持 `Argon 周 · 6天17小时后重置` 简洁呈现，悬停 Tooltip 完整保留全部窗口的百分比与精确重置时刻。
+- **`340pt` 极窄宽度自适应紧凑双倒计时（零截断、零折行）**：
+  - 当主弹窗缩窄至 `< 370pt`（低至 `340pt` 极窄模式）时，双重置脚标自动切换紧凑倒计时格式（如 `Gemini · 5h 3h34m · 周 6d17h 后重置`），释放非悬停态右侧冗余留白并启用单行自适应缩放保护，确保全宽度档位清晰锐利、零截断。
 
 ---
 

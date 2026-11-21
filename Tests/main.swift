@@ -4582,7 +4582,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.2.1", "AppStore.appVersion must match v1.2.1")
+        T.expectEqual(AppStore.appVersion, "1.2.2", "AppStore.appVersion must match v1.2.2")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -6717,6 +6717,321 @@ private func testV121RegressionSuite() async {
     }
 }
 
+// MARK: - Test 18: v1.2.2 Regression Suite (Dual 5h + Weekly Reset Footnote Across Antigravity / Codex / Kimi & 340pt/390pt NSHostingView Verification)
+
+private func testV122RegressionSuite() async {
+    await T.asyncSuite("V122.DualResetFootnoteAndNarrowLayout") {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset3h34m = now.addingTimeInterval(3 * 3600 + 34 * 60 + 20)
+        let reset4h59m = now.addingTimeInterval(4 * 3600 + 59 * 60 + 20)
+        let reset6d17h = now.addingTimeInterval(6 * 86_400 + 17 * 3600 + 10 * 60)
+        let reset3d18h = now.addingTimeInterval(3 * 86_400 + 18 * 3600 + 5 * 60)
+        let reset1h56m = now.addingTimeInterval(1 * 3600 + 56 * 60 + 15)
+        let reset14d8h = now.addingTimeInterval(14 * 86_400 + 8 * 3600 + 5 * 60)
+
+        // 1. Antigravity Account #1 (5h lower than weekly in Gemini, Claude 100%)
+        let snowSnap = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "agy-snow",
+            plan: PlanInfo(kind: .ultra, displayName: "Ultra"),
+            windows: [
+                QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.89, usedPercent: 11, resetAt: reset3h34m, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 0.93, usedPercent: 7, resetAt: reset6d17h, windowSeconds: 604_800),
+                QuotaWindow(id: "claude_gpt_5h", label: "Claude / GPT · 5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset4h59m, windowSeconds: 18_000),
+                QuotaWindow(id: "claude_gpt_weekly", label: "Claude / GPT · 周", remainingFraction: 1.0, usedPercent: 0, resetAt: reset6d17h, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 89
+        )
+
+        let snow390 = MenuBarView.buildFocusFooterSummary(
+            for: snowSnap,
+            visibleWindows: snowSnap.windows,
+            preferredAntigravityPool: .autoLowest,
+            strictPoolFilter: false,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            snow390?.text,
+            "Gemini · 5h 3小时34分 · 周 6天17小时后重置",
+            "390pt regular width must display both 5h and weekly resets for Snow"
+        )
+
+        let snow340 = MenuBarView.buildFocusFooterSummary(
+            for: snowSnap,
+            visibleWindows: snowSnap.windows,
+            preferredAntigravityPool: .autoLowest,
+            strictPoolFilter: false,
+            popoverWidth: 340,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            snow340?.text,
+            "Gemini · 5h 3h34m · 周 6d17h 后重置",
+            "340pt narrow width must use compactResetCountdown for both 5h and weekly resets"
+        )
+
+        // 2. Antigravity Account #2 (weekly lower than 5h in Gemini: previously missed 5h reset!)
+        let weeklyLowerSnap = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "agy-weekly-lower",
+            plan: PlanInfo(kind: .pro, displayName: "Pro"),
+            windows: [
+                QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.99, usedPercent: 1, resetAt: reset3h34m, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 0.75, usedPercent: 25, resetAt: reset6d17h, windowSeconds: 604_800),
+                QuotaWindow(id: "claude_gpt_5h", label: "Claude / GPT · 5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset4h59m, windowSeconds: 18_000),
+                QuotaWindow(id: "claude_gpt_weekly", label: "Claude / GPT · 周", remainingFraction: 0.86, usedPercent: 14, resetAt: reset3d18h, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 99
+        )
+
+        let weeklyLower390 = MenuBarView.buildFocusFooterSummary(
+            for: weeklyLowerSnap,
+            visibleWindows: weeklyLowerSnap.windows,
+            preferredAntigravityPool: .autoLowest,
+            strictPoolFilter: false,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            weeklyLower390?.text,
+            "Gemini · 5h 3小时34分 · 周 6天17小时后重置",
+            "when Gemini weekly is lowest, 5h reset must STILL be shown alongside weekly"
+        )
+
+        // 3. Auto-lowest pool vs explicit pool preference (Claude / GPT lowest at 2%, vs Gemini explicit filter)
+        let claudeLowestSnap = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "agy-claude-low",
+            plan: PlanInfo(kind: .pro, displayName: "Pro"),
+            windows: [
+                QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset3h34m, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 0.987, usedPercent: 1.3, resetAt: reset6d17h, windowSeconds: 604_800),
+                QuotaWindow(id: "claude_gpt_5h", label: "Claude / GPT · 5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset4h59m, windowSeconds: 18_000),
+                QuotaWindow(id: "claude_gpt_weekly", label: "Claude / GPT · 周", remainingFraction: 0.018, usedPercent: 98.2, resetAt: reset3d18h, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 100
+        )
+
+        let autoClaude390 = MenuBarView.buildFocusFooterSummary(
+            for: claudeLowestSnap,
+            visibleWindows: claudeLowestSnap.windows,
+            preferredAntigravityPool: .autoLowest,
+            strictPoolFilter: false,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            autoClaude390?.text,
+            "Claude / GPT · 5h 4小时59分 · 周 3天18小时后重置",
+            "autoLowest must lock onto Claude / GPT pool and show both 5h and weekly resets"
+        )
+
+        let autoClaude340 = MenuBarView.buildFocusFooterSummary(
+            for: claudeLowestSnap,
+            visibleWindows: claudeLowestSnap.windows,
+            preferredAntigravityPool: .autoLowest,
+            strictPoolFilter: false,
+            popoverWidth: 340,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            autoClaude340?.text,
+            "Claude / GPT · 5h 4h59m · 周 3d18h 后重置"
+        )
+
+        let explicitGemini390 = MenuBarView.buildFocusFooterSummary(
+            for: claudeLowestSnap,
+            visibleWindows: claudeLowestSnap.windows,
+            preferredAntigravityPool: .gemini,
+            strictPoolFilter: false,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            explicitGemini390?.text,
+            "Gemini · 5h 3小时34分 · 周 6天17小时后重置",
+            "explicit Gemini pool selection must override auto-lowest Claude pool"
+        )
+
+        // 4. All-100% untouched account + single-window Argon pool + strict missing pool
+        let fullAllPoolsSnap = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "agy-full",
+            plan: PlanInfo(kind: .ultra, displayName: "Ultra"),
+            windows: [
+                QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset4h59m, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 1.0, usedPercent: 0, resetAt: reset6d17h, windowSeconds: 604_800),
+                QuotaWindow(id: "claude_gpt_5h", label: "Claude / GPT · 5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset4h59m.addingTimeInterval(-2), windowSeconds: 18_000),
+                QuotaWindow(id: "claude_gpt_weekly", label: "Claude / GPT · 周", remainingFraction: 1.0, usedPercent: 0, resetAt: reset6d17h, windowSeconds: 604_800),
+                QuotaWindow(id: "argon_weekly", label: "Argon · 周", remainingFraction: 1.0, usedPercent: 0, resetAt: reset6d17h, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 100
+        )
+
+        let fullDefault390 = MenuBarView.buildFocusFooterSummary(
+            for: fullAllPoolsSnap,
+            visibleWindows: fullAllPoolsSnap.windows,
+            preferredAntigravityPool: .autoLowest,
+            strictPoolFilter: false,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            fullDefault390?.text,
+            "Gemini · 5h 4小时59分 · 周 6天17小时后重置",
+            "untouched 100% account must deterministically focus primary Gemini pool and show 5h + weekly"
+        )
+
+        let argonOnly390 = MenuBarView.buildFocusFooterSummary(
+            for: fullAllPoolsSnap,
+            visibleWindows: fullAllPoolsSnap.windows,
+            preferredAntigravityPool: .argon,
+            strictPoolFilter: false,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            argonOnly390?.text,
+            "Argon 周 · 6天17小时后重置",
+            "single-window Argon pool must display 'Argon 周 · 6天17小时后重置'"
+        )
+        T.expect(
+            argonOnly390?.tooltip.contains("Gemini") == true
+                && argonOnly390?.tooltip.contains("Claude / GPT") == true
+                && argonOnly390?.tooltip.contains("Argon") == true,
+            "tooltip must preserve complete reset details for all windows"
+        )
+
+        let strictMissingArgon = MenuBarView.buildFocusFooterSummary(
+            for: snowSnap,
+            visibleWindows: [],
+            preferredAntigravityPool: .argon,
+            strictPoolFilter: true,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expect(strictMissingArgon == nil, "strictPoolFilter with missing Argon pool must return nil")
+
+        // 5. Non-Antigravity multi-window services: Codex (5h + weekly + Credits) & Kimi (5h + monthly)
+        let codexSnap = QuotaSnapshot(
+            provider: .codex,
+            accountId: "codex-1",
+            plan: PlanInfo(kind: .pro, displayName: "Pro"),
+            windows: [
+                QuotaWindow(id: "5h", label: "5小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset3h34m, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "weekly", label: "本周", remainingFraction: 0.74, usedPercent: 26, resetAt: reset6d17h, windowSeconds: 604_800),
+            ],
+            balance: BalanceInfo(currency: "USD", totalBalance: 12.5, detail: "Credits"),
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 100
+        )
+
+        let codex390 = MenuBarView.buildFocusFooterSummary(
+            for: codexSnap,
+            visibleWindows: codexSnap.windows,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            codex390?.text,
+            "5h 3小时34分 · 周 6天17小时后重置 · Credits $12.50",
+            "Codex must omit pool prefix and show both 5h + weekly resets plus Credits"
+        )
+
+        let codex340 = MenuBarView.buildFocusFooterSummary(
+            for: codexSnap,
+            visibleWindows: codexSnap.windows,
+            popoverWidth: 340,
+            showResetRelative: true,
+            now: now
+        )
+        T.expectEqual(
+            codex340?.text,
+            "5h 3h34m · 周 6d17h 后重置 · Credits $12.50"
+        )
+
+        let kimiSnap = QuotaSnapshot(
+            provider: .kimi,
+            accountId: "kimi:api",
+            windows: [
+                QuotaWindow(id: "kimi-5h", label: "5 小时", remainingFraction: 1.0, usedPercent: 0, resetAt: reset1h56m, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "kimi-monthly", label: "月度总额度", remainingFraction: 0.20, usedPercent: 80, resetAt: reset14d8h, windowSeconds: 2_592_000),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 100
+        )
+        T.expectEqual(
+            MenuBarView.buildFocusFooterSummary(for: kimiSnap, visibleWindows: kimiSnap.windows, popoverWidth: 390, showResetRelative: true, now: now)?.text,
+            "5h 1小时56分 · 月 14天8小时后重置"
+        )
+        T.expectEqual(
+            MenuBarView.buildFocusFooterSummary(for: kimiSnap, visibleWindows: kimiSnap.windows, popoverWidth: 340, showResetRelative: true, now: now)?.text,
+            "5h 1h56m · 月 14d8h 后重置"
+        )
+
+        // Absolute reset mode (`showResetRelative == false`)
+        let absSummary = MenuBarView.buildFocusFooterSummary(
+            for: snowSnap,
+            visibleWindows: snowSnap.windows,
+            preferredAntigravityPool: .gemini,
+            popoverWidth: 390,
+            showResetRelative: false,
+            now: now
+        )
+        T.expect(
+            absSummary?.text.hasPrefix("Gemini · 5h ") == true
+                && absSummary?.text.contains(" · 周 ") == true
+                && absSummary?.text.hasSuffix(" 重置") == true,
+            "absolute reset mode must format both 5h and weekly timestamps cleanly"
+        )
+
+        // 6. Single-line pixel-width verification at 340pt (<370 compact) and 370pt/390pt (regular) using 10.5pt monospacedDigit system font
+        let footnoteFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        func measuredWidth(_ text: String) -> CGFloat {
+            ceil((text as NSString).size(withAttributes: [.font: footnoteFont]).width)
+        }
+
+        // At 340pt popoverWidth: inner card content width = 340 - 2*9 (scrollInset) - 2*8.5 (cardHPadding) = 305pt
+        let maxInnerWidthAt340: CGFloat = 305.0
+        for sample340 in [
+            snow340?.text ?? "",
+            autoClaude340?.text ?? "",
+            codex340?.text ?? "",
+            "Claude / GPT · 5h 4h59m · 周 6d23h 后重置",
+        ] {
+            let w = measuredWidth(sample340)
+            T.expect(w > 0 && w < maxInnerWidthAt340, "340pt footnote '\(sample340)' width (\(w)pt) must fit < \(maxInnerWidthAt340)pt without truncation")
+        }
+
+        // At 370pt popoverWidth: inner card content width = 370 - 2*12 (scrollInset) - 2*11 (cardHPadding) = 324pt
+        let maxInnerWidthAt370: CGFloat = 324.0
+        for sample370 in [
+            snow390?.text ?? "",
+            autoClaude390?.text ?? "",
+            codex390?.text ?? "",
+            "Claude / GPT · 5h 4小时59分 · 周 6天23小时后重置",
+        ] {
+            let w = measuredWidth(sample370)
+            T.expect(w > 0 && w < maxInnerWidthAt370, "370pt+ footnote '\(sample370)' width (\(w)pt) must fit < \(maxInnerWidthAt370)pt without truncation")
+        }
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -6738,6 +7053,7 @@ Task {
     await testV110RegressionSuite()
     await testV120RegressionSuite()
     await testV121RegressionSuite()
+    await testV122RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)

@@ -2826,7 +2826,7 @@ public struct MenuBarView: View {
         case monthly = 3
         case other = 4
 
-        init(from cadence: QuotaWindowCadence) {
+        nonisolated init(from cadence: QuotaWindowCadence) {
             switch cadence {
             case .fiveHour: self = .fiveHour
             case .daily: self = .daily
@@ -2836,7 +2836,7 @@ public struct MenuBarView: View {
             }
         }
 
-        var tagText: String? {
+        nonisolated var tagText: String? {
             switch self {
             case .fiveHour: return "5小时"
             case .daily: return "日"
@@ -2846,7 +2846,7 @@ public struct MenuBarView: View {
             }
         }
 
-        var matrixLabel: String? {
+        nonisolated var matrixLabel: String? {
             switch self {
             case .fiveHour: return "5 小时"
             case .daily: return "每日"
@@ -2856,7 +2856,7 @@ public struct MenuBarView: View {
             }
         }
 
-        var compactMatrixLabel: String? {
+        nonisolated var compactMatrixLabel: String? {
             switch self {
             case .fiveHour: return "5h"
             case .daily: return "日"
@@ -2909,8 +2909,12 @@ public struct MenuBarView: View {
     }
 
     private func parseWindowMeta(_ window: QuotaWindow) -> ParsedWindowMeta {
+        Self.parseWindowMetaStatic(window)
+    }
+
+    private nonisolated static func parseWindowMetaStatic(_ window: QuotaWindow) -> ParsedWindowMeta {
         let rawLabel = window.label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cadence = classifyCadence(for: window)
+        let cadence = WindowCadence(from: window.cadence)
 
         // Primary split convention shared by Antigravity & Codex extra limits: "<Pool> · <Cadence>"
         if let dotRange = rawLabel.range(of: " · ", options: .backwards) {
@@ -3105,14 +3109,17 @@ public struct MenuBarView: View {
                                     .monospacedDigit()
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
                                     .truncationMode(.tail)
                                     .help(focusFooter.tooltip)
 
-                                if showInlineRemoveOnFootnote {
-                                    Spacer(minLength: 4)
+                                Spacer(minLength: 0)
+
+                                if showInlineRemoveOnFootnote && isHovered {
                                     hoverRemovePillButton(accountId: accountId, isHovered: isHovered)
                                 }
                             }
+                            .frame(minHeight: isCompactCards ? 14 : 16)
                             .padding(.top, isCompactCards ? 0.5 : 1)
                         }
                     }
@@ -3290,6 +3297,14 @@ public struct MenuBarView: View {
         poolTitle: String,
         compact: Bool = false
     ) -> String {
+        Self.cadenceMatrixLabelStatic(for: item, poolTitle: poolTitle, compact: compact)
+    }
+
+    private nonisolated static func cadenceMatrixLabelStatic(
+        for item: ParsedWindowMeta,
+        poolTitle: String,
+        compact: Bool = false
+    ) -> String {
         if compact, let shortLabel = item.cadence.compactMatrixLabel {
             return shortLabel
         }
@@ -3330,52 +3345,178 @@ public struct MenuBarView: View {
         preferredAntigravityPool: AntigravityPoolPreference = .autoLowest,
         strictPoolFilter: Bool = false
     ) -> (text: String, tooltip: String)? {
+        Self.buildFocusFooterSummary(
+            for: snapshot,
+            visibleWindows: visibleWindows,
+            preferredAntigravityPool: preferredAntigravityPool,
+            strictPoolFilter: strictPoolFilter,
+            popoverWidth: popoverWidth,
+            showResetRelative: settings.showResetRelative
+        )
+    }
+
+    /// Builds the single-line card reset footnote (displaying both `5h` and `周`/`月` countdowns when both exist
+    /// in the focused pool/card) along with the full multi-window tooltip.
+    public nonisolated static func buildFocusFooterSummary(
+        for snapshot: QuotaSnapshot,
+        visibleWindows: [QuotaWindow],
+        preferredAntigravityPool: AntigravityPoolPreference = .autoLowest,
+        strictPoolFilter: Bool = false,
+        popoverWidth: CGFloat = CGFloat(AppSettings.defaultPopoverWidth),
+        showResetRelative: Bool = true,
+        now: Date = Date()
+    ) -> (text: String, tooltip: String)? {
+        let isAntigravity = (snapshot.provider == .antigravity)
         let baseWindows: [QuotaWindow]
-        if strictPoolFilter && preferredAntigravityPool != .autoLowest {
+        if isAntigravity && strictPoolFilter && preferredAntigravityPool != .autoLowest {
             baseWindows = visibleWindows.isEmpty
-                ? snapshot.windows.filter { store.isAntigravityWindowMatchingPool($0) }
+                ? snapshot.windows.filter { AppStore.isAntigravityWindowMatchingPool($0, pool: preferredAntigravityPool) }
                 : visibleWindows
         } else {
             baseWindows = visibleWindows.isEmpty ? snapshot.windows : visibleWindows
         }
 
-        let resetCandidates: [QuotaWindow]
-        if preferredAntigravityPool != .autoLowest && !strictPoolFilter {
-            let preferredCandidates = baseWindows.filter {
-                store.isAntigravityWindowMatchingPool($0) && $0.resetAt != nil
+        let allResetWindows = baseWindows.filter { $0.resetAt != nil }
+
+        func selectLowestAnchor(from candidates: [QuotaWindow]) -> QuotaWindow? {
+            let nonFull = candidates.filter { $0.remainingFraction < 0.999 }
+            let searchPool = nonFull.isEmpty ? candidates : nonFull
+            return searchPool.min { lhs, rhs in
+                if abs(lhs.remainingFraction - rhs.remainingFraction) > 0.005 {
+                    return lhs.remainingFraction < rhs.remainingFraction
+                }
+                if nonFull.isEmpty && lhs.isPrimary != rhs.isPrimary {
+                    return lhs.isPrimary && !rhs.isPrimary
+                }
+                let lDate = lhs.resetAt ?? .distantFuture
+                let rDate = rhs.resetAt ?? .distantFuture
+                if lDate != rDate {
+                    return lDate < rDate
+                }
+                return lhs.isPrimary && !rhs.isPrimary
             }
-            resetCandidates = preferredCandidates.isEmpty
-                ? baseWindows.filter { $0.resetAt != nil }
-                : preferredCandidates
-        } else {
-            resetCandidates = baseWindows.filter { $0.resetAt != nil }
         }
 
-        let nonFullCandidates = resetCandidates.filter { $0.remainingFraction < 0.999 }
-        let poolToSearch = nonFullCandidates.isEmpty ? resetCandidates : nonFullCandidates
+        func lockPoolWindows(for anchor: QuotaWindow, in candidates: [QuotaWindow]) -> [QuotaWindow] {
+            if let kind = anchor.antigravityPoolKind {
+                return candidates.filter { $0.antigravityPoolKind == kind }
+            }
+            let anchorPool = parseWindowMetaStatic(anchor).poolName
+            return candidates.filter {
+                parseWindowMetaStatic($0).poolName.caseInsensitiveCompare(anchorPool) == .orderedSame
+            }
+        }
 
-        let focusWindow = poolToSearch.min { lhs, rhs in
-            if abs(lhs.remainingFraction - rhs.remainingFraction) > 0.005 {
-                return lhs.remainingFraction < rhs.remainingFraction
+        let scopedResetWindows: [QuotaWindow]
+        let poolPrefix: String?
+
+        if isAntigravity {
+            if preferredAntigravityPool != .autoLowest {
+                let preferredMatches = allResetWindows.filter {
+                    AppStore.isAntigravityWindowMatchingPool($0, pool: preferredAntigravityPool)
+                }
+                if !preferredMatches.isEmpty {
+                    scopedResetWindows = preferredMatches
+                } else if strictPoolFilter {
+                    scopedResetWindows = []
+                } else if let anchor = selectLowestAnchor(from: allResetWindows) {
+                    scopedResetWindows = lockPoolWindows(for: anchor, in: allResetWindows)
+                } else {
+                    scopedResetWindows = []
+                }
+            } else if let anchor = selectLowestAnchor(from: allResetWindows) {
+                scopedResetWindows = lockPoolWindows(for: anchor, in: allResetWindows)
+            } else {
+                scopedResetWindows = []
             }
-            let lDate = lhs.resetAt ?? .distantFuture
-            let rDate = rhs.resetAt ?? .distantFuture
-            if lDate != rDate {
-                return lDate < rDate
+
+            if let explicitPool = scopedResetWindows
+                .map({ parseWindowMetaStatic($0).poolName })
+                .first(where: { !$0.isEmpty }) {
+                poolPrefix = explicitPool
+            } else if let kind = scopedResetWindows.first?.antigravityPoolKind {
+                switch kind {
+                case .gemini: poolPrefix = "Gemini"
+                case .claude: poolPrefix = "Claude / GPT"
+                case .argon: poolPrefix = "Argon"
+                case .autoLowest: poolPrefix = nil
+                }
+            } else {
+                poolPrefix = nil
             }
-            return lhs.isPrimary && !rhs.isPrimary
+        } else {
+            poolPrefix = nil
+            if snapshot.provider == .codex {
+                let coreOnly = allResetWindows.filter { !$0.id.lowercased().hasPrefix("add_") }
+                scopedResetWindows = coreOnly.isEmpty ? allResetWindows : coreOnly
+            } else {
+                scopedResetWindows = allResetWindows
+            }
         }
 
         var segments: [String] = []
 
-        if let focus = focusWindow, let resetAt = focus.resetAt {
-            let meta = parseWindowMeta(focus)
-            let poolTitle = meta.poolName.isEmpty ? "主额度" : meta.poolName
-            let cadLabel = cadenceMatrixLabel(for: meta, poolTitle: poolTitle, compact: isNarrowLayout)
-            let focusTitle = (cadLabel == poolTitle) ? poolTitle : "\(poolTitle) \(cadLabel)"
-            let resetText = Formatters.resetDisplayString(resetAt, relative: settings.showResetRelative)
-            if !resetText.isEmpty {
-                segments.append("\(focusTitle) · \(resetText)")
+        if !scopedResetWindows.isEmpty {
+            let fiveHourReset = scopedResetWindows
+                .filter { $0.cadence == .fiveHour }
+                .compactMap(\.resetAt)
+                .min()
+
+            let weeklyWindows = scopedResetWindows.filter { $0.cadence == .weekly }
+            let monthlyWindows = scopedResetWindows.filter { $0.cadence == .monthly }
+            let longCadenceWindows = !weeklyWindows.isEmpty ? weeklyWindows : monthlyWindows
+            let longCadenceTag = (!weeklyWindows.isEmpty || monthlyWindows.isEmpty) ? "周" : "月"
+            let weeklyReset = longCadenceWindows.compactMap(\.resetAt).min()
+
+            if let fiveHourReset, let weeklyReset {
+                let isCompactWidth = (popoverWidth < 370)
+                let dualBody: String
+                if showResetRelative {
+                    if isCompactWidth {
+                        let c5h = Formatters.compactResetCountdown(to: fiveHourReset, now: now) ?? ""
+                        let cLong = Formatters.compactResetCountdown(to: weeklyReset, now: now) ?? ""
+                        let longPart = (cLong == "即将重置") ? cLong : "\(cLong) 后重置"
+                        dualBody = "5h \(c5h) · \(longCadenceTag) \(longPart)"
+                    } else {
+                        let full5h = Formatters.relativeResetString(to: fiveHourReset, now: now)
+                        let short5h = full5h.hasSuffix("后重置") ? String(full5h.dropLast(3)) : full5h
+                        let fullLong = Formatters.relativeResetString(to: weeklyReset, now: now)
+                        dualBody = "5h \(short5h) · \(longCadenceTag) \(fullLong)"
+                    }
+                } else {
+                    let abs5h = Formatters.absoluteResetString(fiveHourReset)
+                    let short5h = abs5h.hasSuffix(" 重置") ? String(abs5h.dropLast(3)) : abs5h
+                    let absLong = Formatters.absoluteResetString(weeklyReset)
+                    dualBody = "5h \(short5h) · \(longCadenceTag) \(absLong)"
+                }
+
+                if let poolPrefix, !poolPrefix.isEmpty {
+                    segments.append("\(poolPrefix) · \(dualBody)")
+                } else {
+                    segments.append(dualBody)
+                }
+            } else if let singleFocus = selectLowestAnchor(from: scopedResetWindows),
+                      let resetAt = singleFocus.resetAt {
+                let meta = parseWindowMetaStatic(singleFocus)
+                let effectivePool = (poolPrefix?.isEmpty == false) ? poolPrefix! : meta.poolName
+                let shortCad = meta.cadence.compactMatrixLabel
+                    ?? cadenceMatrixLabelStatic(
+                        for: meta,
+                        poolTitle: effectivePool.isEmpty ? "主额度" : effectivePool,
+                        compact: true
+                    )
+                let focusTitle: String
+                if effectivePool.isEmpty {
+                    focusTitle = shortCad
+                } else if shortCad.isEmpty || effectivePool == shortCad || effectivePool.contains(shortCad) {
+                    focusTitle = effectivePool
+                } else {
+                    focusTitle = "\(effectivePool) \(shortCad)"
+                }
+                let resetText = Formatters.resetDisplayString(resetAt, relative: showResetRelative, now: now)
+                if !resetText.isEmpty {
+                    segments.append("\(focusTitle) · \(resetText)")
+                }
             }
         }
 
@@ -3393,12 +3534,12 @@ public struct MenuBarView: View {
 
         var tooltipLines: [String] = []
         for win in snapshot.windows {
-            let meta = parseWindowMeta(win)
+            let meta = parseWindowMetaStatic(win)
             let poolTitle = meta.poolName.isEmpty ? "主额度" : meta.poolName
-            let cadLabel = cadenceMatrixLabel(for: meta, poolTitle: poolTitle)
+            let cadLabel = cadenceMatrixLabelStatic(for: meta, poolTitle: poolTitle)
             let title = (cadLabel == poolTitle) ? poolTitle : "\(poolTitle) \(cadLabel)"
             if let resetAt = win.resetAt {
-                let rel = Formatters.relativeResetString(to: resetAt)
+                let rel = Formatters.relativeResetString(to: resetAt, now: now)
                 let abs = Formatters.absoluteResetString(resetAt)
                 tooltipLines.append("\(title)：\(win.remainingPercent)% · \(rel)（\(abs)）")
             } else {

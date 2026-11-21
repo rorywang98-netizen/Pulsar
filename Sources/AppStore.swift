@@ -73,7 +73,7 @@ public enum PopoverTab: String, CaseIterable, Identifiable, Hashable, Sendable {
 @MainActor
 public final class AppStore: ObservableObject {
     public nonisolated static let bundleIdentifier = "com.rory.roryorbit"
-    public nonisolated static let appVersion = "1.2.1"
+    public nonisolated static let appVersion = "1.2.2"
 
     public nonisolated static var defaultAvatarCacheDirectoryURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("avatars", isDirectory: true)
