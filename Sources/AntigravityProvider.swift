@@ -136,6 +136,41 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
 
     // MARK: - Detached Executable Matchers
 
+    /// Matches `agy` CLI executables including hot-update renamed binaries such as `agy.<timestamp>.old`
+    /// while strictly excluding external bridge daemons such as `agy-bridge`.
+    public static func isAgyExecutableName(_ basename: String) -> Bool {
+        let lower = basename.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty, !lower.contains("/") else {
+            return false
+        }
+        if lower == "agy" || lower == "agy-desktop-helper" {
+            return true
+        }
+        if lower.hasPrefix("agy."), lower.count > 4 {
+            return true
+        }
+        return false
+    }
+
+    /// Identifies non-interactive `agy acp` background daemon workers (such as `agy acp --process-per-session`
+    /// and `agy acp --worker ...` supervised by `agy-bridge`) while excluding interactive CLI sessions and `agy-bridge`.
+    public static func isAutoRespawnedAgyACPProcess(_ proc: ClientProcessInfo, arguments: [String]) -> Bool {
+        guard proc.bundleId == nil, !proc.isInteractiveCLI else {
+            return false
+        }
+        let trimmedPath = proc.executablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            return false
+        }
+        let basename = URL(fileURLWithPath: trimmedPath).lastPathComponent
+        guard isAgyExecutableName(basename) else {
+            return false
+        }
+        return arguments.contains { arg in
+            arg.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "acp"
+        }
+    }
+
     private func detachedExecutableMatchers() -> [(String) -> Bool] {
         let agyPath = paths.agyCLIURL.standardizedFileURL.path
         let stablePrefix = paths.stableAppURL.standardizedFileURL.path + "/"
@@ -144,15 +179,15 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             { execPath in
                 let std = URL(fileURLWithPath: execPath).standardizedFileURL.path
                 let lower = std.lowercased()
-                let base = URL(fileURLWithPath: std).lastPathComponent.lowercased()
+                let base = URL(fileURLWithPath: std).lastPathComponent
 
-                if std == agyPath || base == "agy" || base == "agy-desktop-helper" {
+                if std == agyPath || std.hasPrefix(agyPath + ".") || Self.isAgyExecutableName(base) {
                     return true
                 }
                 if std.hasPrefix(stablePrefix) || std.hasPrefix(insidersPrefix) {
                     return true
                 }
-                if base.hasPrefix("language_server") &&
+                if base.lowercased().hasPrefix("language_server") &&
                     (lower.contains("antigravity") || lower.contains("/.gemini/")) {
                     return true
                 }
@@ -351,30 +386,79 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         )
     }
 
-    private func buildUpdatedBundleJSON(
+    /// Generates a cryptographically random 32-byte URL-safe unpadded Base64 `writer_id` (43 chars,
+    /// matching Antigravity's Go `base64.RawURLEncoding` format) guaranteed to differ from `previous`.
+    public static func generateWriterID(excluding previous: String? = nil) -> String {
+        let trimmedPrevious = nonEmptyStatic(previous)
+        var attempt = 0
+        while true {
+            var bytes = [UInt8](repeating: 0, count: 32)
+            let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+            let rawData: Data
+            if status == errSecSuccess {
+                rawData = Data(bytes)
+            } else {
+                let entropy = "\(UUID().uuidString)-\(UUID().uuidString)-\(attempt)-\(DispatchTime.now().uptimeNanoseconds)"
+                rawData = Data(SHA256.hash(data: Data(entropy.utf8)))
+            }
+            let candidate = Formatters.base64URLEncode(rawData)
+            if !candidate.isEmpty,
+               candidate != previous,
+               candidate != trimmedPrevious {
+                return candidate
+            }
+            attempt += 1
+        }
+    }
+
+    /// Builds a clean Antigravity live OAuth credential bundle from scratch without inheriting stale
+    /// outgoing fields (`writer_id`, `id_token_email`, `id_token`, or old `token` metadata) from `base`.
+    public static func buildUpdatedBundleJSON(
         base: [String: Any]?,
         accessToken: String,
         refreshToken: String,
         expiry: Date,
-        idToken: String?
+        expiresIn: TimeInterval? = nil,
+        idToken: String?,
+        targetEmail: String?,
+        writerID: String
     ) throws -> Data {
-        var root = base ?? [:]
-        var tokenObj = (root["token"] as? [String: Any]) ?? [:]
-        tokenObj["access_token"] = accessToken
-        tokenObj["token_type"] = nonEmpty(tokenObj["token_type"] as? String) ?? "Bearer"
-        tokenObj["refresh_token"] = refreshToken
-        tokenObj["expiry"] = Formatters.formatRFC3339Local(expiry)
-        root["token"] = tokenObj
-
-        if nonEmpty(root["auth_method"] as? String) == nil {
-            root["auth_method"] = "consumer"
+        guard let cleanAccessToken = nonEmptyStatic(accessToken) else {
+            throw ProviderAdapterError.invalidCredential("构造 Antigravity 凭证缺少 access_token")
+        }
+        guard let cleanRefreshToken = nonEmptyStatic(refreshToken) else {
+            throw ProviderAdapterError.invalidCredential("构造 Antigravity 凭证缺少 refresh_token")
+        }
+        guard let cleanWriterID = nonEmptyStatic(writerID) else {
+            throw ProviderAdapterError.operationFailed("构造 Antigravity 凭证缺少 writer_id")
         }
 
-        if let idToken, !idToken.isEmpty {
-            root["id_token"] = idToken
-        } else {
-            // Avoid leaving a stale outgoing account's id_token paired with the new account's access_token.
-            root.removeValue(forKey: "id_token")
+        var tokenObj: [String: Any] = [
+            "access_token": cleanAccessToken,
+            "token_type": "Bearer",
+            "refresh_token": cleanRefreshToken,
+            "expiry": Formatters.formatRFC3339Local(expiry),
+        ]
+        if let expiresIn, expiresIn.isFinite {
+            tokenObj["expires_in"] = Int(max(expiresIn, 60.0))
+        }
+
+        var root: [String: Any] = [
+            "auth_method": nonEmptyStatic(base?["auth_method"] as? String) ?? "consumer",
+            "token": tokenObj,
+            "writer_id": cleanWriterID,
+        ]
+
+        let cleanIDToken = nonEmptyStatic(idToken)
+        if let cleanIDToken {
+            root["id_token"] = cleanIDToken
+        }
+
+        let jwtEmail = cleanIDToken
+            .flatMap { Formatters.decodeJWTPayload($0) }
+            .flatMap { nonEmptyStatic($0["email"] as? String) }
+        if let resolvedEmail = nonEmptyStatic(targetEmail) ?? jwtEmail {
+            root["id_token_email"] = resolvedEmail
         }
 
         return try JSONSerialization.data(
@@ -2308,6 +2392,18 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             }
         }
 
+        // Snapshot running GUI bundles before gracefulStop in case only auto-respawned `agy acp` survives Step 4.
+        let selfPid = Int(ProcessInfo.processInfo.processIdentifier)
+        let preStopGUI = processController.inspector.runningApplications(bundleIDs: Self.bundleIDs)
+        var preStopBundleURLs: [URL] = []
+        var seenPreStop = Set<String>()
+        for app in preStopGUI where app.pid > 1 && app.pid != selfPid {
+            if let url = app.bundleURL?.standardizedFileURL,
+               seenPreStop.insert(url.path).inserted {
+                preStopBundleURLs.append(url)
+            }
+        }
+
         // Step 4: Graceful stop across Stable + Insiders + language_server + agy (12s timeout; zero auto-SIGKILL).
         let stopResult = await processController.gracefulStop(
             bundleIDs: Self.bundleIDs,
@@ -2317,9 +2413,24 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
         )
 
         let reopenURLs: [URL]
+        var deferredAutoRespawnedACP: [ClientProcessInfo] = []
         switch stopResult {
         case .stillRunning(let surviving):
-            return .needsForceQuitConfirmation(surviving: surviving)
+            let activeSurviving = surviving.filter { processController.inspector.isProcessAlive(pid: $0.id) }
+            let allAreRespawnedACP = activeSurviving.allSatisfy { proc in
+                let args = processController.inspector.processArguments(pid: proc.id)
+                return Self.isAutoRespawnedAgyACPProcess(proc, arguments: args)
+            }
+            guard allAreRespawnedACP else {
+                return .needsForceQuitConfirmation(surviving: activeSurviving.isEmpty ? surviving : activeSurviving)
+            }
+            deferredAutoRespawnedACP = activeSurviving
+            reopenURLs = Self.filterReopenURLs(
+                preStopBundleURLs,
+                includeInsiders: relaunchInsiders,
+                stableAppURL: paths.stableAppURL,
+                insidersAppURL: paths.insidersAppURL
+            )
         case .stopped(let urls):
             reopenURLs = Self.filterReopenURLs(
                 urls,
@@ -2329,15 +2440,23 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             )
         }
 
-        // Step 5: Atomic write Keychain `(gemini, antigravity)` + mirror `~/.gemini/jetski-standalone-oauth-token`.
+        // Step 5: Atomic write Keychain `(gemini, antigravity)` + mirror `~/.gemini/jetski-standalone-oauth-token`
+        // with a rotated fresh `writer_id` and clean target `id_token_email` (never reusing outgoing fields).
+        let previousWriterID = nonEmpty(outgoingLive?.root["writer_id"] as? String)
+        let freshWriterID = Self.generateWriterID(excluding: previousWriterID)
+        let expectedEmail = nonEmpty(targetIdentity.email) ?? nonEmpty(account.email)
+
         let bundleData: Data
         do {
-            bundleData = try buildUpdatedBundleJSON(
+            bundleData = try Self.buildUpdatedBundleJSON(
                 base: outgoingLive?.root,
                 accessToken: minted.accessToken,
                 refreshToken: effectiveTargetRefresh,
                 expiry: targetExpiry,
-                idToken: minted.idToken
+                expiresIn: minted.expiresIn,
+                idToken: minted.idToken,
+                targetEmail: expectedEmail,
+                writerID: freshWriterID
             )
         } catch {
             await processController.reopenApps(urls: reopenURLs)
@@ -2353,11 +2472,15 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             )
             try KeychainStore.writeAtomicFile(data: bundleData, to: paths.mirrorTokenURL, mode: 0o600)
 
-            // Step 6: Strict read-back verification of BOTH Keychain and mirror file (`refresh_token` + `sub`).
+            // Step 6: Strict read-back verification of BOTH Keychain and mirror file
+            // (`refresh_token`, `access_token`, rotated `writer_id`, `id_token_email`, and `sub`).
             try verifyLiveWriteReadback(
                 expectedRefreshToken: effectiveTargetRefresh,
                 expectedAccessToken: minted.accessToken,
-                expectedSub: account.id
+                expectedSub: account.id,
+                expectedEmail: expectedEmail,
+                expectedWriterID: freshWriterID,
+                previousWriterID: previousWriterID
             )
         } catch {
             rollbackLiveCredentials(previousKeychainRaw: previousKeychainRaw, previousMirrorData: previousMirrorData)
@@ -2365,16 +2488,51 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             return .failed("写入或校验 Antigravity 凭证失败，已回滚原账号: \(error.localizedDescription)")
         }
 
+        // Step 6.5: Gently send SIGTERM once to any currently running non-interactive `agy acp` worker
+        // so `agy-bridge` immediately respawns it against the newly verified Keychain + fresh `writer_id`.
+        recycleAutoRespawnedAgyACPProcesses(recorded: deferredAutoRespawnedACP)
+
         // Step 7: Reopen ONLY filtered bundle(s) (by default Stable only; Insiders excluded unless explicitly enabled).
         await processController.reopenApps(urls: reopenURLs)
         let reopenedNames = reopenURLs.map { $0.deletingPathExtension().lastPathComponent }
         return .switched(reopenedApps: reopenedNames)
     }
 
+    @discardableResult
+    private func recycleAutoRespawnedAgyACPProcesses(recorded: [ClientProcessInfo] = []) -> [Int] {
+        let selfPid = Int(ProcessInfo.processInfo.processIdentifier)
+        var candidateByPid: [Int: ClientProcessInfo] = [:]
+
+        for proc in processController.inspector.allRunningProcesses() {
+            guard proc.id > 1, proc.id != selfPid else { continue }
+            candidateByPid[proc.id] = proc
+        }
+        for proc in recorded {
+            guard proc.id > 1, proc.id != selfPid else { continue }
+            if candidateByPid[proc.id] == nil && processController.inspector.isProcessAlive(pid: proc.id) {
+                candidateByPid[proc.id] = proc
+            }
+        }
+
+        var signaledPids: [Int] = []
+        for pid in candidateByPid.keys.sorted() {
+            guard let proc = candidateByPid[pid] else { continue }
+            let args = processController.inspector.processArguments(pid: pid)
+            guard Self.isAutoRespawnedAgyACPProcess(proc, arguments: args) else { continue }
+            if processController.inspector.sendSignal(SIGTERM, to: pid) {
+                signaledPids.append(pid)
+            }
+        }
+        return signaledPids
+    }
+
     private func verifyLiveWriteReadback(
         expectedRefreshToken: String,
         expectedAccessToken: String,
-        expectedSub: String
+        expectedSub: String,
+        expectedEmail: String?,
+        expectedWriterID: String,
+        previousWriterID: String?
     ) throws {
         // Verify Keychain readback.
         guard let kcRaw = try keychain.readExternalGenericPassword(
@@ -2382,33 +2540,73 @@ public final class AntigravityProvider: ProviderAdapter, @unchecked Sendable {
             account: Self.liveKeychainAccount
         ),
         let kcData = Self.decodeGoKeyringValue(kcRaw),
-        let kcObj = (try? JSONSerialization.jsonObject(with: kcData, options: [])) as? [String: Any],
-        let kcToken = kcObj["token"] as? [String: Any],
-        (kcToken["refresh_token"] as? String) == expectedRefreshToken,
-        (kcToken["access_token"] as? String) == expectedAccessToken else {
+        let kcObj = (try? JSONSerialization.jsonObject(with: kcData, options: [])) as? [String: Any] else {
             throw ProviderAdapterError.operationFailed("Keychain 回读校验失败")
         }
-
-        if let idToken = nonEmpty(kcObj["id_token"] as? String) {
-            guard let claims = Formatters.decodeJWTPayload(idToken),
-                  (claims["sub"] as? String) == expectedSub else {
-                throw ProviderAdapterError.operationFailed("Keychain id_token sub 回读不一致")
-            }
-        }
+        try Self.validateLiveBundleReadbackObject(
+            kcObj,
+            sourceLabel: "Keychain",
+            expectedRefreshToken: expectedRefreshToken,
+            expectedAccessToken: expectedAccessToken,
+            expectedSub: expectedSub,
+            expectedEmail: expectedEmail,
+            expectedWriterID: expectedWriterID,
+            previousWriterID: previousWriterID
+        )
 
         // Verify mirror file readback.
         let mirrorData = try Data(contentsOf: paths.mirrorTokenURL)
-        guard let mirrorObj = (try? JSONSerialization.jsonObject(with: mirrorData, options: [])) as? [String: Any],
-              let mirrorToken = mirrorObj["token"] as? [String: Any],
-              (mirrorToken["refresh_token"] as? String) == expectedRefreshToken,
-              (mirrorToken["access_token"] as? String) == expectedAccessToken else {
+        guard let mirrorObj = (try? JSONSerialization.jsonObject(with: mirrorData, options: [])) as? [String: Any] else {
             throw ProviderAdapterError.operationFailed("镜像文件 jetski-standalone-oauth-token 回读校验失败")
         }
+        try Self.validateLiveBundleReadbackObject(
+            mirrorObj,
+            sourceLabel: "镜像文件 jetski-standalone-oauth-token",
+            expectedRefreshToken: expectedRefreshToken,
+            expectedAccessToken: expectedAccessToken,
+            expectedSub: expectedSub,
+            expectedEmail: expectedEmail,
+            expectedWriterID: expectedWriterID,
+            previousWriterID: previousWriterID
+        )
+    }
 
-        if let idToken = nonEmpty(mirrorObj["id_token"] as? String) {
+    private static func validateLiveBundleReadbackObject(
+        _ obj: [String: Any],
+        sourceLabel: String,
+        expectedRefreshToken: String,
+        expectedAccessToken: String,
+        expectedSub: String,
+        expectedEmail: String?,
+        expectedWriterID: String,
+        previousWriterID: String?
+    ) throws {
+        guard let tokenObj = obj["token"] as? [String: Any],
+              (tokenObj["refresh_token"] as? String) == expectedRefreshToken,
+              (tokenObj["access_token"] as? String) == expectedAccessToken else {
+            throw ProviderAdapterError.operationFailed("\(sourceLabel) 回读校验失败")
+        }
+
+        guard let actualWriterID = nonEmptyStatic(obj["writer_id"] as? String),
+              actualWriterID == expectedWriterID else {
+            throw ProviderAdapterError.operationFailed("\(sourceLabel) writer_id 回读不一致")
+        }
+
+        if let prevWriterID = nonEmptyStatic(previousWriterID), actualWriterID == prevWriterID {
+            throw ProviderAdapterError.operationFailed("\(sourceLabel) writer_id 未更新，仍为旧账号标识")
+        }
+
+        if let expectedEmail = nonEmptyStatic(expectedEmail) {
+            guard let actualEmail = nonEmptyStatic(obj["id_token_email"] as? String),
+                  actualEmail.lowercased() == expectedEmail.lowercased() else {
+                throw ProviderAdapterError.operationFailed("\(sourceLabel) id_token_email 回读不一致")
+            }
+        }
+
+        if let idToken = nonEmptyStatic(obj["id_token"] as? String) {
             guard let claims = Formatters.decodeJWTPayload(idToken),
                   (claims["sub"] as? String) == expectedSub else {
-                throw ProviderAdapterError.operationFailed("镜像文件 id_token sub 回读不一致")
+                throw ProviderAdapterError.operationFailed("\(sourceLabel) id_token sub 回读不一致")
             }
         }
     }

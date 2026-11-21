@@ -4582,7 +4582,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.2.0", "AppStore.appVersion must match v1.2.0")
+        T.expectEqual(AppStore.appVersion, "1.2.1", "AppStore.appVersion must match v1.2.1")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -6115,6 +6115,608 @@ private func testV120RegressionSuite() async {
     }
 }
 
+// MARK: - Test 17: v1.2.1 Regression Suite (AGY writer_id Rotation, Clean Bundle Builder, agy.*.old Matcher & Bridge Respawn Fence)
+
+private final class BridgeRespawnProcessInspector: ProcessInspectorProtocol, @unchecked Sendable {
+    private let lock = NSLock()
+    var guiApps: [RunningGUIApp] = []
+    var processes: [ClientProcessInfo] = []
+    var installed: [URL] = []
+    var argsByPid: [Int: [String]] = [:]
+
+    var terminateRequests: [(pid: Int, bundleId: String?)] = []
+    var signalsSent: [(signal: Int32, pid: Int)] = []
+    var reopenedURLs: [URL] = []
+
+    var onAgyACPSigTerm: ((Int) -> Void)?
+
+    func runningApplications(bundleIDs: [String]) -> [RunningGUIApp] {
+        lock.lock()
+        defer { lock.unlock() }
+        let set = Set(bundleIDs)
+        return guiApps.filter { set.contains($0.bundleId) }
+    }
+
+    func allRunningProcesses() -> [ClientProcessInfo] {
+        lock.lock()
+        defer { lock.unlock() }
+        return processes
+    }
+
+    func processArguments(pid: Int) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return argsByPid[pid] ?? []
+    }
+
+    func installedAppURLs(bundleIDs: [String], extraPaths: [String]) -> [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return installed
+    }
+
+    func requestGracefulTerminate(pid: Int, bundleId: String?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        terminateRequests.append((pid, bundleId))
+        guiApps.removeAll { $0.pid == pid }
+        processes.removeAll { $0.id == pid }
+        return true
+    }
+
+    func sendSignal(_ signal: Int32, to pid: Int) -> Bool {
+        let callback: ((Int) -> Void)? = lock.withLock {
+            signalsSent.append((signal, pid))
+            if signal == SIGTERM || signal == SIGKILL {
+                guiApps.removeAll { $0.pid == pid }
+                processes.removeAll { $0.id == pid }
+            }
+            if signal == SIGTERM,
+               let args = argsByPid[pid],
+               args.contains(where: { $0.lowercased() == "acp" }) {
+                return onAgyACPSigTerm
+            }
+            return nil
+        }
+        callback?(pid)
+        return true
+    }
+
+    func spawnProcess(_ proc: ClientProcessInfo, arguments: [String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        processes.removeAll { $0.id == proc.id }
+        processes.append(proc)
+        argsByPid[proc.id] = arguments
+    }
+
+    func isProcessAlive(pid: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return guiApps.contains { $0.pid == pid } || processes.contains { $0.id == pid }
+    }
+
+    func openApplication(at url: URL) async throws {
+        lock.withLock {
+            reopenedURLs.append(url)
+        }
+    }
+
+    func sleep(nanoseconds: UInt64) async {}
+}
+
+private func testV121RegressionSuite() async {
+    await T.asyncSuite("V121.AntigravitySwitchFenceAndAgyMatcher") {
+        // 1. generateWriterID(excluding:): 43-char URL-safe unpadded Base64 (32 random bytes), strictly != previous
+        let allowedWriterChars = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        let previousWriter = "prev_writer_id_0123456789abcdefghijklmnopqr"
+        var generatedSet = Set<String>()
+        for i in 0..<16 {
+            let excl = (i % 2 == 0) ? previousWriter : "  \(previousWriter)  "
+            let wid = AntigravityProvider.generateWriterID(excluding: excl)
+            T.expectEqual(wid.count, 43, "writer_id must be 43 chars (32 bytes URL-safe unpadded Base64)")
+            T.expect(!wid.contains("+") && !wid.contains("/") && !wid.contains("="), "writer_id must never contain '+', '/' or '='")
+            T.expect(wid.unicodeScalars.allSatisfy { allowedWriterChars.contains($0) }, "writer_id must contain only URL-safe Base64 characters")
+            T.expectEqual(Formatters.base64URLDecode(wid)?.count, 32, "writer_id must decode to 32 raw bytes")
+            T.expect(wid != previousWriter, "writer_id must strictly differ from previous")
+            generatedSet.insert(wid)
+        }
+        T.expectEqual(generatedSet.count, 16, "16 consecutive generateWriterID calls must be unique")
+
+        // 2. buildUpdatedBundleJSON: strips polluted outgoing fields while preserving auth_method & writing clean target fields
+        let expiryDate = Date(timeIntervalSince1970: 1_800_123_456)
+        let freshWriter = AntigravityProvider.generateWriterID(excluding: previousWriter)
+        let newIDToken = makeUnsignedJWT(payload: [
+            "sub": "sub-new-202",
+            "email": "jwt-fallback@example.com",
+            "name": "New Target User",
+        ])
+        let pollutedBase: [String: Any] = [
+            "auth_method": "enterprise_sso",
+            "writer_id": previousWriter,
+            "id_token_email": "old@example.com",
+            "id_token": makeUnsignedJWT(payload: ["sub": "sub-old-101", "email": "old@example.com"]),
+            "legacy_polluted_account": "old-account-meta",
+            "extra_stale_dict": ["email": "old@example.com"],
+            "token": [
+                "access_token": "at_old_stale",
+                "refresh_token": "rt_old_stale",
+                "token_type": "MAC",
+                "stale_token_field": "must_be_removed",
+            ],
+        ]
+
+        let cleanData = try AntigravityProvider.buildUpdatedBundleJSON(
+            base: pollutedBase,
+            accessToken: "at_clean_new",
+            refreshToken: "rt_clean_new",
+            expiry: expiryDate,
+            expiresIn: 3600,
+            idToken: newIDToken,
+            targetEmail: "target@example.com",
+            writerID: freshWriter
+        )
+        let cleanObj = try JSONSerialization.jsonObject(with: cleanData, options: []) as? [String: Any]
+        T.expect(cleanObj != nil, "buildUpdatedBundleJSON must emit valid JSON dictionary")
+        T.expectEqual(
+            cleanObj?.keys.sorted(),
+            ["auth_method", "id_token", "id_token_email", "token", "writer_id"],
+            "root dictionary must contain ONLY canonical Antigravity fields and zero polluted keys"
+        )
+        T.expectEqual(cleanObj?["auth_method"] as? String, "enterprise_sso", "valid auth_method from base must be preserved")
+        T.expectEqual(cleanObj?["writer_id"] as? String, freshWriter)
+        T.expect((cleanObj?["writer_id"] as? String) != previousWriter, "writer_id must never inherit outgoing writer_id")
+        T.expectEqual(cleanObj?["id_token_email"] as? String, "target@example.com", "explicit targetEmail must replace old@example.com")
+        T.expectEqual(cleanObj?["id_token"] as? String, newIDToken)
+        T.expect(cleanObj?["legacy_polluted_account"] == nil, "polluted root field must be stripped")
+        T.expect(cleanObj?["extra_stale_dict"] == nil, "polluted nested dict must be stripped")
+
+        let cleanTokenObj = cleanObj?["token"] as? [String: Any]
+        T.expectEqual(
+            cleanTokenObj?.keys.sorted(),
+            ["access_token", "expires_in", "expiry", "refresh_token", "token_type"],
+            "token dictionary must strip stale fields and write expires_in"
+        )
+        T.expectEqual(cleanTokenObj?["access_token"] as? String, "at_clean_new")
+        T.expectEqual(cleanTokenObj?["refresh_token"] as? String, "rt_clean_new")
+        T.expectEqual(cleanTokenObj?["token_type"] as? String, "Bearer")
+        T.expectEqual(cleanTokenObj?["expires_in"] as? Int, 3600)
+        T.expect(cleanTokenObj?["stale_token_field"] == nil)
+        let parsedExpiry = (cleanTokenObj?["expiry"] as? String).flatMap { Formatters.parseRFC3339($0) }
+        T.expect(parsedExpiry != nil && abs(parsedExpiry!.timeIntervalSince(expiryDate)) < 1.0, "expiry must be valid RFC3339")
+
+        // Fallback id_token_email from idToken JWT email when targetEmail is nil/blank + default consumer auth_method + expiresIn floor 60s
+        let fallbackData = try AntigravityProvider.buildUpdatedBundleJSON(
+            base: ["id_token_email": "old@example.com", "writer_id": previousWriter],
+            accessToken: "at_fb",
+            refreshToken: "rt_fb",
+            expiry: expiryDate,
+            expiresIn: 12,
+            idToken: newIDToken,
+            targetEmail: "   ",
+            writerID: freshWriter
+        )
+        let fallbackObj = try JSONSerialization.jsonObject(with: fallbackData, options: []) as? [String: Any]
+        T.expectEqual(fallbackObj?["auth_method"] as? String, "consumer", "missing auth_method must default to consumer")
+        T.expectEqual(fallbackObj?["id_token_email"] as? String, "jwt-fallback@example.com", "blank targetEmail must fall back to idToken JWT email")
+        T.expectEqual((fallbackObj?["token"] as? [String: Any])?["expires_in"] as? Int, 60, "expiresIn < 60s must clamp to 60")
+
+        // Validation errors on blank required inputs
+        var missingATThrew = false
+        do {
+            _ = try AntigravityProvider.buildUpdatedBundleJSON(
+                base: nil,
+                accessToken: "  ",
+                refreshToken: "rt",
+                expiry: expiryDate,
+                idToken: nil,
+                targetEmail: nil,
+                writerID: freshWriter
+            )
+        } catch {
+            missingATThrew = true
+        }
+        T.expectEqual(missingATThrew, true, "blank accessToken must throw")
+
+        // 3. isAgyExecutableName(_:)
+        for validName in ["agy", "agy.1795227640703023000.old", "agy-desktop-helper", "AGY.999.old", "  agy.42.old  "] {
+            T.expectEqual(AntigravityProvider.isAgyExecutableName(validName), true, "expected isAgyExecutableName(\(validName)) == true")
+        }
+        for rejectedName in ["agy-bridge", "agy.", "claude", "codex", "", "   ", "/usr/local/bin/agy", "agy_worker"] {
+            T.expectEqual(AntigravityProvider.isAgyExecutableName(rejectedName), false, "expected isAgyExecutableName(\(rejectedName)) == false")
+        }
+
+        // 4. isAutoRespawnedAgyACPProcess(_:arguments:)
+        let acpPerSession = ClientProcessInfo(
+            id: 5101,
+            name: "agy",
+            executablePath: "/Users/example/.local/bin/agy",
+            bundleId: nil,
+            isInteractiveCLI: false
+        )
+        let acpHotUpdatedWorker = ClientProcessInfo(
+            id: 5102,
+            name: "agy.1795227640703023000.old",
+            executablePath: "/Users/example/.local/bin/agy.1795227640703023000.old",
+            bundleId: nil,
+            isInteractiveCLI: false
+        )
+        let interactiveAgy = ClientProcessInfo(
+            id: 5103,
+            name: "agy.1795227640703023000.old",
+            executablePath: "/Users/example/.local/bin/agy.1795227640703023000.old",
+            bundleId: nil,
+            isInteractiveCLI: true
+        )
+        let guiAntigravity = ClientProcessInfo(
+            id: 5104,
+            name: "Antigravity",
+            executablePath: "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            bundleId: AntigravityProvider.stableBundleId,
+            isInteractiveCLI: false
+        )
+        let agyBridgeProc = ClientProcessInfo(
+            id: 5105,
+            name: "agy-bridge",
+            executablePath: "/opt/homebrew/bin/agy-bridge",
+            bundleId: nil,
+            isInteractiveCLI: false
+        )
+
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(acpPerSession, arguments: ["agy", "acp", "--process-per-session"]),
+            true,
+            "non-interactive `agy acp --process-per-session` must match"
+        )
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(acpHotUpdatedWorker, arguments: ["agy", "acp", "--worker"]),
+            true,
+            "non-interactive `agy.<ts>.old acp --worker` must match"
+        )
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(interactiveAgy, arguments: ["agy", "acp", "--process-per-session"]),
+            false,
+            "interactive terminal `agy` (isInteractiveCLI == true) must be rejected"
+        )
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(guiAntigravity, arguments: ["Antigravity", "acp"]),
+            false,
+            "GUI Antigravity (bundleId != nil) must be rejected"
+        )
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(agyBridgeProc, arguments: ["agy-bridge", "serve"]),
+            false,
+            "`agy-bridge serve` must be rejected"
+        )
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(agyBridgeProc, arguments: ["agy-bridge", "acp"]),
+            false,
+            "`agy-bridge` must be rejected even if arguments contain `acp`"
+        )
+        T.expectEqual(
+            AntigravityProvider.isAutoRespawnedAgyACPProcess(acpPerSession, arguments: ["agy", "chat"]),
+            false,
+            "non-ACP `agy` subcommand must be rejected"
+        )
+
+        // 5. Full Mock `switchAccount` scenarios (interactive `agy.*.old` guard + `agy-bridge` respawning `agy acp` fence)
+        let dir = try makeTempDir(prefix: "pulsar-v121-switch")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let stableApp = dir.appendingPathComponent("Antigravity.app", isDirectory: true)
+        let insidersApp = dir.appendingPathComponent("Antigravity - Insiders.app", isDirectory: true)
+        try writeSyntheticASAR(to: stableApp.appendingPathComponent("Contents/Resources/app.asar"), version: "2.33.0")
+        let binDir = stableApp.appendingPathComponent("Contents/Resources/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try Data("GOCSPX-1234567890abcdefghijklmnopqr".utf8).write(to: binDir.appendingPathComponent("language_server"))
+
+        let agyBinDir = dir.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: agyBinDir, withIntermediateDirectories: true)
+        let agyCLIURL = agyBinDir.appendingPathComponent("agy")
+        let agyOldPath = agyBinDir.appendingPathComponent("agy.1795227640703023000.old").path
+        try Data("#!/bin/sh\n".utf8).write(to: agyCLIURL)
+
+        let mirrorURL = dir.appendingPathComponent(".gemini/jetski-standalone-oauth-token")
+
+        let backend = InMemoryKeychainBackend()
+        let kc = KeychainStore(backend: backend)
+        try kc.writeSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-new-202", value: "rt_seed_202")
+
+        let oldWriterID = "old_writer_id_1111111111111111111111111111111"
+        let outgoingIDToken = makeUnsignedJWT(payload: [
+            "sub": "sub-old-101",
+            "email": "old@example.com",
+            "name": "Outgoing User",
+        ])
+        let outgoingBundleObj: [String: Any] = [
+            "auth_method": "consumer",
+            "writer_id": oldWriterID,
+            "id_token_email": "old@example.com",
+            "id_token": outgoingIDToken,
+            "polluted_legacy_key": "stale_from_old_account",
+            "token": [
+                "access_token": "at_old_101",
+                "refresh_token": "rt_old_101",
+                "token_type": "Bearer",
+                "expiry": Formatters.formatRFC3339Local(Date().addingTimeInterval(3600)),
+            ],
+        ]
+        let outgoingBundleData = try JSONSerialization.data(withJSONObject: outgoingBundleObj, options: [.sortedKeys])
+        try kc.writeExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount,
+            value: AntigravityProvider.encodeGoKeyringValue(outgoingBundleData)
+        )
+        try KeychainStore.writeAtomicFile(data: outgoingBundleData, to: mirrorURL, mode: 0o600)
+
+        let targetIDToken = makeUnsignedJWT(payload: [
+            "sub": "sub-new-202",
+            "email": "new@example.com",
+            "name": "Target User",
+        ])
+        StubURLProtocol.reset { req, bodyData in
+            let urlStr = req.url?.absoluteString ?? ""
+            let makeResp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
+                let d = try! JSONSerialization.data(withJSONObject: obj)
+                return (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, d)
+            }
+            if urlStr.contains("oauth2.googleapis.com/token") {
+                let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
+                if bodyStr.contains("roryorbit_client_secret_probe") {
+                    return makeResp(400, ["error": "invalid_grant"])
+                }
+                return makeResp(200, [
+                    "access_token": "at_new_202",
+                    "refresh_token": "rt_new_202_rotated",
+                    "expires_in": 3600,
+                    "id_token": targetIDToken,
+                ])
+            }
+            if urlStr.contains("googleapis.com/oauth2/v2/userinfo") {
+                let auth = req.value(forHTTPHeaderField: "Authorization") ?? ""
+                if auth.contains("at_new_202") {
+                    return makeResp(200, [
+                        "id": "sub-new-202",
+                        "email": "new@example.com",
+                        "name": "Target User",
+                    ])
+                }
+                if auth.contains("at_old_101") {
+                    return makeResp(200, [
+                        "id": "sub-old-101",
+                        "email": "old@example.com",
+                        "name": "Outgoing User",
+                    ])
+                }
+            }
+            return makeResp(404, [:])
+        }
+
+        let paths = AntigravityProvider.Paths(
+            stableAppURL: stableApp,
+            insidersAppURL: insidersApp,
+            agyCLIURL: agyCLIURL,
+            mirrorTokenURL: mirrorURL
+        )
+        let inspector = BridgeRespawnProcessInspector()
+        inspector.installed = [stableApp, insidersApp]
+        let ctrl = ProcessController(inspector: inspector, selfPid: 9999)
+        let provider = AntigravityProvider(
+            keychain: kc,
+            processController: ctrl,
+            paths: paths,
+            session: makeMockSession()
+        )
+        let targetAccount = AccountRecord(
+            id: "sub-new-202",
+            provider: .antigravity,
+            email: "new@example.com",
+            displayName: "Target User"
+        )
+
+        // 5a. Interactive terminal `agy.*.old` session + `allowForceQuit == false` -> MUST return `.needsForceQuitConfirmation`
+        let bridgePID = 6100
+        let interactiveOldAgyPID = 6200
+        inspector.processes = [
+            ClientProcessInfo(
+                id: bridgePID,
+                name: "agy-bridge",
+                executablePath: "/opt/homebrew/bin/agy-bridge",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+            ClientProcessInfo(
+                id: interactiveOldAgyPID,
+                name: "agy.1795227640703023000.old",
+                executablePath: agyOldPath,
+                bundleId: nil,
+                isInteractiveCLI: true
+            ),
+        ]
+        inspector.argsByPid = [
+            bridgePID: ["agy-bridge", "serve"],
+            interactiveOldAgyPID: ["agy"],
+        ]
+
+        let detectedWithOldAgy = await provider.detectClientStatus()
+        T.expectEqual(
+            detectedWithOldAgy.runningProcesses.map(\.id),
+            [interactiveOldAgyPID],
+            "detectClientStatus must detect `agy.*.old` and exclude `agy-bridge`"
+        )
+
+        let blockedByInteractive = await provider.switchAccount(to: targetAccount, allowForceQuit: false)
+        if case .needsForceQuitConfirmation(let surviving) = blockedByInteractive {
+            T.expectEqual(surviving.map(\.id), [interactiveOldAgyPID], "interactive `agy.*.old` must require confirmation")
+        } else {
+            T.expect(false, "expected .needsForceQuitConfirmation for interactive `agy.*.old`, got \(blockedByInteractive)")
+        }
+        T.expectEqual(inspector.signalsSent.count, 0, "interactive guard must abort before sending any signal")
+        let kcAfterBlockedRaw = try kc.readExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount
+        )
+        let kcAfterBlockedObj = kcAfterBlockedRaw
+            .flatMap { AntigravityProvider.decodeGoKeyringValue($0) }
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        T.expectEqual(kcAfterBlockedObj?["writer_id"] as? String, oldWriterID, "aborted switch must leave outgoing writer_id untouched")
+        T.expectEqual(kcAfterBlockedObj?["id_token_email"] as? String, "old@example.com", "aborted switch must leave outgoing email untouched")
+
+        // 5b. Full `switchAccount` with Stable + Insiders GUI & `agy-bridge` continuously respawning non-interactive `agy acp`
+        let stableGUIPID = 7001
+        let insidersGUIPID = 7002
+        let langServerPID = 7003
+        let initialACPPID = 7201
+        var nextRespawnedACPPID = 7202
+        var postWriteACPSignals: [Int] = []
+        var credentialsAlreadyRotatedWhenPostWriteSignaled = false
+
+        inspector.guiApps = [
+            RunningGUIApp(
+                pid: stableGUIPID,
+                bundleId: AntigravityProvider.stableBundleId,
+                localizedName: "Antigravity",
+                bundleURL: stableApp,
+                executablePath: stableApp.appendingPathComponent("Contents/MacOS/Antigravity").path
+            ),
+            RunningGUIApp(
+                pid: insidersGUIPID,
+                bundleId: AntigravityProvider.insidersBundleId,
+                localizedName: "Antigravity - Insiders",
+                bundleURL: insidersApp,
+                executablePath: insidersApp.appendingPathComponent("Contents/MacOS/Antigravity").path
+            ),
+        ]
+        inspector.processes = [
+            ClientProcessInfo(
+                id: stableGUIPID,
+                name: "Antigravity",
+                executablePath: stableApp.appendingPathComponent("Contents/MacOS/Antigravity").path,
+                bundleId: AntigravityProvider.stableBundleId
+            ),
+            ClientProcessInfo(
+                id: insidersGUIPID,
+                name: "Antigravity - Insiders",
+                executablePath: insidersApp.appendingPathComponent("Contents/MacOS/Antigravity").path,
+                bundleId: AntigravityProvider.insidersBundleId
+            ),
+            ClientProcessInfo(
+                id: langServerPID,
+                name: "language_server",
+                executablePath: binDir.appendingPathComponent("language_server").path
+            ),
+            ClientProcessInfo(
+                id: bridgePID,
+                name: "agy-bridge",
+                executablePath: "/opt/homebrew/bin/agy-bridge",
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+            ClientProcessInfo(
+                id: initialACPPID,
+                name: "agy.1795227640703023000.old",
+                executablePath: agyOldPath,
+                bundleId: nil,
+                isInteractiveCLI: false
+            ),
+        ]
+        inspector.argsByPid = [
+            bridgePID: ["agy-bridge", "serve"],
+            initialACPPID: ["agy", "acp", "--process-per-session"],
+        ]
+
+        inspector.onAgyACPSigTerm = { terminatedPID in
+            let currentKC = (try? kc.readExternalGenericPassword(
+                service: AntigravityProvider.liveKeychainService,
+                account: AntigravityProvider.liveKeychainAccount
+            ))
+            .flatMap { AntigravityProvider.decodeGoKeyringValue($0) }
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let currentMirror = (try? Data(contentsOf: mirrorURL))
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+
+            let kcWriter = currentKC?["writer_id"] as? String
+            let mirrorWriter = currentMirror?["writer_id"] as? String
+            let kcEmail = currentKC?["id_token_email"] as? String
+            let mirrorEmail = currentMirror?["id_token_email"] as? String
+
+            if kcWriter != nil && kcWriter != oldWriterID {
+                postWriteACPSignals.append(terminatedPID)
+                if kcWriter == mirrorWriter && kcEmail == "new@example.com" && mirrorEmail == "new@example.com" {
+                    credentialsAlreadyRotatedWhenPostWriteSignaled = true
+                }
+            }
+            // Simulate `agy-bridge` supervisor immediately respawning a fresh `agy acp` worker whenever one exits!
+            let newPID = nextRespawnedACPPID
+            nextRespawnedACPPID += 1
+            inspector.spawnProcess(
+                ClientProcessInfo(
+                    id: newPID,
+                    name: "agy",
+                    executablePath: agyCLIURL.path,
+                    bundleId: nil,
+                    isInteractiveCLI: false
+                ),
+                arguments: ["agy", "acp", "--process-per-session"]
+            )
+        }
+
+        let switchRes = await provider.switchAccount(to: targetAccount, allowForceQuit: false)
+        T.expectEqual(
+            switchRes,
+            .switched(reopenedApps: ["Antigravity"]),
+            "switchAccount must succeed despite respawned `agy acp` and reopen ONLY Stable Antigravity"
+        )
+        T.expectEqual(inspector.reopenedURLs, [stableApp.standardizedFileURL], "must reopen Stable app only")
+
+        // Signal invariants: 0 SIGKILL, 0 signals/terminates to agy-bridge, and exactly 1 post-write SIGTERM to respawned agy acp
+        T.expect(inspector.signalsSent.allSatisfy { $0.signal != SIGKILL }, "switchAccount must send ZERO SIGKILL signals")
+        T.expect(!inspector.signalsSent.contains { $0.pid == bridgePID }, "switchAccount must NEVER send any signal to agy-bridge")
+        T.expect(!inspector.terminateRequests.contains { $0.pid == bridgePID }, "switchAccount must NEVER terminate agy-bridge")
+        T.expectEqual(postWriteACPSignals, [7202], "must send SIGTERM exactly once to respawned `agy acp` after writing credentials")
+        T.expectEqual(
+            credentialsAlreadyRotatedWhenPostWriteSignaled,
+            true,
+            "Keychain and mirror file must ALREADY hold rotated writer_id + new id_token_email when post-write SIGTERM fires"
+        )
+
+        // Verify live Keychain & mirror file contents and outgoing backup vaulting
+        let finalKCRaw = try kc.readExternalGenericPassword(
+            service: AntigravityProvider.liveKeychainService,
+            account: AntigravityProvider.liveKeychainAccount
+        )
+        T.expect(finalKCRaw?.hasPrefix(AntigravityProvider.goKeyringBase64Prefix) == true)
+        let finalKCData = finalKCRaw.flatMap { AntigravityProvider.decodeGoKeyringValue($0) }
+        let finalMirrorData = try Data(contentsOf: mirrorURL)
+        T.expectEqual(finalKCData, finalMirrorData, "Keychain JSON payload and mirror file must match byte-for-byte")
+
+        let finalObj = try JSONSerialization.jsonObject(with: finalMirrorData, options: []) as? [String: Any]
+        let finalWriterID = finalObj?["writer_id"] as? String ?? ""
+        T.expectEqual(finalWriterID.count, 43)
+        T.expect(finalWriterID != oldWriterID, "switched live writer_id must rotate away from outgoing writer_id")
+        T.expectEqual(finalObj?["id_token_email"] as? String, "new@example.com")
+        T.expectEqual(finalObj?["auth_method"] as? String, "consumer")
+        T.expect(finalObj?["polluted_legacy_key"] == nil, "polluted outgoing key must be stripped on switch")
+        let finalToken = finalObj?["token"] as? [String: Any]
+        T.expectEqual(finalToken?["access_token"] as? String, "at_new_202")
+        T.expectEqual(finalToken?["refresh_token"] as? String, "rt_new_202_rotated")
+        T.expectEqual(finalToken?["expires_in"] as? Int, 3600)
+
+        let mirrorPerms = (try FileManager.default.attributesOfItem(atPath: mirrorURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        T.expectEqual(mirrorPerms, 0o600, "mirror file mode must remain 0600")
+        T.expectEqual(
+            try kc.readSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-old-101"),
+            "rt_old_101",
+            "outgoing live refresh_token must be vaulted before overwrite"
+        )
+        T.expectEqual(
+            try kc.readSecret(service: KeychainStore.roryOrbitAntigravityService, account: "sub-new-202"),
+            "rt_new_202_rotated",
+            "rotated target refresh_token must be persisted to isolated Keychain"
+        )
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -6135,6 +6737,7 @@ Task {
     await testPhase2RegressionSuite()
     await testV110RegressionSuite()
     await testV120RegressionSuite()
+    await testV121RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)

@@ -3,7 +3,7 @@
   <h1>Pulsar</h1>
   <p><strong>原生 macOS Liquid Glass 菜单栏 AI 配额监控、多账号安全切换、纯本地 Token 分析与实时 <code>tok/s</code> 测速工具</strong></p>
   <p>
-    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/version-v1.2.0-6366F1?style=flat-square" alt="Version v1.2.0" /></a>
+    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.1"><img src="https://img.shields.io/badge/version-v1.2.1-6366F1?style=flat-square" alt="Version v1.2.1" /></a>
     <img src="https://img.shields.io/badge/macOS-13%2B%20%7C%20Liquid%20Glass%2026%2F27-0EA5E9?style=flat-square" alt="macOS 13+" />
     <img src="https://img.shields.io/badge/arch-Apple%20Silicon%20(arm64)-10B981?style=flat-square" alt="Apple Silicon" />
     <img src="https://img.shields.io/badge/Swift-AppKit%20%2B%20SwiftUI%20(Zero%20Deps)-F97316?style=flat-square" alt="Pure Swift" />
@@ -19,9 +19,9 @@
 
 | 下载项 | 链接 / 信息 |
 |---|---|
-| **DMG 直链下载（最新 v1.2.0）** | [**Pulsar-v1.2.0-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.2.0-macOS-arm64.dmg) |
-| **GitHub Release 发布页** | [Releases · v1.2.0](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.0) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
-| **SHA-256 校验值** | `d07e9d1999e42ada56fa4e7d93717593b200e5fb12a17bb1a6e70cf4d4ad501f` |
+| **DMG 直链下载（最新 v1.2.1）** | [**Pulsar-v1.2.1-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.2.1-macOS-arm64.dmg) |
+| **GitHub Release 发布页** | [Releases · v1.2.1](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.1) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
+| **SHA-256 校验值** | `ef31a939a48cb9584022c3b49859071b6590a60fbc5eb91517bfad72ed8d7bd8` |
 | **系统要求** | macOS 13.0+（Apple Silicon `arm64`），macOS 26/27 自动启用原生 Liquid Glass 液态玻璃材质 |
 
 ### 首次打开说明（本地 Ad-hoc 签名）
@@ -35,9 +35,21 @@ xattr -dr com.apple.quarantine /Applications/Pulsar.app
 可选校验下载完整性：
 
 ```bash
-shasum -a 256 Pulsar-v1.2.0-macOS-arm64.dmg
-# 应输出: d07e9d1999e42ada56fa4e7d93717593b200e5fb12a17bb1a6e70cf4d4ad501f  Pulsar-v1.2.0-macOS-arm64.dmg
+shasum -a 256 Pulsar-v1.2.1-macOS-arm64.dmg
+# 应输出: ef31a939a48cb9584022c3b49859071b6590a60fbc5eb91517bfad72ed8d7bd8  Pulsar-v1.2.1-macOS-arm64.dmg
 ```
+
+---
+
+## v1.2.1 修复与增强
+
+- **Antigravity 切号旋转全新 `writer_id`（阻断旧会话并发回写覆盖）**：
+  - 每次切换账号自动生成密码学随机 32 字节（43 字符 URL-safe Base64）全新 `writer_id` 且确保严格异于旧值，彻底阻断旧进程凭过期 `writer_id` 将旧 Token 静默写回覆盖新账号凭证。
+- **洁净重构凭证 Bundle 并同步更新 `id_token_email` 与双重回读校验**：
+  - 切号时从零干净构造目标凭证（保留合法 `auth_method`，同步写入目标 `id_token_email`、`id_token`、`token` 与 `expires_in`），彻底剥离旧账号残留字段，并对 Keychain `(gemini, antigravity)` 与镜像文件 `~/.gemini/jetski-standalone-oauth-token` 执行完整回读校验与失败自动回滚。
+- **精准识别 `agy.<timestamp>.old` 热更新二进制与 `agy-bridge` 零误伤热重载**：
+  - 完整识别 `agy`、`agy-desktop-helper` 及热更新重命名进程 `agy.<timestamp>.old`，同时严格排除第三方桥接守护进程 `agy-bridge`；存在交互终端 `agy`（含 `agy.*.old`）时仍安全拦截提示，绝不误杀在跑会话。
+  - 针对 `agy-bridge` 自动拉起的非交互后台 `agy acp`（`--process-per-session` / `--worker`）建立切号写后重载栅栏：完成新凭证原子写入与校验后仅温和发送一次 `SIGTERM` 触发无缝切换至新账号（全程 **0 `SIGKILL`**、绝不触碰 `agy-bridge`）。
 
 ---
 
