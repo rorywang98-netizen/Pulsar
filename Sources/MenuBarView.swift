@@ -219,6 +219,8 @@ public struct MenuBarView: View {
     @State private var inlineAPIKeyDraft: String = ""
     @State private var refreshSpinAngle: Double = 0
     @State private var showQuotaCustomizePopover: Bool = false
+    @State private var expandedCurveAccountKeys: Set<String> = []
+    @State private var selectedCurveRange: QuotaHistoryRange = .hours24
 
     // Popover live edge/corner drag resize state
     @State private var activeResizeEdge: PopoverResizeEdge? = nil
@@ -2614,6 +2616,7 @@ public struct MenuBarView: View {
     }
 
     private func accountCard(account: AccountRecord, provider: ProviderID) -> some View {
+        let _ = store.quotaHistoryRevision
         let snap = store.snapshot(for: provider, accountId: account.id)
         let isHovered = (hoveredAccountId == account.id)
         let isConfirmingRemove = (confirmRemoveAccountId == account.id)
@@ -2647,11 +2650,34 @@ public struct MenuBarView: View {
         let showRemoveInFootnoteRow = !showStandaloneFooter && focusFooter != nil
         let showRemoveInHeader = !showStandaloneFooter && focusFooter == nil && isHovered
 
+        let accountKey = QuotaHistoryStore.accountKey(provider: provider, accountId: account.id)
+        let canShowCurve = (snap?.status.isReady == true && !rawWindows.isEmpty)
+        let isCurveExpanded = canShowCurve && expandedCurveAccountKeys.contains(accountKey)
+        let curveConfig = snap.map {
+            curveWindowSelection(for: $0, preferredAntigravityPool: activeAgPool)
+        }
+        let sparklinePoints: [QuotaBurnPoint] = {
+            guard canShowCurve, let curveConfig else { return [] }
+            let previewSeries = store.quotaHistoryStore.analyze(
+                accountKey: accountKey,
+                range: .hours24,
+                preferredWindowIds: curveConfig.windowIds,
+                windowLabels: curveConfig.labels
+            )
+            return previewSeries.first(where: { $0.points.count >= 2 })?.points
+                ?? previewSeries.first?.points
+                ?? []
+        }()
+        let showCurveInFootnote = canShowCurve && focusFooter != nil
+        let showCurveInStandaloneFooter = canShowCurve && !showCurveInFootnote && showStandaloneFooter
+        let showCurveInHeader = canShowCurve && !showCurveInFootnote && !showCurveInStandaloneFooter
+
         let cardSpacing: CGFloat = isCompactCards ? 2.5 : 4.5
         let cardHPadding: CGFloat = isNarrowLayout
             ? (isCompactCards ? 8 : 8.5)
             : (isCompactCards ? 9 : 11)
         let cardVPadding: CGFloat = isCompactCards ? 5 : 7.5
+        let cardInnerWidth = max(240, popoverWidth - (isNarrowLayout ? 18 : 24) - cardHPadding * 2)
 
         return VStack(alignment: .leading, spacing: cardSpacing) {
             // Card top row: Optional 28x28 Avatar + Identity + Status / Quick Switch
@@ -2685,6 +2711,15 @@ public struct MenuBarView: View {
                 Spacer(minLength: 4)
 
                 HStack(spacing: 4) {
+                    if showCurveInHeader {
+                        curveTogglePill(
+                            accountKey: accountKey,
+                            sparklinePoints: sparklinePoints,
+                            isExpanded: isCurveExpanded,
+                            compact: true
+                        )
+                    }
+
                     if account.isBestRemaining {
                         bestRemainingBadge
                     }
@@ -2746,10 +2781,37 @@ public struct MenuBarView: View {
                 isHovered: isHovered,
                 accountId: account.id,
                 focusedAntigravityPool: isAgPoolFocused ? activeAgPool : nil,
-                missingFilteredAntigravityPool: missingFilteredAgPool ? activeAgPool : nil
+                missingFilteredAntigravityPool: missingFilteredAgPool ? activeAgPool : nil,
+                curveFootnoteAccountKey: showCurveInFootnote ? accountKey : nil,
+                curveFootnoteSparkline: sparklinePoints,
+                isCurveExpanded: isCurveExpanded
             )
 
-            // Compact footer: source label + hover-revealed remove / inline confirmation
+            // Inline expandable Quota History & Burn-Rate Curve (zero extra card height when collapsed)
+            if isCurveExpanded, let curveConfig {
+                let series = store.quotaHistoryStore.analyze(
+                    accountKey: accountKey,
+                    range: selectedCurveRange,
+                    preferredWindowIds: curveConfig.windowIds,
+                    windowLabels: curveConfig.labels
+                )
+                QuotaCurvePanelView(
+                    seriesList: series,
+                    selectedRange: selectedCurveRange,
+                    onSelectRange: { newRange in
+                        withAnimation(OrbitMotion.pill) {
+                            selectedCurveRange = newRange
+                        }
+                    },
+                    poolBadgeText: curveConfig.poolBadge,
+                    compact: isCompactCards || isNarrowLayout,
+                    availableWidth: cardInnerWidth
+                )
+                .padding(.top, isCompactCards ? 2 : 3)
+                .transition(OrbitMotion.panelTransition)
+            }
+
+            // Compact footer: source label + curve toggle + hover-revealed remove / inline confirmation
             if showStandaloneFooter {
                 HStack(spacing: 6) {
                     if hasSourceBadge, let snap {
@@ -2761,12 +2823,21 @@ public struct MenuBarView: View {
                     if isConfirmingRemove {
                         inlineRemoveConfirmation(account: account, provider: provider)
                     } else {
+                        if showCurveInStandaloneFooter {
+                            curveTogglePill(
+                                accountKey: accountKey,
+                                sparklinePoints: sparklinePoints,
+                                isExpanded: isCurveExpanded,
+                                compact: isNarrowLayout
+                            )
+                        }
                         hoverRemovePillButton(accountId: account.id, isHovered: isHovered)
                     }
                 }
                 .frame(minHeight: isCompactCards ? 14 : 16)
             }
         }
+        .animation(OrbitMotion.snappy, value: isCurveExpanded)
         .padding(.horizontal, cardHPadding)
         .padding(.vertical, cardVPadding)
         .orbitCardStyle(
@@ -3157,7 +3228,10 @@ public struct MenuBarView: View {
         isHovered: Bool,
         accountId: String,
         focusedAntigravityPool: AntigravityPoolPreference? = nil,
-        missingFilteredAntigravityPool: AntigravityPoolPreference? = nil
+        missingFilteredAntigravityPool: AntigravityPoolPreference? = nil,
+        curveFootnoteAccountKey: String? = nil,
+        curveFootnoteSparkline: [QuotaBurnPoint] = [],
+        isCurveExpanded: Bool = false
     ) -> some View {
         if let snapshot {
             switch snapshot.status {
@@ -3198,20 +3272,29 @@ public struct MenuBarView: View {
                         }
 
                         if let focusFooter {
-                            HStack(spacing: 6) {
+                            HStack(spacing: 5) {
                                 Text(focusFooter.text)
                                     .font(.system(size: isCompactCards ? 10 : 10.5))
                                     .monospacedDigit()
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
-                                    .minimumScaleFactor(0.85)
+                                    .minimumScaleFactor(0.82)
                                     .truncationMode(.tail)
                                     .help(focusFooter.tooltip)
 
-                                Spacer(minLength: 0)
+                                Spacer(minLength: 2)
 
                                 if showInlineRemoveOnFootnote && isHovered {
                                     hoverRemovePillButton(accountId: accountId, isHovered: isHovered)
+                                }
+
+                                if let curveKey = curveFootnoteAccountKey {
+                                    curveTogglePill(
+                                        accountKey: curveKey,
+                                        sparklinePoints: curveFootnoteSparkline,
+                                        isExpanded: isCurveExpanded,
+                                        compact: isNarrowLayout
+                                    )
                                 }
                             }
                             .frame(minHeight: isCompactCards ? 14 : 16)
@@ -3803,10 +3886,29 @@ public struct MenuBarView: View {
 
     @ViewBuilder
     private func readySingleProviderBody(provider: ProviderID, snapshot: QuotaSnapshot, fetchedAt: Date) -> some View {
+        let _ = store.quotaHistoryRevision
         let cfg = accountCardConfig
         let visibleWindows = filteredVisibleWindows(from: snapshot.windows)
         let primaryWindow = visibleWindows.first(where: { $0.isPrimary }) ?? visibleWindows.first
         let heroFontSize: CGFloat = isCompactCards ? 25 : 30
+        let accountKey = QuotaHistoryStore.accountKey(provider: provider, accountId: snapshot.accountId)
+        let canShowCurve = !snapshot.windows.isEmpty
+        let isCurveExpanded = canShowCurve && expandedCurveAccountKeys.contains(accountKey)
+        let curveConfig = curveWindowSelection(for: snapshot, preferredAntigravityPool: .autoLowest)
+        let sparklinePoints: [QuotaBurnPoint] = {
+            guard canShowCurve else { return [] }
+            let previewSeries = store.quotaHistoryStore.analyze(
+                accountKey: accountKey,
+                range: .hours24,
+                preferredWindowIds: curveConfig.windowIds,
+                windowLabels: curveConfig.labels
+            )
+            return previewSeries.first(where: { $0.points.count >= 2 })?.points
+                ?? previewSeries.first?.points
+                ?? []
+        }()
+        let singleCardPad: CGFloat = isCompactCards ? (isNarrowLayout ? 9 : 10) : (isNarrowLayout ? 11 : 13)
+        let cardInnerWidth = max(240, popoverWidth - (isNarrowLayout ? 18 : 24) - singleCardPad * 2)
 
         VStack(alignment: .leading, spacing: isCompactCards ? 8 : 12) {
             if snapshot.windows.isEmpty, let balance = snapshot.balance {
@@ -3965,19 +4067,193 @@ public struct MenuBarView: View {
                 }
             }
 
-            HStack {
+            if isCurveExpanded {
+                let series = store.quotaHistoryStore.analyze(
+                    accountKey: accountKey,
+                    range: selectedCurveRange,
+                    preferredWindowIds: curveConfig.windowIds,
+                    windowLabels: curveConfig.labels
+                )
+                QuotaCurvePanelView(
+                    seriesList: series,
+                    selectedRange: selectedCurveRange,
+                    onSelectRange: { newRange in
+                        withAnimation(OrbitMotion.pill) {
+                            selectedCurveRange = newRange
+                        }
+                    },
+                    poolBadgeText: curveConfig.poolBadge,
+                    compact: isCompactCards || isNarrowLayout,
+                    availableWidth: cardInnerWidth
+                )
+                .transition(OrbitMotion.panelTransition)
+            }
+
+            HStack(spacing: 6) {
                 Text("最近同步：\(store.relativeTimeAgoString(since: fetchedAt))")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
-                Spacer()
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if canShowCurve {
+                    curveTogglePill(
+                        accountKey: accountKey,
+                        sparklinePoints: sparklinePoints,
+                        isExpanded: isCurveExpanded,
+                        compact: isNarrowLayout
+                    )
+                }
                 if provider.supportsAPIKeyConfig {
                     let configured = store.apiKeyConfiguredMap[provider] ?? false
                     Text(configured ? "密钥状态：已配置" : "密钥状态：未配置")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(configured ? Color(nsColor: .systemGreen) : Color(nsColor: .systemOrange))
+                        .lineLimit(1)
                 }
             }
         }
+        .animation(OrbitMotion.snappy, value: isCurveExpanded)
+    }
+
+    // MARK: - Quota Curve Helpers & Toggle Pill
+
+    private func curveWindowSelection(
+        for snapshot: QuotaSnapshot,
+        preferredAntigravityPool: AntigravityPoolPreference
+    ) -> (windowIds: [String], labels: [String: String], poolBadge: String?) {
+        var labels: [String: String] = [:]
+        for w in snapshot.windows {
+            labels[w.id] = w.label
+        }
+
+        if snapshot.provider == .antigravity {
+            let scopedWindows: [QuotaWindow]
+            let resolvedPool: AntigravityPoolPreference?
+
+            if preferredAntigravityPool != .autoLowest {
+                let matched = snapshot.windows.filter {
+                    AppStore.isAntigravityWindowMatchingPool($0, pool: preferredAntigravityPool)
+                }
+                if !matched.isEmpty {
+                    scopedWindows = matched
+                    resolvedPool = preferredAntigravityPool
+                } else {
+                    scopedWindows = snapshot.windows
+                    resolvedPool = nil
+                }
+            } else {
+                let nonFull = snapshot.windows.filter { $0.remainingFraction < 0.999 }
+                let anchorPool = nonFull.isEmpty ? snapshot.windows : nonFull
+                let anchor = anchorPool.min { lhs, rhs in
+                    if abs(lhs.remainingFraction - rhs.remainingFraction) > 0.005 {
+                        return lhs.remainingFraction < rhs.remainingFraction
+                    }
+                    return lhs.isPrimary && !rhs.isPrimary
+                }
+                if let anchorKind = anchor?.antigravityPoolKind {
+                    scopedWindows = snapshot.windows.filter { $0.antigravityPoolKind == anchorKind }
+                    resolvedPool = anchorKind
+                } else {
+                    scopedWindows = snapshot.windows
+                    resolvedPool = nil
+                }
+            }
+
+            let ordered = scopedWindows.sorted { lhs, rhs in
+                if lhs.cadence.rawValue != rhs.cadence.rawValue {
+                    return lhs.cadence.rawValue < rhs.cadence.rawValue
+                }
+                return lhs.isPrimary && !rhs.isPrimary
+            }
+            let badge: String? = resolvedPool.map { agPoolHumanName($0) }
+            return (Array(ordered.prefix(2).map(\.id)), labels, badge)
+        }
+
+        if snapshot.provider == .codex {
+            let core = snapshot.windows.filter { !$0.id.lowercased().hasPrefix("add_") }
+            let base = core.isEmpty ? snapshot.windows : core
+            let ordered = base.sorted { lhs, rhs in
+                if lhs.cadence.rawValue != rhs.cadence.rawValue {
+                    return lhs.cadence.rawValue < rhs.cadence.rawValue
+                }
+                return lhs.isPrimary && !rhs.isPrimary
+            }
+            return (Array(ordered.prefix(2).map(\.id)), labels, nil)
+        }
+
+        let ordered = snapshot.windows.sorted { lhs, rhs in
+            if lhs.isPrimary != rhs.isPrimary {
+                return lhs.isPrimary && !rhs.isPrimary
+            }
+            return lhs.cadence.rawValue < rhs.cadence.rawValue
+        }
+        return (Array(ordered.prefix(2).map(\.id)), labels, nil)
+    }
+
+    private func curveTogglePill(
+        accountKey: String,
+        sparklinePoints: [QuotaBurnPoint],
+        isExpanded: Bool,
+        compact: Bool
+    ) -> some View {
+        let isDark = (colorScheme == .dark)
+        let accentTint = Color(red: 0.23, green: 0.51, blue: 0.96)
+        let hasSparkline = sparklinePoints.count >= 2
+
+        return Button {
+            withAnimation(OrbitMotion.snappy) {
+                if expandedCurveAccountKeys.contains(accountKey) {
+                    expandedCurveAccountKeys.remove(accountKey)
+                } else {
+                    expandedCurveAccountKeys.insert(accountKey)
+                }
+            }
+        } label: {
+            HStack(spacing: compact ? 3 : 4) {
+                if hasSparkline {
+                    QuotaMiniSparklineView(
+                        points: sparklinePoints,
+                        tint: isExpanded ? .accentColor : accentTint
+                    )
+                    .frame(width: 28, height: 12)
+                } else {
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundColor(isExpanded ? .accentColor : .secondary)
+                }
+
+                Text("曲线")
+                    .font(.system(size: compact ? 9 : 9.5, weight: isExpanded ? .semibold : .medium))
+                    .foregroundColor(isExpanded ? .accentColor : .secondary)
+                    .lineLimit(1)
+
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 7.5, weight: .semibold))
+                    .foregroundColor(isExpanded ? .accentColor : .secondary.opacity(0.8))
+            }
+            .padding(.horizontal, compact ? 5 : 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule()
+                    .fill(
+                        isExpanded
+                            ? Color.accentColor.opacity(isDark ? 0.20 : 0.12)
+                            : Color.primary.opacity(isDark ? 0.08 : 0.05)
+                    )
+            )
+            .overlay(
+                Capsule()
+                    .stroke(
+                        isExpanded
+                            ? Color.accentColor.opacity(isDark ? 0.42 : 0.28)
+                            : Color.primary.opacity(isDark ? 0.12 : 0.08),
+                        lineWidth: 0.6
+                    )
+            )
+        }
+        .orbitInteractiveButton(pressedScale: 0.94, hoverTint: nil, cornerRadius: 99)
+        .fixedSize(horizontal: true, vertical: false)
+        .help(isExpanded ? "收起额度消耗曲线" : "展开额度消耗与时段掉额曲线")
     }
 
     private func supplementaryBalanceCard(_ balance: BalanceInfo, compact: Bool) -> some View {
@@ -4471,5 +4747,939 @@ public struct MenuBarView: View {
         .padding(.horizontal, isNarrowLayout ? 10 : 13)
         .padding(.top, 7)
         .padding(.bottom, 9)
+    }
+}
+
+// MARK: - Inline Mini Quota Sparkline (28x12pt)
+
+public struct QuotaMiniSparklineView: View {
+    public let points: [QuotaBurnPoint]
+    public var tint: Color
+
+    public init(
+        points: [QuotaBurnPoint],
+        tint: Color = Color(red: 0.23, green: 0.51, blue: 0.96)
+    ) {
+        self.points = points
+        self.tint = tint
+    }
+
+    public var body: some View {
+        Canvas { context, size in
+            guard points.count >= 2, size.width > 2, size.height > 2 else { return }
+            let sorted = points.sorted { $0.timestamp < $1.timestamp }
+            let minT = sorted.first!.timestamp.timeIntervalSince1970
+            let maxT = sorted.last!.timestamp.timeIntervalSince1970
+            let spanT = max(maxT - minT, 1.0)
+
+            let padX: CGFloat = 1.2
+            let padY: CGFloat = 1.5
+            let plotW = max(1, size.width - padX * 2)
+            let plotH = max(1, size.height - padY * 2)
+
+            var path = Path()
+            var lastPoint: CGPoint = .zero
+            for (idx, pt) in sorted.enumerated() {
+                let fracX = CGFloat((pt.timestamp.timeIntervalSince1970 - minT) / spanT)
+                let fracY = CGFloat(min(max(pt.remainingPercent / 100.0, 0.0), 1.0))
+                let x = padX + fracX * plotW
+                let y = padY + (1.0 - fracY) * plotH
+                let cgPt = CGPoint(x: x, y: y)
+                if idx == 0 {
+                    path.move(to: cgPt)
+                } else {
+                    path.addLine(to: cgPt)
+                }
+                lastPoint = cgPt
+            }
+
+            context.stroke(
+                path,
+                with: .color(tint.opacity(0.92)),
+                style: StrokeStyle(lineWidth: 1.35, lineCap: .round, lineJoin: .round)
+            )
+
+            let dotRect = CGRect(x: lastPoint.x - 1.5, y: lastPoint.y - 1.5, width: 3.0, height: 3.0)
+            context.fill(Path(ellipseIn: dotRect), with: .color(tint))
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Expandable Liquid Glass Quota Curve & Hourly Burn Panel
+
+public struct QuotaCurvePanelView: View {
+    public let seriesList: [QuotaBurnSeries]
+    public let selectedRange: QuotaHistoryRange
+    public let onSelectRange: (QuotaHistoryRange) -> Void
+    public var poolBadgeText: String?
+    public var referenceNow: Date
+    public var compact: Bool
+    public var availableWidth: CGFloat
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var scrubbedFraction: Double? = nil
+
+    private static let primaryBlue = Color(red: 0.23, green: 0.51, blue: 0.96)
+    private static let secondaryEmerald = Color(red: 0.06, green: 0.72, blue: 0.50)
+    private static let tertiaryPurple = Color(red: 0.58, green: 0.40, blue: 0.96)
+
+    public init(
+        seriesList: [QuotaBurnSeries],
+        selectedRange: QuotaHistoryRange,
+        onSelectRange: @escaping (QuotaHistoryRange) -> Void,
+        poolBadgeText: String? = nil,
+        referenceNow: Date = Date(),
+        compact: Bool = false,
+        availableWidth: CGFloat = 350
+    ) {
+        self.seriesList = seriesList
+        self.selectedRange = selectedRange
+        self.onSelectRange = onSelectRange
+        self.poolBadgeText = poolBadgeText
+        self.referenceNow = referenceNow
+        self.compact = compact
+        self.availableWidth = availableWidth
+    }
+
+    private var maxSampleCount: Int {
+        seriesList.map(\.points.count).max() ?? 0
+    }
+
+    private var primaryBurnSeries: QuotaBurnSeries? {
+        if let fiveH = seriesList.first(where: { Self.shortLegendTitle(for: $0) == "5h" && $0.points.count >= 2 }) {
+            return fiveH
+        }
+        return seriesList.first(where: { $0.points.count >= 2 }) ?? seriesList.first
+    }
+
+    private var effectiveRangeBounds: (start: Date, end: Date) {
+        let latestSample = seriesList.compactMap { $0.points.last?.timestamp }.max()
+        let end = max(referenceNow, latestSample ?? referenceNow)
+        let start = end.addingTimeInterval(-selectedRange.durationSeconds)
+        return (start, end)
+    }
+
+    private var isUltraNarrow: Bool {
+        availableWidth < 335
+    }
+
+    private var panelBackground: Color {
+        colorScheme == .dark ? Color.white.opacity(0.052) : Color.black.opacity(0.030)
+    }
+
+    private var panelBorder: Color {
+        colorScheme == .dark ? Color.white.opacity(0.11) : Color.black.opacity(0.075)
+    }
+
+    public var body: some View {
+        let pad: CGFloat = compact ? 7.5 : 9
+
+        VStack(alignment: .leading, spacing: compact ? 6 : 7.5) {
+            headerControlBar
+
+            if maxSampleCount < 2 {
+                dayZeroWaitingState
+            } else {
+                let bounds = effectiveRangeBounds
+                let scrubbedDate: Date? = scrubbedFraction.map { frac in
+                    let clamped = min(max(frac, 0.0), 1.0)
+                    return bounds.start.addingTimeInterval(selectedRange.durationSeconds * clamped)
+                }
+
+                scrubbingStatusStrip(scrubbedDate: scrubbedDate)
+
+                remainingCurveCanvas(bounds: bounds, scrubbedDate: scrubbedDate)
+
+                timeAxisRow(bounds: bounds)
+
+                if let burnSeries = primaryBurnSeries, !burnSeries.buckets.isEmpty {
+                    bucketBurnBarSection(
+                        series: burnSeries,
+                        bounds: bounds,
+                        scrubbedDate: scrubbedDate
+                    )
+                }
+
+                if let burnSeries = primaryBurnSeries {
+                    peakBurnCalloutRow(series: burnSeries)
+                }
+            }
+        }
+        .padding(pad)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(panelBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(panelBorder, lineWidth: 0.7)
+        )
+    }
+
+    // MARK: Header: Legend + Pool Tag + Range Pills
+
+    @ViewBuilder
+    private var headerControlBar: some View {
+        if isUltraNarrow {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                    legendCluster
+                    Spacer(minLength: 4)
+                    rangeSegmentedControl
+                }
+            }
+        } else {
+            HStack(alignment: .center, spacing: 6) {
+                legendCluster
+                Spacer(minLength: 4)
+                rangeSegmentedControl
+            }
+        }
+    }
+
+    private var legendCluster: some View {
+        HStack(spacing: isUltraNarrow ? 4 : 6) {
+            if let pool = poolBadgeText, !pool.isEmpty {
+                Text(pool)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(Color.accentColor.opacity(colorScheme == .dark ? 0.18 : 0.11))
+                    .clipShape(Capsule())
+                    .lineLimit(1)
+            }
+
+            if seriesList.isEmpty {
+                HStack(spacing: 3.5) {
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Text("额度曲线")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            } else {
+                ForEach(Array(seriesList.prefix(2).enumerated()), id: \.element.id) { idx, series in
+                    let color = Self.seriesColor(for: series, index: idx)
+                    let title = Self.shortLegendTitle(for: series)
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(color)
+                            .frame(width: 5.5, height: 5.5)
+                        Text(title)
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.primary.opacity(0.84))
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+    }
+
+    private var rangeSegmentedControl: some View {
+        let isDark = (colorScheme == .dark)
+        return HStack(spacing: 1.5) {
+            ForEach(QuotaHistoryRange.allCases) { range in
+                let isSelected = (selectedRange == range)
+                Button {
+                    scrubbedFraction = nil
+                    onSelectRange(range)
+                } label: {
+                    Text(range.displayName)
+                        .font(.system(size: isUltraNarrow ? 9 : 9.5, weight: isSelected ? .semibold : .medium))
+                        .foregroundColor(isSelected ? .primary : .secondary)
+                        .padding(.horizontal, isUltraNarrow ? 5 : 6.5)
+                        .padding(.vertical, 2.5)
+                        .background {
+                            if isSelected {
+                                Capsule()
+                                    .fill(isDark ? Color.white.opacity(0.18) : Color.white.opacity(0.88))
+                                    .shadow(color: Color.black.opacity(isDark ? 0.22 : 0.08), radius: 1.2, y: 0.5)
+                            }
+                        }
+                        .contentShape(Capsule())
+                }
+                .orbitInteractiveButton(
+                    pressedScale: 0.96,
+                    hoverTint: isSelected ? nil : Color.primary.opacity(0.04),
+                    cornerRadius: 99
+                )
+            }
+        }
+        .padding(2)
+        .background(Capsule().fill(Color.primary.opacity(isDark ? 0.09 : 0.055)))
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    // MARK: Day-0 Waiting State (< 2 Samples)
+
+    private var dayZeroWaitingState: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if maxSampleCount == 1 {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Self.primaryBlue)
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text("已记录 1 个采样点，等待下次刷新生成曲线")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(.primary.opacity(0.88))
+                            .fixedSize(horizontal: false, vertical: true)
+                        let currentSummary = seriesList.prefix(2).compactMap { series -> String? in
+                            guard let pt = series.points.last else { return nil }
+                            return "\(Self.shortLegendTitle(for: series)) \(Self.formatCompactNumber(pt.remainingPercent))%"
+                        }.joined(separator: " · ")
+                        if !currentSummary.isEmpty {
+                            Text("当前基准：\(currentSummary)")
+                                .font(.system(size: 9.5, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.secondary)
+                    Text("暂无该时段采样记录，刷新配额后自动追踪消耗曲线与掉额峰值")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 4)
+    }
+
+    // MARK: Interactive Scrubbing Readout
+
+    private func scrubbingStatusStrip(scrubbedDate: Date?) -> some View {
+        HStack(spacing: 6) {
+            if let scrubbedDate {
+                Text(Self.formatScrubTimestamp(scrubbedDate, range: selectedRange))
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.06))
+                    .clipShape(Capsule())
+
+                ForEach(Array(seriesList.prefix(2).enumerated()), id: \.element.id) { idx, series in
+                    if let nearest = Self.nearestPoint(in: series.points, to: scrubbedDate) {
+                        let color = Self.seriesColor(for: series, index: idx)
+                        HStack(spacing: 2.5) {
+                            Circle()
+                                .fill(color)
+                                .frame(width: 4.5, height: 4.5)
+                            Text("\(Self.shortLegendTitle(for: series)) \(Self.formatCompactNumber(nearest.remainingPercent))%")
+                                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundColor(.primary.opacity(0.9))
+                                .lineLimit(1)
+                        }
+                    }
+                }
+
+                Spacer(minLength: 2)
+
+                if let burnSeries = primaryBurnSeries,
+                   let bucket = burnSeries.buckets.first(where: { scrubbedDate >= $0.start && scrubbedDate < $0.end }),
+                   bucket.dropPercent >= 0.05 {
+                    Text("-\(Self.formatCompactNumber(bucket.dropPercent))%")
+                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundColor(Self.burnColor(for: bucket.dropPercent))
+                        .lineLimit(1)
+                }
+            } else {
+                Text("剩余额度曲线 (0%–100%)")
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Text("悬停查看明细")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary.opacity(0.72))
+                    .lineLimit(1)
+            }
+        }
+        .frame(minHeight: 14)
+    }
+
+    // MARK: Remaining-% Curve Canvas (0%–100% + Reset Markers + Crosshair)
+
+    private func remainingCurveCanvas(
+        bounds: (start: Date, end: Date),
+        scrubbedDate: Date?
+    ) -> some View {
+        let chartHeight: CGFloat = compact ? 80 : 92
+        let yAxisWidth: CGFloat = 26
+        let topPad: CGFloat = 11
+        let bottomPad: CGFloat = 5
+        let rightPad: CGFloat = 4
+        let isDark = (colorScheme == .dark)
+
+        let startSec = bounds.start.timeIntervalSince1970
+        let spanSec = max(bounds.end.timeIntervalSince(bounds.start), 60.0)
+
+        return GeometryReader { geo in
+            let totalW = max(60, geo.size.width)
+            let plotLeft = yAxisWidth
+            let plotW = max(20, totalW - plotLeft - rightPad)
+            let plotTop = topPad
+            let plotH = max(20, chartHeight - topPad - bottomPad)
+
+            ZStack {
+                Canvas { context, _ in
+                    // 1. Horizontal reference grid (100%, 50%, 0%)
+                    let gridLevels: [(pct: Double, label: String)] = [
+                        (100, "100%"),
+                        (50, "50%"),
+                        (0, "0%"),
+                    ]
+                    for level in gridLevels {
+                        let y = plotTop + (1.0 - CGFloat(level.pct / 100.0)) * plotH
+                        var line = Path()
+                        line.move(to: CGPoint(x: plotLeft, y: y))
+                        line.addLine(to: CGPoint(x: plotLeft + plotW, y: y))
+                        context.stroke(
+                            line,
+                            with: .color(Color.primary.opacity(level.pct == 0 ? 0.14 : 0.08)),
+                            style: StrokeStyle(
+                                lineWidth: 0.65,
+                                dash: level.pct == 50 ? [2.5, 2.5] : []
+                            )
+                        )
+
+                        let text = Text(level.label)
+                            .font(.system(size: 8, weight: .medium, design: .rounded))
+                            .foregroundColor(.secondary.opacity(0.78))
+                        context.draw(
+                            text,
+                            at: CGPoint(x: plotLeft - 4, y: y),
+                            anchor: .trailing
+                        )
+                    }
+
+                    // 2. Dashed emerald reset markers across plotted series
+                    let uniqueResets = Self.mergedResetMarkers(from: Array(seriesList.prefix(2)))
+                    for resetDate in uniqueResets {
+                        let frac = (resetDate.timeIntervalSince1970 - startSec) / spanSec
+                        guard frac >= 0.0 && frac <= 1.0 else { continue }
+                        let x = plotLeft + CGFloat(frac) * plotW
+
+                        var markerPath = Path()
+                        markerPath.move(to: CGPoint(x: x, y: plotTop))
+                        markerPath.addLine(to: CGPoint(x: x, y: plotTop + plotH))
+                        context.stroke(
+                            markerPath,
+                            with: .color(Self.secondaryEmerald.opacity(0.78)),
+                            style: StrokeStyle(lineWidth: 1.0, dash: [3, 2.5])
+                        )
+
+                        let labelX = min(max(x, plotLeft + 13), plotLeft + plotW - 13)
+                        let resetCaption = Text("重置")
+                            .font(.system(size: 7.5, weight: .semibold))
+                            .foregroundColor(Self.secondaryEmerald)
+                        context.draw(
+                            resetCaption,
+                            at: CGPoint(x: labelX, y: max(5, plotTop - 5.5)),
+                            anchor: .center
+                        )
+                    }
+
+                    // 3. Draw series (secondary first so primary 5h sits cleanly on top)
+                    let displayed = Array(seriesList.prefix(2).enumerated())
+                    for (idx, series) in displayed.reversed() {
+                        let color = Self.seriesColor(for: series, index: idx)
+                        let isPrimary = (idx == 0)
+                        let segments = Self.splitSegmentsAcrossResets(
+                            points: series.points,
+                            resetMarkers: series.resetMarkers
+                        )
+
+                        for segment in segments {
+                            let cgPts: [CGPoint] = segment.map { pt in
+                                let fx = min(max((pt.timestamp.timeIntervalSince1970 - startSec) / spanSec, 0.0), 1.0)
+                                let fy = min(max(pt.remainingPercent / 100.0, 0.0), 1.0)
+                                return CGPoint(
+                                    x: plotLeft + CGFloat(fx) * plotW,
+                                    y: plotTop + (1.0 - CGFloat(fy)) * plotH
+                                )
+                            }
+                            guard !cgPts.isEmpty else { continue }
+
+                            if cgPts.count == 1 {
+                                let p = cgPts[0]
+                                let r = CGRect(x: p.x - 2.2, y: p.y - 2.2, width: 4.4, height: 4.4)
+                                context.fill(Path(ellipseIn: r), with: .color(color))
+                                continue
+                            }
+
+                            let curvePath = Self.makeMonotoneCubicPath(points: cgPts, minY: plotTop, maxY: plotTop + plotH)
+
+                            // Area gradient fill under each contiguous segment
+                            var fillPath = curvePath
+                            fillPath.addLine(to: CGPoint(x: cgPts.last!.x, y: plotTop + plotH))
+                            fillPath.addLine(to: CGPoint(x: cgPts.first!.x, y: plotTop + plotH))
+                            fillPath.closeSubpath()
+
+                            let topAlpha: Double = isPrimary ? (isDark ? 0.24 : 0.18) : (isDark ? 0.12 : 0.09)
+                            context.fill(
+                                fillPath,
+                                with: .linearGradient(
+                                    Gradient(colors: [color.opacity(topAlpha), color.opacity(0.01)]),
+                                    startPoint: CGPoint(x: 0, y: plotTop),
+                                    endPoint: CGPoint(x: 0, y: plotTop + plotH)
+                                )
+                            )
+
+                            context.stroke(
+                                curvePath,
+                                with: .color(color),
+                                style: StrokeStyle(
+                                    lineWidth: isPrimary ? 1.85 : 1.55,
+                                    lineCap: .round,
+                                    lineJoin: .round
+                                )
+                            )
+                        }
+
+                        // Subtle sample point dots when sparse enough to read cleanly
+                        if series.points.count <= 24 {
+                            for pt in series.points {
+                                let fx = min(max((pt.timestamp.timeIntervalSince1970 - startSec) / spanSec, 0.0), 1.0)
+                                let fy = min(max(pt.remainingPercent / 100.0, 0.0), 1.0)
+                                let cx = plotLeft + CGFloat(fx) * plotW
+                                let cy = plotTop + (1.0 - CGFloat(fy)) * plotH
+                                let r = CGRect(x: cx - 1.7, y: cy - 1.7, width: 3.4, height: 3.4)
+                                context.fill(Path(ellipseIn: r), with: .color(color.opacity(0.9)))
+                            }
+                        }
+                    }
+
+                    // 4. Interactive crosshair + highlighted snap points
+                    if let scrubbedDate {
+                        let frac = min(max((scrubbedDate.timeIntervalSince1970 - startSec) / spanSec, 0.0), 1.0)
+                        let cx = plotLeft + CGFloat(frac) * plotW
+
+                        var guide = Path()
+                        guide.move(to: CGPoint(x: cx, y: plotTop))
+                        guide.addLine(to: CGPoint(x: cx, y: plotTop + plotH))
+                        context.stroke(
+                            guide,
+                            with: .color(Color.primary.opacity(isDark ? 0.42 : 0.32)),
+                            style: StrokeStyle(lineWidth: 0.9, dash: [2.5, 2])
+                        )
+
+                        for (idx, series) in displayed {
+                            guard let nearest = Self.nearestPoint(in: series.points, to: scrubbedDate) else { continue }
+                            let color = Self.seriesColor(for: series, index: idx)
+                            let fx = min(max((nearest.timestamp.timeIntervalSince1970 - startSec) / spanSec, 0.0), 1.0)
+                            let fy = min(max(nearest.remainingPercent / 100.0, 0.0), 1.0)
+                            let px = plotLeft + CGFloat(fx) * plotW
+                            let py = plotTop + (1.0 - CGFloat(fy)) * plotH
+
+                            let halo = CGRect(x: px - 4.5, y: py - 4.5, width: 9, height: 9)
+                            context.fill(Path(ellipseIn: halo), with: .color(color.opacity(0.24)))
+                            let core = CGRect(x: px - 2.6, y: py - 2.6, width: 5.2, height: 5.2)
+                            context.fill(Path(ellipseIn: core), with: .color(color))
+                            context.stroke(Path(ellipseIn: core), with: .color(Color.white.opacity(0.9)), lineWidth: 0.9)
+                        }
+                    }
+                }
+
+                // Transparent hover + drag scrubbing surface aligned to plot frame
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let loc):
+                            let frac = Double((loc.x - plotLeft) / plotW)
+                            scrubbedFraction = min(max(frac, 0.0), 1.0)
+                        case .ended:
+                            scrubbedFraction = nil
+                        }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                let frac = Double((value.location.x - plotLeft) / plotW)
+                                scrubbedFraction = min(max(frac, 0.0), 1.0)
+                            }
+                            .onEnded { _ in
+                                scrubbedFraction = nil
+                            }
+                    )
+            }
+        }
+        .frame(height: chartHeight)
+    }
+
+    // MARK: Time Axis Row
+
+    private func timeAxisRow(bounds: (start: Date, end: Date)) -> some View {
+        let mid = bounds.start.addingTimeInterval(bounds.end.timeIntervalSince(bounds.start) * 0.5)
+        return HStack {
+            Text(Self.formatAxisTick(bounds.start, range: selectedRange))
+            Spacer()
+            Text(Self.formatAxisTick(mid, range: selectedRange))
+            Spacer()
+            Text("现在")
+        }
+        .font(.system(size: 8.5, design: .rounded))
+        .monospacedDigit()
+        .foregroundColor(.secondary.opacity(0.75))
+        .padding(.leading, 26)
+        .padding(.trailing, 4)
+    }
+
+    // MARK: Bucket Burn-Rate Bar Chart (时段掉额柱状图)
+
+    private func bucketBurnBarSection(
+        series: QuotaBurnSeries,
+        bounds: (start: Date, end: Date),
+        scrubbedDate: Date?
+    ) -> some View {
+        let barHeight: CGFloat = compact ? 26 : 30
+        let leftInset: CGFloat = 26
+        let rightInset: CGFloat = 4
+        let maxDrop = max(series.buckets.map(\.dropPercent).max() ?? 0.0, 5.0)
+        let peakStart = series.peakBucket?.start
+        let startSec = bounds.start.timeIntervalSince1970
+        let spanSec = max(bounds.end.timeIntervalSince(bounds.start), 60.0)
+
+        return VStack(alignment: .leading, spacing: 3.5) {
+            HStack(spacing: 6) {
+                Text("时段掉额")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: isUltraNarrow ? 4 : 6) {
+                    burnLegendDot(color: Color(nsColor: .systemGreen), label: "<5%")
+                    burnLegendDot(color: Color(nsColor: .systemOrange), label: "5–15%")
+                    burnLegendDot(color: Color(nsColor: .systemRed), label: "≥15%")
+                }
+            }
+
+            GeometryReader { geo in
+                let totalW = max(60, geo.size.width)
+                let plotW = max(20, totalW - leftInset - rightInset)
+
+                ZStack {
+                    Canvas { context, _ in
+                        // Baseline
+                        var base = Path()
+                        base.move(to: CGPoint(x: leftInset, y: barHeight - 1))
+                        base.addLine(to: CGPoint(x: leftInset + plotW, y: barHeight - 1))
+                        context.stroke(base, with: .color(Color.primary.opacity(0.10)), lineWidth: 0.6)
+
+                        for bucket in series.buckets {
+                            let sFrac = min(max((bucket.start.timeIntervalSince1970 - startSec) / spanSec, 0.0), 1.0)
+                            let eFrac = min(max((bucket.end.timeIntervalSince1970 - startSec) / spanSec, 0.0), 1.0)
+                            guard eFrac > sFrac else { continue }
+
+                            let rawX = leftInset + CGFloat(sFrac) * plotW
+                            let rawW = CGFloat(eFrac - sFrac) * plotW
+                            let gap: CGFloat = rawW > 5 ? 1.5 : 0.6
+                            let barW = max(1.5, rawW - gap)
+                            let barX = rawX + gap * 0.5
+
+                            let isPeak = (peakStart != nil && bucket.start == peakStart && bucket.dropPercent >= 0.1)
+                            let isScrubbed: Bool = {
+                                guard let scrubbedDate else { return false }
+                                return scrubbedDate >= bucket.start && scrubbedDate < bucket.end
+                            }()
+
+                            if bucket.dropPercent < 0.05 {
+                                let tickRect = CGRect(x: barX, y: barHeight - 2.5, width: barW, height: 1.5)
+                                context.fill(
+                                    Path(roundedRect: tickRect, cornerRadius: 0.75),
+                                    with: .color(Color.primary.opacity(isScrubbed ? 0.25 : 0.10))
+                                )
+                            } else {
+                                let frac = min(max(bucket.dropPercent / maxDrop, 0.0), 1.0)
+                                let h = max(3.5, CGFloat(frac) * (barHeight - 3.5))
+                                let rect = CGRect(x: barX, y: barHeight - 1 - h, width: barW, height: h)
+                                let color = Self.burnColor(for: bucket.dropPercent)
+                                let opacity: Double = (isPeak || isScrubbed) ? 0.96 : 0.76
+                                context.fill(
+                                    Path(roundedRect: rect, cornerRadius: min(2.2, barW * 0.45)),
+                                    with: .color(color.opacity(opacity))
+                                )
+                                if isPeak || isScrubbed {
+                                    context.stroke(
+                                        Path(roundedRect: rect, cornerRadius: min(2.2, barW * 0.45)),
+                                        with: .color(Color.primary.opacity(0.28)),
+                                        lineWidth: 0.65
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let loc):
+                                let frac = Double((loc.x - leftInset) / plotW)
+                                scrubbedFraction = min(max(frac, 0.0), 1.0)
+                            case .ended:
+                                scrubbedFraction = nil
+                            }
+                        }
+                }
+            }
+            .frame(height: barHeight)
+        }
+    }
+
+    private func burnLegendDot(color: Color, label: String) -> some View {
+        HStack(spacing: 2.5) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(color.opacity(0.88))
+                .frame(width: 5.5, height: 5.5)
+            Text(label)
+                .font(.system(size: 8.5, design: .rounded))
+                .monospacedDigit()
+                .foregroundColor(.secondary.opacity(0.82))
+                .lineLimit(1)
+        }
+    }
+
+    // MARK: Peak Burn Callout Footer
+
+    private func peakBurnCalloutRow(series: QuotaBurnSeries) -> some View {
+        let calloutText: String
+        let accent: Color
+        if let peak = series.peakBucket, peak.dropPercent >= 0.1 {
+            let peakDrop = Self.formatCompactNumber(peak.dropPercent)
+            let avgRate = Self.formatRate(series.averageBurnPerHour)
+            let totalDrop = Self.formatCompactNumber(series.totalConsumedPercent)
+            calloutText = "⚡ 掉额最快：\(peak.label) (-\(peakDrop)%) · 均速 -\(avgRate)%/h · 累计 -\(totalDrop)%"
+            accent = Self.burnColor(for: peak.dropPercent)
+        } else {
+            calloutText = "⚡ 本时段额度平稳 · 均速 0%/h · 累计 0%"
+            accent = Color(nsColor: .systemGreen)
+        }
+
+        return HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(calloutText)
+                .font(.system(size: compact ? 9.5 : 10, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundColor(.primary.opacity(0.86))
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 6.5)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(accent.opacity(colorScheme == .dark ? 0.12 : 0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(accent.opacity(colorScheme == .dark ? 0.22 : 0.16), lineWidth: 0.55)
+        )
+    }
+
+    // MARK: Static Geometry & Formatting Helpers
+
+    private static func seriesColor(for series: QuotaBurnSeries, index: Int) -> Color {
+        let short = shortLegendTitle(for: series)
+        if short == "5h" { return primaryBlue }
+        if short == "周" || short == "月" { return secondaryEmerald }
+        switch index {
+        case 0: return primaryBlue
+        case 1: return secondaryEmerald
+        default: return tertiaryPurple
+        }
+    }
+
+    private static func burnColor(for dropPercent: Double) -> Color {
+        if dropPercent >= 15.0 {
+            return Color(nsColor: .systemRed)
+        }
+        if dropPercent >= 5.0 {
+            return Color(nsColor: .systemOrange)
+        }
+        return Color(nsColor: .systemGreen)
+    }
+
+    private static func shortLegendTitle(for series: QuotaBurnSeries) -> String {
+        let lowId = series.windowId.lowercased()
+        let lowLabel = series.label.lowercased()
+        if lowId.contains("5h") || lowLabel.contains("5小时") || lowLabel.contains("5 小时") || lowLabel.contains("5h") {
+            return "5h"
+        }
+        if lowId.contains("week") || lowId.contains("7d") || lowLabel.contains("周") || lowLabel.contains("7天") {
+            return "周"
+        }
+        if lowId.contains("month") || lowLabel.contains("月") {
+            return "月"
+        }
+        if lowId.contains("daily") || lowId.contains("1d") || lowLabel.contains("每日") {
+            return "日"
+        }
+        return String(series.label.prefix(8))
+    }
+
+    private static func mergedResetMarkers(from seriesList: [QuotaBurnSeries]) -> [Date] {
+        var all: [Date] = []
+        for s in seriesList {
+            all.append(contentsOf: s.resetMarkers)
+        }
+        all.sort()
+        var deduped: [Date] = []
+        for date in all {
+            if let last = deduped.last, abs(date.timeIntervalSince(last)) < 120 {
+                continue
+            }
+            deduped.append(date)
+        }
+        return deduped
+    }
+
+    private static func splitSegmentsAcrossResets(
+        points: [QuotaBurnPoint],
+        resetMarkers: [Date]
+    ) -> [[QuotaBurnPoint]] {
+        guard !points.isEmpty else { return [] }
+        guard !resetMarkers.isEmpty else { return [points] }
+        let resetSet = Set(resetMarkers.map { Int($0.timeIntervalSince1970.rounded()) })
+        var segments: [[QuotaBurnPoint]] = []
+        var current: [QuotaBurnPoint] = []
+
+        for pt in points {
+            let key = Int(pt.timestamp.timeIntervalSince1970.rounded())
+            if !current.isEmpty && resetSet.contains(key) {
+                segments.append(current)
+                current = [pt]
+            } else {
+                current.append(pt)
+            }
+        }
+        if !current.isEmpty {
+            segments.append(current)
+        }
+        return segments
+    }
+
+    /// Monotone-clamped cubic Bezier curve that stays strictly within `[minY, maxY]` with zero overshoot.
+    private static func makeMonotoneCubicPath(
+        points: [CGPoint],
+        minY: CGFloat,
+        maxY: CGFloat
+    ) -> Path {
+        var path = Path()
+        guard let first = points.first else { return path }
+        path.move(to: first)
+        guard points.count > 1 else { return path }
+        if points.count == 2 {
+            path.addLine(to: points[1])
+            return path
+        }
+
+        let n = points.count
+        var slopes = [CGFloat](repeating: 0, count: n - 1)
+        for i in 0..<(n - 1) {
+            let dx = max(points[i + 1].x - points[i].x, 0.001)
+            slopes[i] = (points[i + 1].y - points[i].y) / dx
+        }
+
+        var tangents = [CGFloat](repeating: 0, count: n)
+        tangents[0] = slopes[0]
+        tangents[n - 1] = slopes[n - 2]
+        for i in 1..<(n - 1) {
+            if slopes[i - 1] * slopes[i] <= 0 {
+                tangents[i] = 0
+            } else {
+                tangents[i] = 0.5 * (slopes[i - 1] + slopes[i])
+            }
+        }
+
+        for i in 0..<(n - 1) {
+            let p0 = points[i]
+            let p1 = points[i + 1]
+            let dx = p1.x - p0.x
+            if dx <= 0.001 {
+                path.addLine(to: p1)
+                continue
+            }
+            let c1 = CGPoint(
+                x: p0.x + dx / 3.0,
+                y: min(max(p0.y + tangents[i] * dx / 3.0, minY), maxY)
+            )
+            let c2 = CGPoint(
+                x: p1.x - dx / 3.0,
+                y: min(max(p1.y - tangents[i + 1] * dx / 3.0, minY), maxY)
+            )
+            path.addCurve(to: p1, control1: c1, control2: c2)
+        }
+        return path
+    }
+
+    private static func nearestPoint(in points: [QuotaBurnPoint], to target: Date) -> QuotaBurnPoint? {
+        guard !points.isEmpty else { return nil }
+        return points.min { lhs, rhs in
+            abs(lhs.timestamp.timeIntervalSince(target)) < abs(rhs.timestamp.timeIntervalSince(target))
+        }
+    }
+
+    private static func formatAxisTick(_ date: Date, range: QuotaHistoryRange) -> String {
+        let comps = Calendar.current.dateComponents([.month, .day, .hour, .minute], from: date)
+        let m = comps.month ?? 1
+        let d = comps.day ?? 1
+        let h = comps.hour ?? 0
+        let min = comps.minute ?? 0
+        switch range {
+        case .hours6, .hours24:
+            return String(format: "%02d:%02d", h, min)
+        case .days7:
+            return String(format: "%02d/%02d", m, d)
+        }
+    }
+
+    private static func formatScrubTimestamp(_ date: Date, range: QuotaHistoryRange) -> String {
+        let comps = Calendar.current.dateComponents([.month, .day, .hour, .minute], from: date)
+        let m = comps.month ?? 1
+        let d = comps.day ?? 1
+        let h = comps.hour ?? 0
+        let min = comps.minute ?? 0
+        switch range {
+        case .hours6, .hours24:
+            return String(format: "%02d:%02d", h, min)
+        case .days7:
+            return String(format: "%02d/%02d %02d:%02d", m, d, h, min)
+        }
+    }
+
+    private static func formatCompactNumber(_ value: Double) -> String {
+        let rounded = (value * 10.0).rounded() / 10.0
+        if abs(rounded - rounded.rounded()) < 0.05 {
+            return String(format: "%.0f", rounded)
+        }
+        return String(format: "%.1f", rounded)
+    }
+
+    private static func formatRate(_ value: Double) -> String {
+        let rounded = (value * 10.0).rounded() / 10.0
+        if rounded >= 100.0 {
+            return String(format: "%.0f", rounded)
+        }
+        return String(format: "%.1f", rounded)
     }
 }

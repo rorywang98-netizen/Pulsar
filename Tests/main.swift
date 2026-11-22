@@ -5,6 +5,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import SQLite3
+import SwiftUI
 
 // MARK: - Minimal Standalone Test Runner
 
@@ -4582,7 +4583,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.2.3", "AppStore.appVersion must match v1.2.3")
+        T.expectEqual(AppStore.appVersion, "1.3.0", "AppStore.appVersion must match v1.3.0")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -8076,6 +8077,647 @@ private func testV123RegressionSuite() async {
     }
 }
 
+// MARK: - Test 20: v1.3.0 Regression Suite (QuotaHistoryStore & Burn-Rate Curve, AGY gen_metadata Recovery & CHECKPOINT Inheritance, Models-Default Breakdown UI)
+
+private func encodeProtoVarint(_ value: UInt64) -> Data {
+    var v = value
+    var out = Data()
+    repeat {
+        var byte = UInt8(v & 0x7F)
+        v >>= 7
+        if v != 0 { byte |= 0x80 }
+        out.append(byte)
+    } while v != 0
+    return out
+}
+
+private func encodeProtoLengthDelimited(field: UInt64, payload: Data) -> Data {
+    var out = Data()
+    out.append(encodeProtoVarint((field << 3) | 2))
+    out.append(encodeProtoVarint(UInt64(payload.count)))
+    out.append(payload)
+    return out
+}
+
+private func encodeProtoString(field: UInt64, value: String) -> Data {
+    encodeProtoLengthDelimited(field: field, payload: Data(value.utf8))
+}
+
+private func makeSyntheticAntigravityGenMetadataBlob(
+    baseModel: String?,
+    displayName: String?,
+    metadataMap: [(String, String)]
+) -> Data {
+    var inner = Data()
+    if let baseModel {
+        inner.append(encodeProtoString(field: 19, value: baseModel))
+    }
+    for (k, v) in metadataMap {
+        var entry = Data()
+        entry.append(encodeProtoString(field: 1, value: k))
+        entry.append(encodeProtoString(field: 2, value: v))
+        inner.append(encodeProtoLengthDelimited(field: 20, payload: entry))
+    }
+    if let displayName {
+        inner.append(encodeProtoString(field: 21, value: displayName))
+    }
+    return encodeProtoLengthDelimited(field: 1, payload: inner)
+}
+
+private func writeSyntheticGenMetadataDB(
+    at dbURL: URL,
+    rows: [(idx: Int, blob: Data)]
+) throws {
+    try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    var db: OpaquePointer?
+    let rc = sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil)
+    guard rc == SQLITE_OK, let db else {
+        if let db { sqlite3_close(db) }
+        throw NSError(domain: "V130TestSQLite", code: Int(rc))
+    }
+    defer { sqlite3_close(db) }
+
+    guard sqlite3_exec(db, "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);", nil, nil, nil) == SQLITE_OK else {
+        throw NSError(domain: "V130TestSQLite", code: 2)
+    }
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, "INSERT INTO gen_metadata (idx, data) VALUES (?, ?);", -1, &stmt, nil) == SQLITE_OK, let stmt else {
+        throw NSError(domain: "V130TestSQLite", code: 3)
+    }
+    defer { sqlite3_finalize(stmt) }
+
+    for row in rows {
+        sqlite3_reset(stmt)
+        sqlite3_bind_int64(stmt, 1, Int64(row.idx))
+        row.blob.withUnsafeBytes { raw in
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            _ = sqlite3_bind_blob(stmt, 2, raw.baseAddress, Int32(row.blob.count), transient)
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw NSError(domain: "V130TestSQLite", code: 4)
+        }
+    }
+}
+
+private func testV130RegressionSuite() async {
+    // 20.1 QuotaHistoryStore: 0600 atomic persistence, dedup vs 15m heartbeat, 7-day pruning, reset-jump exclusion, hourly peak burn math (`20:00–21:00 -24%`) & AppStore integration
+    await T.asyncSuite("V130.QuotaHistoryStorePersistenceAndBurnAnalysis") {
+        T.expectEqual(AppStore.appVersion, "1.3.0", "AppStore.appVersion must be 1.3.0")
+
+        let dir = try makeTempDir(prefix: "pulsar-v130-history")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let historyURL = dir.appendingPathComponent("quota-history.json", isDirectory: false)
+        let store = QuotaHistoryStore(fileURL: historyURL)
+
+        var shanghaiCal = Calendar(identifier: .gregorian)
+        shanghaiCal.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+
+        func makeDate(day: Int, hour: Int, minute: Int) -> Date {
+            var comps = DateComponents()
+            comps.calendar = shanghaiCal
+            comps.timeZone = shanghaiCal.timeZone
+            comps.year = 2026
+            comps.month = 11
+            comps.day = day
+            comps.hour = hour
+            comps.minute = minute
+            comps.second = 0
+            return shanghaiCal.date(from: comps)!
+        }
+
+        func makeSnap(
+            accountId: String = "acct-snow",
+            rem5h: Double,
+            remWeekly: Double,
+            reset5h: Date,
+            resetWeekly: Date,
+            status: QuotaStatus? = nil,
+            at ts: Date
+        ) -> QuotaSnapshot {
+            QuotaSnapshot(
+                provider: .antigravity,
+                accountId: accountId,
+                plan: PlanInfo(kind: .ultra, displayName: "Ultra"),
+                windows: [
+                    QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: rem5h / 100.0, resetAt: reset5h, windowSeconds: 18_000, isPrimary: true),
+                    QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: remWeekly / 100.0, resetAt: resetWeekly, windowSeconds: 604_800),
+                ],
+                status: status ?? .ready(fetchedAt: ts, stale: false),
+                primaryRemainingPercent: Int(rem5h.rounded())
+            )
+        }
+
+        let reset5hBase = makeDate(day: 22, hour: 21, minute: 5)
+        let reset5hAfter = makeDate(day: 23, hour: 2, minute: 5)
+        let resetWeekly = makeDate(day: 28, hour: 12, minute: 0)
+
+        // Ignored statuses: loading, failed, stale, empty windows
+        let t1800 = makeDate(day: 22, hour: 18, minute: 0)
+        T.expectEqual(store.record(snapshot: .loading(provider: .antigravity, accountId: "acct-snow"), now: t1800), false)
+        T.expectEqual(store.record(snapshot: .failed(provider: .antigravity, accountId: "acct-snow", sourceLabel: "err", message: "boom"), now: t1800), false)
+        T.expectEqual(store.record(snapshot: makeSnap(rem5h: 100, remWeekly: 90, reset5h: reset5hBase, resetWeekly: resetWeekly, status: .ready(fetchedAt: t1800, stale: true), at: t1800), now: t1800), false)
+        let emptyWinSnap = QuotaSnapshot(provider: .deepseek, accountId: "ds", windows: [], status: .ready(fetchedAt: t1800, stale: false))
+        T.expectEqual(store.record(snapshot: emptyWinSnap, now: t1800), false)
+
+        // First real sample at 18:00 (100% / 90%) -> recorded & atomic 0600 file written
+        T.expectEqual(store.record(snapshot: makeSnap(rem5h: 100, remWeekly: 90, reset5h: reset5hBase, resetWeekly: resetWeekly, at: t1800), now: t1800), true)
+        T.expect(FileManager.default.fileExists(atPath: historyURL.path), "quota-history.json must be persisted")
+        let perms = (try FileManager.default.attributesOfItem(atPath: historyURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        T.expectEqual(perms, 0o600, "quota-history.json must use strict 0600 permissions")
+
+        // Dedup: identical sample 2 min later -> skipped
+        let t1802 = makeDate(day: 22, hour: 18, minute: 2)
+        T.expectEqual(store.record(snapshot: makeSnap(rem5h: 100, remWeekly: 90, reset5h: reset5hBase, resetWeekly: resetWeekly, at: t1802), now: t1802), false)
+
+        // Dedup: sub-threshold 0.05% delta 4 min later -> skipped
+        let t1804 = makeDate(day: 22, hour: 18, minute: 4)
+        T.expectEqual(store.record(snapshot: makeSnap(rem5h: 99.95, remWeekly: 90, reset5h: reset5hBase, resetWeekly: resetWeekly, at: t1804), now: t1804), false)
+
+        // 15-minute heartbeat: identical sample at 18:15 -> recorded!
+        let t1815 = makeDate(day: 22, hour: 18, minute: 15)
+        T.expectEqual(store.record(snapshot: makeSnap(rem5h: 100, remWeekly: 90, reset5h: reset5hBase, resetWeekly: resetWeekly, at: t1815), now: t1815), true)
+
+        // Remaining series with 20:00–21:00 burning -24% + 21:05 reset jump (+44%)
+        let pointsSchedule: [(Date, Double, Double, Date)] = [
+            (makeDate(day: 22, hour: 19, minute: 0), 92.0, 88.0, reset5hBase),   // 18:00–19:00: -8%
+            (makeDate(day: 22, hour: 19, minute: 30), 84.0, 86.0, reset5hBase),  // 19:00–20:00: -8%
+            (makeDate(day: 22, hour: 20, minute: 0), 80.0, 85.0, reset5hBase),   // 19:00–20:00: -4% (total -12%)
+            (makeDate(day: 22, hour: 20, minute: 25), 68.0, 82.0, reset5hBase),  // 20:00–21:00: -12%
+            (makeDate(day: 22, hour: 20, minute: 55), 56.0, 79.0, reset5hBase),  // 20:00–21:00: -12% (total -24% PEAK!)
+            (makeDate(day: 22, hour: 21, minute: 5), 100.0, 79.0, reset5hAfter), // RESET (+44% & resetAt +5h) -> excluded from burn!
+            (makeDate(day: 22, hour: 21, minute: 35), 94.0, 78.0, reset5hAfter), // 21:00–22:00: -6%
+        ]
+        for (ts, r5, rw, rAt) in pointsSchedule {
+            T.expectEqual(store.record(snapshot: makeSnap(rem5h: r5, remWeekly: rw, reset5h: rAt, resetWeekly: resetWeekly, at: ts), now: ts), true)
+        }
+
+        // Reload from disk and verify full persistence + exact burn-rate analysis
+        let reloaded = QuotaHistoryStore(fileURL: historyURL)
+        let acctKey = QuotaHistoryStore.accountKey(provider: .antigravity, accountId: "acct-snow")
+        T.expectEqual(reloaded.samples(for: acctKey).count, 9, "reloaded store must contain all 9 recorded samples")
+
+        let analysisNow = makeDate(day: 22, hour: 21, minute: 45)
+        let series24h = reloaded.analyze(
+            accountKey: acctKey,
+            range: .hours24,
+            preferredWindowIds: ["gemini_5h", "gemini_weekly"],
+            now: analysisNow,
+            calendar: shanghaiCal
+        )
+        T.expectEqual(series24h.count, 2, "must produce series for both 5h and weekly windows")
+        let s5h = series24h[0]
+        T.expectEqual(s5h.windowId, "gemini_5h")
+        T.expectEqual(s5h.resetMarkers.count, 1, "must emit exactly 1 reset marker at 21:05")
+        T.expectEqual(s5h.resetMarkers.first, makeDate(day: 22, hour: 21, minute: 5))
+        T.expectEqual(s5h.peakBucket?.label, "20:00–21:00", "peak burn bucket must be 20:00–21:00")
+        T.expect(abs((s5h.peakBucket?.dropPercent ?? 0) - 24.0) < 0.05, "20:00–21:00 drop must be 24%, got \(s5h.peakBucket?.dropPercent ?? -1)")
+        T.expect(abs(s5h.totalConsumedPercent - 50.0) < 0.05, "total consumed must be 50% (excluding +44% reset), got \(s5h.totalConsumedPercent)")
+        T.expect(s5h.averageBurnPerHour > 13.0 && s5h.averageBurnPerHour < 15.0, "average burn rate must be ~13.95%/h, got \(s5h.averageBurnPerHour)")
+
+        let sWeekly = series24h[1]
+        T.expectEqual(sWeekly.windowId, "gemini_weekly")
+        T.expectEqual(sWeekly.resetMarkers.count, 0, "weekly window had no reset")
+        T.expect(abs(sWeekly.totalConsumedPercent - 12.0) < 0.05, "weekly total drop must be 12%, got \(sWeekly.totalConsumedPercent)")
+
+        // 6h & 7d range bucket sizing sanity
+        let series6h = reloaded.analyze(accountKey: acctKey, range: .hours6, preferredWindowIds: ["gemini_5h"], now: analysisNow, calendar: shanghaiCal)
+        T.expectEqual(series6h.count, 1)
+        T.expect((series6h[0].buckets.count) >= 12, "6h range must generate 30m buckets")
+        let series7d = reloaded.analyze(accountKey: acctKey, range: .days7, preferredWindowIds: ["gemini_5h"], now: analysisNow, calendar: shanghaiCal)
+        T.expectEqual(series7d.count, 1)
+        T.expect((series7d[0].buckets.count) >= 28, "7d range must generate 6h buckets")
+
+        // 7-day pruning + 900-sample per-account cap
+        let pruneStore = QuotaHistoryStore(fileURL: nil)
+        let pruneKey = QuotaHistoryStore.accountKey(provider: .antigravity, accountId: "acct-cap")
+        let eightDaysAgo = analysisNow.addingTimeInterval(-8 * 24 * 3600)
+        T.expectEqual(pruneStore.record(snapshot: makeSnap(accountId: "acct-cap", rem5h: 100, remWeekly: 100, reset5h: reset5hBase, resetWeekly: resetWeekly, at: eightDaysAgo), now: eightDaysAgo), true)
+        T.expectEqual(pruneStore.record(snapshot: makeSnap(accountId: "acct-cap", rem5h: 95, remWeekly: 99, reset5h: reset5hBase, resetWeekly: resetWeekly, at: analysisNow), now: analysisNow), true)
+        T.expectEqual(pruneStore.samples(for: pruneKey).count, 1, "samples older than 7 days must be pruned")
+
+        let capBase = analysisNow.addingTimeInterval(-3 * 24 * 3600)
+        for i in 0..<915 {
+            let ts = capBase.addingTimeInterval(Double(i) * 120.0)
+            let rem = Double(100 - (i % 50))
+            _ = pruneStore.record(snapshot: makeSnap(accountId: "acct-cap", rem5h: rem, remWeekly: 90, reset5h: reset5hBase, resetWeekly: resetWeekly, at: ts), now: ts)
+        }
+        T.expectEqual(pruneStore.samples(for: pruneKey).count, QuotaHistoryStore.maxSamplesPerAccount, "per-account history must cap cleanly at 900 samples")
+
+        // Verify AppStore.refreshProvider records ready snapshots and bumps quotaHistoryRevision
+        let regURL = dir.appendingPathComponent("registry.json")
+        let reg = RegistryData(accounts: [
+            AccountRecord(id: "codex-live", provider: .codex, email: "codex@example.com", displayName: "Codex Live", isActiveLive: true),
+        ])
+        try reg.save(to: regURL)
+        final class StaticQuotaAdapter: ProviderAdapter {
+            let id: ProviderID
+            let capabilities: ProviderCapability = []
+            let snap: QuotaSnapshot
+            init(provider: ProviderID, snap: QuotaSnapshot) {
+                self.id = provider
+                self.snap = snap
+            }
+            func detectClientStatus() async -> ClientRuntimeStatus { .notInstalled }
+            func syncLiveAccount(registry: inout RegistryData) async -> String? { snap.accountId }
+            func fetchQuota(for account: AccountRecord, isActiveLive: Bool) async -> QuotaSnapshot { snap }
+            func hasStoredAPIKey() -> Bool { false }
+            func saveAPIKey(_ key: String, label: String?) throws {}
+            func deleteAccountCredentials(accountId: String) throws {}
+        }
+        let codexSnap = QuotaSnapshot(
+            provider: .codex,
+            accountId: "codex-live",
+            windows: [
+                QuotaWindow(id: "5h", label: "5小时", remainingFraction: 0.77, resetAt: Date().addingTimeInterval(3600), windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "weekly", label: "本周", remainingFraction: 0.88, resetAt: Date().addingTimeInterval(3 * 86_400), windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: Date(), stale: false),
+            primaryRemainingPercent: 77
+        )
+        let appStore = await MainActor.run {
+            AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+                adapters: [.codex: StaticQuotaAdapter(provider: .codex, snap: codexSnap)],
+                registryURL: regURL,
+                startScheduler: false,
+                persistAccountPoolExport: false
+            )
+        }
+        let revBefore = await MainActor.run { appStore.quotaHistoryRevision }
+        await appStore.refreshProvider(.codex, persistExport: false)
+        let revAfter = await MainActor.run { appStore.quotaHistoryRevision }
+        let recordedCount = await MainActor.run {
+            appStore.quotaHistoryStore.samples(for: QuotaHistoryStore.accountKey(provider: .codex, accountId: "codex-live")).count
+        }
+        T.expectEqual(revAfter, revBefore + 1, "AppStore.refreshProvider must bump quotaHistoryRevision on new ready sample")
+        T.expectEqual(recordedCount, 1, "AppStore.refreshProvider must record fresh ready snapshot into quotaHistoryStore")
+    }
+
+    // 20.2 TokenUsageEngine: Antigravity gen_metadata protobuf decoder, read-only SQLite recovery & CHECKPOINT lastKnownModel inheritance
+    await T.asyncSuite("V130.AntigravityGenMetadataProtobufAndCheckpointRecovery") {
+        // 1. Direct protobuf wire parser verification across real Antigravity shapes & malformed inputs
+        let blobCarbon = makeSyntheticAntigravityGenMetadataBlob(
+            baseModel: "gemini-4-carbon",
+            displayName: "Gemini 4 Carbon (High)",
+            metadataMap: [("last_step_index", "0"), ("model_enum", "MODEL_PLACEHOLDER_M427")]
+        )
+        let parsedCarbon = TokenUsageEngine.parseAntigravityGenMetadataBlob(blobCarbon)
+        T.expectEqual(parsedCarbon.modelId, "gemini-4-carbon-high")
+        T.expectEqual(parsedCarbon.lastStepIndex, 0)
+
+        let blobNeon = makeSyntheticAntigravityGenMetadataBlob(
+            baseModel: "gemini-4-neon",
+            displayName: "Gemini 4 Neon (XHigh)",
+            metadataMap: [("last_step_index", "6"), ("model_enum", "MODEL_PLACEHOLDER_M535")]
+        )
+        let parsedNeon = TokenUsageEngine.parseAntigravityGenMetadataBlob(blobNeon)
+        T.expectEqual(parsedNeon.modelId, "gemini-4-neon-xhigh")
+        T.expectEqual(parsedNeon.lastStepIndex, 6)
+
+        let blobHydrogen = makeSyntheticAntigravityGenMetadataBlob(
+            baseModel: "gemini-4-hydrogen",
+            displayName: "Gemini 4 Hydrogen (XHigh)",
+            metadataMap: [("last_step_index", "12")]
+        )
+        let parsedHydrogen = TokenUsageEngine.parseAntigravityGenMetadataBlob(blobHydrogen)
+        T.expectEqual(parsedHydrogen.modelId, "gemini-4-hydrogen-xhigh")
+        T.expectEqual(parsedHydrogen.lastStepIndex, 12)
+
+        let blobClaude = makeSyntheticAntigravityGenMetadataBlob(
+            baseModel: "claude-opus-5-5-high",
+            displayName: "Claude Opus 5.5 (High)",
+            metadataMap: [("last_step_index", "20")]
+        )
+        let parsedClaude = TokenUsageEngine.parseAntigravityGenMetadataBlob(blobClaude)
+        T.expectEqual(parsedClaude.modelId, "claude-opus-5-5-high", "must NOT duplicate -high suffix when base model already ends with -high")
+        T.expectEqual(parsedClaude.lastStepIndex, 20)
+
+        let blobOrch = makeSyntheticAntigravityGenMetadataBlob(
+            baseModel: "gemini-pro-orchestrator",
+            displayName: "Orchestrator (Carbon)",
+            metadataMap: [("last_step_index", "24")]
+        )
+        let parsedOrch = TokenUsageEngine.parseAntigravityGenMetadataBlob(blobOrch)
+        T.expectEqual(parsedOrch.modelId, "gemini-pro-orchestrator", "non-tier parenthetical (Carbon) must not be appended")
+
+        let blobDisplayOnly = makeSyntheticAntigravityGenMetadataBlob(
+            baseModel: nil,
+            displayName: "Gemini 4 Neon (XHigh)",
+            metadataMap: [("last_step_index", "30")]
+        )
+        let parsedDisplayOnly = TokenUsageEngine.parseAntigravityGenMetadataBlob(blobDisplayOnly)
+        T.expectEqual(parsedDisplayOnly.modelId, "gemini-4-neon-xhigh", "field-21-only blob must still normalize to canonical model ID")
+        T.expectEqual(parsedDisplayOnly.lastStepIndex, 30)
+
+        // Malformed / truncated / extreme length varint blobs must fail closed without crashing
+        let malformedSamples: [Data] = [
+            Data(),
+            Data([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Data([0x0A, 0xFF, 0xFF, 0xFF, 0x7F, 0x01]), // huge length overflow
+            Data([0x0B, 0x01, 0x02]), // unsupported wire type 3
+        ]
+        for bad in malformedSamples {
+            let res = TokenUsageEngine.parseAntigravityGenMetadataBlob(bad)
+            T.expectEqual(res.modelId, nil, "malformed protobuf must safely return nil modelId")
+            T.expectEqual(res.lastStepIndex, nil, "malformed protobuf must safely return nil lastStepIndex")
+        }
+
+        // 2. End-to-end hermetic TokenUsageEngine scan with read-only SQLite recovery & CHECKPOINT inheritance
+        let tempHome = try makeTempDir(prefix: "pulsar-v130-agy-home")
+        let tempSupport = try makeTempDir(prefix: "pulsar-v130-agy-support")
+        defer {
+            try? FileManager.default.removeItem(at: tempHome)
+            try? FileManager.default.removeItem(at: tempSupport)
+        }
+
+        let agyRoot = tempHome.appendingPathComponent(".gemini/antigravity", isDirectory: true)
+        let convUUID = "conv-pre-nov19-test"
+        let dbURL = agyRoot.appendingPathComponent("conversations/\(convUUID).db", isDirectory: false)
+        try writeSyntheticGenMetadataDB(
+            at: dbURL,
+            rows: [
+                (idx: 0, blob: blobCarbon), // last_step_index=0 -> matches step_index=1
+                (idx: 1, blob: blobNeon),   // last_step_index=6 -> matches step_index=7
+            ]
+        )
+
+        let shanghaiTZ = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let todayKey = TokenFormatters.ymdString(from: Date(), timeZone: shanghaiTZ)
+        let ts1 = "\(todayKey)T09:00:00Z"
+        let ts2 = "\(todayKey)T09:01:00Z"
+        let ts3 = "\(todayKey)T09:02:00Z"
+        let ts4 = "\(todayKey)T09:03:00Z"
+
+        let transcript1URL = agyRoot
+            .appendingPathComponent("brain/\(convUUID)/.system_generated/logs/transcript.jsonl", isDirectory: false)
+        try FileManager.default.createDirectory(at: transcript1URL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let lines1 = [
+            #"{"step_index":0,"type":"USER_INPUT","created_at":"\#(ts1)"}"#,
+            #"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"\#(ts1)","input_tokens":10000,"cache_read_tokens":50000,"output_tokens":2000}"#,
+            #"{"step_index":7,"type":"PLANNER_RESPONSE","created_at":"\#(ts2)","input_tokens":15000,"cache_read_tokens":80000,"output_tokens":3000}"#,
+            #"{"step_index":8,"type":"CHECKPOINT","created_at":"\#(ts3)","input_tokens":4000,"cache_read_tokens":20000,"output_tokens":1000}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(lines1.utf8).write(to: transcript1URL)
+
+        // Second conversation with NO sibling DB, explicit model on PLANNER_RESPONSE + CHECKPOINT omitting model
+        let conv2UUID = "conv-nov22-checkpoint-test"
+        let transcript2URL = agyRoot
+            .appendingPathComponent("brain/\(conv2UUID)/.system_generated/logs/transcript.jsonl", isDirectory: false)
+        try FileManager.default.createDirectory(at: transcript2URL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let lines2 = [
+            #"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"\#(ts1)","model":"claude-opus-5-5-high","input_tokens":5000,"cache_read_tokens":30000,"output_tokens":1500}"#,
+            #"{"step_index":2,"type":"CHECKPOINT","created_at":"\#(ts2)","input_tokens":2000,"cache_read_tokens":10000,"output_tokens":500}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(lines2.utf8).write(to: transcript2URL)
+
+        let engine = TokenUsageEngine(
+            homeDirectoryURL: tempHome,
+            appSupportURL: tempSupport,
+            legacyTokenMonitorDirURL: tempSupport.appendingPathComponent("no-tm", isDirectory: true)
+        )
+        let snap1 = await engine.scanAndExportArchive(forceFullRescan: true)
+        let summary1 = snap1.summary(for: .allTime, clientFilter: .antigravity)
+
+        // Verify ZERO "unknown" models remain!
+        T.expectEqual(
+            summary1.byModel.contains(where: { $0.modelId.lowercased() == "unknown" }),
+            false,
+            "recovered Antigravity summary must contain ZERO 'unknown' model entries"
+        )
+        let carbonRow = summary1.byModel.first { $0.modelId == "gemini-4-carbon-high" }
+        let neonRow = summary1.byModel.first { $0.modelId == "gemini-4-neon-xhigh" }
+        let opusRow = summary1.byModel.first { $0.modelId == "claude-opus-5-5-high" }
+
+        T.expectEqual(carbonRow?.totals.totalTokens, 62_000, "step 1 must map to gemini-4-carbon-high (62K tok)")
+        T.expectEqual(neonRow?.totals.totalTokens, 123_000, "step 7 (98K) + inherited CHECKPOINT step 8 (25K) must map to gemini-4-neon-xhigh (123K tok)")
+        T.expectEqual(opusRow?.totals.totalTokens, 49_000, "conv2 PLANNER_RESPONSE (36.5K) + CHECKPOINT (12.5K) must map to claude-opus-5-5-high (49K tok)")
+        T.expect((neonRow?.totals.estimatedCostUSD ?? 0) > 0, "recovered model must produce accurate positive pricing")
+
+        // Verify strict read-only open created NO -wal or -shm sidecars next to conversations/<uuid>.db
+        T.expectEqual(FileManager.default.fileExists(atPath: dbURL.path + "-wal"), false, "read-only immutable open must NEVER create -wal")
+        T.expectEqual(FileManager.default.fileExists(atPath: dbURL.path + "-shm"), false, "read-only immutable open must NEVER create -shm")
+
+        // Incremental resume test: append a new CHECKPOINT line (no "model") to conv2 -> must resume antigravityLastModel from CachedFileState!
+        let appendedLine = #"{"step_index":3,"type":"CHECKPOINT","created_at":"\#(ts4)","input_tokens":1000,"cache_read_tokens":5000,"output_tokens":200}"# + "\n"
+        let handle = try FileHandle(forWritingTo: transcript2URL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(appendedLine.utf8))
+        try handle.close()
+
+        let snap2 = await engine.scanAndExportArchive(forceFullRescan: false)
+        let summary2 = snap2.summary(for: .allTime, clientFilter: .antigravity)
+        T.expectEqual(
+            summary2.byModel.contains(where: { $0.modelId.lowercased() == "unknown" }),
+            false,
+            "incremental CHECKPOINT resume must preserve antigravityLastModel with zero 'unknown'"
+        )
+        T.expectEqual(
+            summary2.byModel.first { $0.modelId == "claude-opus-5-5-high" }?.totals.totalTokens,
+            55_200,
+            "incremental CHECKPOINT (+6.2K) must add cleanly onto claude-opus-5-5-high"
+        )
+    }
+
+    // 20.3 UI NSHostingView Smoke Tests (340pt & 390pt): Models-Default Breakdown Tab + Share Progress Bars & QuotaCurvePanelView (0, 1, multi-sample + reset)
+    await T.asyncSuite("V130.UINSHostingViewSmokeTests") {
+        // BreakdownTab invariants: NO .clients tab, .models is first & default
+        T.expectEqual(TokenUsagePopoverView.BreakdownTab.allCases, [.models, .projects], "BreakdownTab must only contain [.models, .projects]")
+        T.expectEqual(TokenUsagePopoverView.defaultBreakdownTab, .models, "default breakdown tab must be .models")
+
+        let dir = try makeTempDir(prefix: "pulsar-v130-ui")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let regURL = dir.appendingPathComponent("registry.json")
+        let reg = RegistryData(accounts: [
+            AccountRecord(id: "agy-ui", provider: .antigravity, email: "snow@example.com", displayName: "Snow", isActiveLive: true),
+        ])
+        try reg.save(to: regURL)
+
+        let now = Date()
+        let reset5h = now.addingTimeInterval(3 * 3600)
+        let resetWeekly = now.addingTimeInterval(5 * 86_400)
+        let agySnap = QuotaSnapshot(
+            provider: .antigravity,
+            accountId: "agy-ui",
+            plan: PlanInfo(kind: .ultra, displayName: "Ultra"),
+            windows: [
+                QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: 0.68, resetAt: reset5h, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: 0.84, resetAt: resetWeekly, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now, stale: false),
+            primaryRemainingPercent: 68
+        )
+
+        let shanghaiTZ = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let todayKey = TokenFormatters.ymdString(from: now, timeZone: shanghaiTZ)
+        let agyTotals = TokenComponentTotals(totalTokens: 12_400_000, uncachedInputTokens: 1_200_000, outputTokens: 320_000, cacheReadTokens: 10_880_000, estimatedCostUSD: 10.52, messageCount: 48)
+        let codexTotals = TokenComponentTotals(totalTokens: 5_100_000, uncachedInputTokens: 600_000, outputTokens: 200_000, cacheReadTokens: 4_300_000, estimatedCostUSD: 4.60, messageCount: 22)
+        let combinedTotals = agyTotals.adding(codexTotals)
+        let todayRangeSummary = TokenRangeSummary(
+            range: .today,
+            startDate: todayKey,
+            endDate: todayKey,
+            totals: combinedTotals,
+            activeDays: 1,
+            totalDaysInRange: 1,
+            byClient: [
+                TokenClientBreakdown(client: .antigravity, totals: agyTotals, shareOfTokens: 12.4 / 17.5, activeDays: 1),
+                TokenClientBreakdown(client: .codex, totals: codexTotals, shareOfTokens: 5.1 / 17.5, activeDays: 1),
+            ],
+            byModel: [
+                TokenModelBreakdown(client: .antigravity, modelId: "gemini-4-neon-xhigh", providerId: "google", totals: agyTotals, shareOfTokens: 12.4 / 17.5),
+                TokenModelBreakdown(client: .codex, modelId: "gpt-6.2-sol", providerId: "openai", totals: codexTotals, shareOfTokens: 5.1 / 17.5),
+            ],
+            byProject: [
+                TokenProjectBreakdown(
+                    id: "/Users/rory/Tools/rory-orbit",
+                    projectName: "rory-orbit",
+                    pathDisplay: "~/Tools/rory-orbit",
+                    clients: [.antigravity],
+                    totals: agyTotals,
+                    shareOfTokens: 12.4 / 17.5,
+                    lastActiveDate: todayKey
+                ),
+            ],
+            dailySeries: []
+        )
+        let syntheticTokenSnap = TokenUsageSnapshot(
+            generatedAt: now,
+            lastScannedAt: now,
+            seedDaysCount: 0,
+            totalDaysCount: 1,
+            liveScannedFilesCount: 2,
+            archiveFileURLPath: dir.appendingPathComponent("daily-history-archive.json").path,
+            heatmap112Days: [],
+            allDays: [],
+            ranges: [
+                .today: todayRangeSummary,
+                .allTime: todayRangeSummary,
+            ]
+        )
+
+        let multiSampleStore = QuotaHistoryStore(fileURL: nil)
+        let acctKey = QuotaHistoryStore.accountKey(provider: .antigravity, accountId: "agy-ui")
+        let t0 = now.addingTimeInterval(-4 * 3600)
+        let t1 = now.addingTimeInterval(-3 * 3600)
+        let t2 = now.addingTimeInterval(-2 * 3600)
+        let t3 = now.addingTimeInterval(-1 * 3600)
+        let t4 = now.addingTimeInterval(-20 * 60)
+        let seq: [(Date, Double, Double, Date)] = [
+            (t0, 100, 92, reset5h.addingTimeInterval(-5 * 3600)),
+            (t1, 86, 90, reset5h.addingTimeInterval(-5 * 3600)),
+            (t2, 62, 87, reset5h.addingTimeInterval(-5 * 3600)),
+            (t3, 100, 87, reset5h), // reset!
+            (t4, 78, 84, reset5h),
+        ]
+        for (ts, r5, rw, rAt) in seq {
+            _ = multiSampleStore.record(
+                snapshot: QuotaSnapshot(
+                    provider: .antigravity,
+                    accountId: "agy-ui",
+                    windows: [
+                        QuotaWindow(id: "gemini_5h", label: "Gemini · 5小时", remainingFraction: r5 / 100.0, resetAt: rAt, windowSeconds: 18_000, isPrimary: true),
+                        QuotaWindow(id: "gemini_weekly", label: "Gemini · 周", remainingFraction: rw / 100.0, resetAt: resetWeekly, windowSeconds: 604_800),
+                    ],
+                    status: .ready(fetchedAt: ts, stale: false),
+                    primaryRemainingPercent: Int(r5)
+                ),
+                now: ts
+            )
+        }
+        let multiSeries = multiSampleStore.analyze(accountKey: acctKey, range: .hours24, preferredWindowIds: ["gemini_5h", "gemini_weekly"], now: now)
+        let oneSampleSeries = [
+            QuotaBurnSeries(
+                windowId: "gemini_5h",
+                label: "Gemini · 5小时",
+                points: [QuotaBurnPoint(timestamp: now, remainingPercent: 82.0)],
+                resetMarkers: [],
+                buckets: [],
+                peakBucket: nil,
+                totalConsumedPercent: 0,
+                averageBurnPerHour: 0
+            ),
+        ]
+
+        let hermeticEngine = TokenUsageEngine(
+            homeDirectoryURL: dir.appendingPathComponent("empty-home", isDirectory: true),
+            appSupportURL: dir.appendingPathComponent("empty-support", isDirectory: true),
+            legacyTokenMonitorDirURL: dir.appendingPathComponent("empty-tm", isDirectory: true)
+        )
+
+        await MainActor.run {
+            let app = NSApplication.shared
+            app.setActivationPolicy(.prohibited)
+
+            let store = AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+                adapters: [:],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: hermeticEngine,
+                persistAccountPoolExport: false,
+                quotaHistoryStore: multiSampleStore
+            )
+            store.snapshots[AppStore.snapshotKey(provider: .antigravity, accountId: "agy-ui")] = agySnap
+            store.tokenUsage = syntheticTokenSnap
+
+            @MainActor
+            func smokeHost<V: View>(_ view: V, width: CGFloat, height: CGFloat, fixedHeight: Bool, appearanceName: NSAppearance.Name, label: String) {
+                let framed: AnyView = fixedHeight
+                    ? AnyView(view.frame(width: width, height: height))
+                    : AnyView(view.frame(width: width))
+                let host = NSHostingView(rootView: framed)
+                host.appearance = NSAppearance(named: appearanceName)
+                host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+                host.layoutSubtreeIfNeeded()
+                let fit = host.fittingSize
+                T.expect(fit.width > 0 && fit.height > 0 && fit.width.isFinite && fit.height.isFinite, "\(label) @\(Int(width))pt must lay out with valid finite fittingSize (\(fit))")
+            }
+
+            // 1. TokenUsagePopoverView (defaults to .models with share progress bars) at 340pt, 390pt & 560pt in Light & Dark modes
+            for w in [CGFloat(340), CGFloat(390), CGFloat(560)] {
+                smokeHost(TokenUsagePopoverView(store: store), width: w, height: 620, fixedHeight: true, appearanceName: .aqua, label: "TokenUsagePopoverView.Light")
+                smokeHost(TokenUsagePopoverView(store: store), width: w, height: 620, fixedHeight: true, appearanceName: .darkAqua, label: "TokenUsagePopoverView.Dark")
+            }
+
+            // 2. QuotaCurvePanelView with 0 samples, 1 sample, and multi-sample + reset markers at 340pt & 390pt
+            for w in [CGFloat(340), CGFloat(390)] {
+                for (name, series) in [("0-sample", [QuotaBurnSeries]()), ("1-sample", oneSampleSeries), ("multi-reset", multiSeries)] {
+                    for range in QuotaHistoryRange.allCases {
+                        let panel = QuotaCurvePanelView(
+                            seriesList: series,
+                            selectedRange: range,
+                            onSelectRange: { _ in },
+                            poolBadgeText: "Gemini",
+                            referenceNow: now,
+                            compact: w < 365,
+                            availableWidth: w - 36
+                        )
+                        smokeHost(panel, width: w - 24, height: 220, fixedHeight: false, appearanceName: .darkAqua, label: "QuotaCurvePanelView.\(name).\(range.rawValue)")
+                    }
+                }
+            }
+
+            // 3. Full MenuBarView at 340pt & 390pt with ready account card + mini sparkline curve toggle pill
+            for w in [CGFloat(340), CGFloat(390)] {
+                store.registry.settings.popoverWidth = Double(w)
+                smokeHost(
+                    MenuBarView(store: store, onOpenSettings: {}),
+                    width: w,
+                    height: 580,
+                    fixedHeight: true,
+                    appearanceName: .aqua,
+                    label: "MenuBarView.Light"
+                )
+            }
+        }
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -8099,10 +8741,11 @@ Task {
     await testV121RegressionSuite()
     await testV122RegressionSuite()
     await testV123RegressionSuite()
+    await testV130RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)
     Darwin.exit(T.failed == 0 ? 0 : 1)
 }
 
-dispatchMain()
+RunLoop.main.run()

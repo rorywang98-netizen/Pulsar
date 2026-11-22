@@ -73,7 +73,7 @@ public enum PopoverTab: String, CaseIterable, Identifiable, Hashable, Sendable {
 @MainActor
 public final class AppStore: ObservableObject {
     public nonisolated static let bundleIdentifier = "com.rory.roryorbit"
-    public nonisolated static let appVersion = "1.2.3"
+    public nonisolated static let appVersion = "1.3.0"
 
     public nonisolated static var defaultAvatarCacheDirectoryURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("avatars", isDirectory: true)
@@ -90,6 +90,7 @@ public final class AppStore: ObservableObject {
     public let tokenUsageEngine: TokenUsageEngine
     public let accountPoolExporter: AccountPoolExporter
     public let releaseUpdater: ReleaseUpdater
+    public let quotaHistoryStore: QuotaHistoryStore
 
     private let registryURL: URL
     private let migrationPaths: LegacyMigrationPaths
@@ -143,6 +144,7 @@ public final class AppStore: ObservableObject {
     @Published public private(set) var updatePhase: ReleaseUpdatePhase = .idle
     @Published public var isUpdateBannerDismissed: Bool = false
     @Published public private(set) var antigravityCredentialDrift: AntigravityCredentialDrift? = nil
+    @Published public private(set) var quotaHistoryRevision: Int = 0
 
     public nonisolated static func makeDefaultAdapters(
         keychain: KeychainStore = .shared,
@@ -173,7 +175,8 @@ public final class AppStore: ObservableObject {
         avatarCacheDirectoryURL: URL? = nil,
         avatarSession: URLSession? = nil,
         perAccountRefreshTimeoutSeconds: TimeInterval? = nil,
-        releaseUpdater: ReleaseUpdater? = nil
+        releaseUpdater: ReleaseUpdater? = nil,
+        quotaHistoryStore: QuotaHistoryStore? = nil
     ) {
         self.keychain = keychain
         self.processController = processController
@@ -191,8 +194,20 @@ public final class AppStore: ObservableObject {
         self.ownsAvatarSession = (avatarSession == nil)
         self.avatarSession = avatarSession ?? HTTPFactory.makeSession(policy: .systemProxy, timeout: 15.0)
         self.shouldPrewarmAvatars = startScheduler || (avatarSession != nil)
-        self.shouldPersistAccountPoolExport = persistAccountPoolExport
+        let shouldPersistLive = persistAccountPoolExport
             ?? (registryURL.standardizedFileURL == RegistryData.defaultFileURL.standardizedFileURL)
+        self.shouldPersistAccountPoolExport = shouldPersistLive
+        if let quotaHistoryStore {
+            self.quotaHistoryStore = quotaHistoryStore
+        } else if shouldPersistLive {
+            self.quotaHistoryStore = QuotaHistoryStore(fileURL: QuotaHistoryStore.defaultFileURL)
+        } else {
+            self.quotaHistoryStore = QuotaHistoryStore(
+                fileURL: registryURL
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("quota-history.json", isDirectory: false)
+            )
+        }
         self.isSchedulerEnabled = startScheduler
         self.providerRefreshTimeoutSeconds = max(0.5, providerRefreshTimeoutSeconds)
         self.perAccountRefreshTimeoutSeconds = perAccountRefreshTimeoutSeconds
@@ -1095,12 +1110,18 @@ public final class AppStore: ObservableObject {
         var metadataChanged = accountsChangedFromSync
         let accountTimeoutInt = max(1, Int(effectiveAccountTimeout.rounded()))
         var freshSnapshotCount = 0
+        var didRecordQuotaHistory = false
+        let sampleTimestamp = Date()
 
         for (account, maybeSnap) in batchResult.fetchedSnapshots {
             let key = Self.snapshotKey(provider: provider, accountId: account.id)
             if let snap = maybeSnap {
                 snapshots[key] = snap
                 freshSnapshotCount += 1
+
+                if quotaHistoryStore.record(snapshot: snap, now: sampleTimestamp) {
+                    didRecordQuotaHistory = true
+                }
 
                 if let plan = snap.plan, plan.kind != .unknown {
                     if let idx = registry.accounts.firstIndex(where: { $0.provider == provider && $0.id == account.id }),
@@ -1121,6 +1142,10 @@ public final class AppStore: ObservableObject {
                     message: "刷新超时（>\(accountTimeoutInt)秒），已自动跳过以免阻塞"
                 )
             }
+        }
+
+        if didRecordQuotaHistory {
+            quotaHistoryRevision &+= 1
         }
 
         for (accountId, avatarURL) in batchResult.fetchedAvatarURLs {

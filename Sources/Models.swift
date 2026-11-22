@@ -1513,7 +1513,7 @@ public enum DashboardTokenCard: String, Codable, CaseIterable, Identifiable, Has
         case .liveSpeed: return "实时 tok/s 脉冲与近期模型速度分布"
         case .heatmap: return "近 16 周每日活跃格子与强度图例"
         case .dailyTrend: return "每日 Token 消耗与费用趋势柱图"
-        case .deepBreakdown: return "客户端 / 模型 / 项目三标签深度明细"
+        case .deepBreakdown: return "模型排行与项目明细（含占比进度条）"
         }
     }
 

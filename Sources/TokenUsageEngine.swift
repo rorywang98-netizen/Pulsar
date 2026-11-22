@@ -230,6 +230,8 @@ private struct CachedFileState: Codable {
     var antigravityPendingStep: PendingAntigravityStep? = nil
     var antigravityPrevStepType: String? = nil
     var antigravityPrevStepTsSec: Double? = nil
+    var antigravityLastModel: String? = nil
+    var antigravityPlannerOrdinal: Int? = nil
     var kimiLastRequestMs: Double? = nil
     var kimiLastUsageMs: Double? = nil
 }
@@ -245,7 +247,7 @@ private struct CachedSQLiteState: Codable {
 }
 
 private struct TokenScanCache: Codable {
-    static let currentVersion = 3
+    static let currentVersion = 4
     var version: Int
     var files: [String: CachedFileState]
     var sqliteCaches: [String: CachedSQLiteState]
@@ -1030,10 +1032,18 @@ public actor TokenUsageEngine {
             return
         }
         guard let data = readTailBytes(atPath: path, maxBytes: Self.speedTailReadBytes) else { return }
+        // Derive root (<root>/brain/<uuid>/.system_generated/logs/transcript.jsonl -> <root>)
+        let rootURL = URL(fileURLWithPath: path)
+            .deletingLastPathComponent() // logs
+            .deletingLastPathComponent() // .system_generated
+            .deletingLastPathComponent() // <uuid>
+            .deletingLastPathComponent() // brain
+            .deletingLastPathComponent() // <root>
         let samples = autoreleasepool {
             parseAntigravitySpeedSamplesOnly(
                 data: data,
                 convUUID: uuid,
+                rootURL: rootURL,
                 fileMtime: mtime,
                 speedCutoffSec: historyCutoffSec
             )
@@ -2652,6 +2662,18 @@ public actor TokenUsageEngine {
                 var pendingStep: PendingAntigravityStep? = canResume ? existing?.antigravityPendingStep : nil
                 var prevStepType: String? = canResume ? existing?.antigravityPrevStepType : nil
                 var prevStepTsSec: Double? = canResume ? existing?.antigravityPrevStepTsSec : nil
+                var lastKnownModel: String? = canResume ? existing?.antigravityLastModel : nil
+                var plannerOrdinal: Int = canResume ? (existing?.antigravityPlannerOrdinal ?? 0) : 0
+                var didLoadGenMeta = false
+                var genMetaIndex: AntigravityGenMetadataIndex? = nil
+
+                let loadGenMetaIfNeeded: () -> AntigravityGenMetadataIndex? = {
+                    if !didLoadGenMeta {
+                        didLoadGenMeta = true
+                        genMetaIndex = self.loadAntigravityGenMetadata(forUUID: uuid, primaryRoot: root, fallbackRoots: allowedRoots)
+                    }
+                    return genMetaIndex
+                }
 
                 forEachJSONLine(in: chunk) { lineData in
                     let hasTokens = Self.utf8Contains(lineData, needle: "\"input_tokens\"")
@@ -2717,8 +2739,25 @@ public actor TokenUsageEngine {
                           let dateKey = Self.parseISOToShanghaiDateKey(tsStr),
                           dateKey <= todayKey else { return }
 
+                    let isCheckpoint = (recType == "CHECKPOINT")
                     let rawModel = Self.extractJSONString(in: lineData, afterKey: "model")?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let modelId = Self.sanitizeModelId((rawModel?.isEmpty == false) ? rawModel! : "unknown")
+                    let modelId = Self.resolveAntigravityModelId(
+                        rawModel: rawModel,
+                        isCheckpoint: isCheckpoint,
+                        stepIndex: stepIdx,
+                        plannerOrdinal: plannerOrdinal,
+                        lastKnownModel: lastKnownModel,
+                        loadGenMetadata: loadGenMetaIfNeeded
+                    )
+                    if !isCheckpoint {
+                        plannerOrdinal += 1
+                        if Self.isConcreteAntigravityModelId(modelId) {
+                            lastKnownModel = modelId
+                        }
+                    } else if lastKnownModel == nil && Self.isConcreteAntigravityModelId(modelId) {
+                        lastKnownModel = modelId
+                    }
+
                     let providerId = TokenPricingCatalog.defaultProviderId(for: modelId, client: .antigravity)
                     let cost = TokenPricingCatalog.pricing(for: modelId, client: .antigravity).estimateCostUSD(
                         uncachedInput: uncachedIn,
@@ -2805,7 +2844,9 @@ public actor TokenUsageEngine {
                     speedSamples: finalSpeed.isEmpty ? nil : finalSpeed,
                     antigravityPendingStep: pendingStep,
                     antigravityPrevStepType: prevStepType,
-                    antigravityPrevStepTsSec: prevStepTsSec
+                    antigravityPrevStepTsSec: prevStepTsSec,
+                    antigravityLastModel: lastKnownModel,
+                    antigravityPlannerOrdinal: plannerOrdinal
                 )
             }
         }
@@ -2815,6 +2856,7 @@ public actor TokenUsageEngine {
     private func parseAntigravitySpeedSamplesOnly(
         data: Data,
         convUUID: String,
+        rootURL: URL? = nil,
         fileMtime: Double,
         speedCutoffSec: Double
     ) -> [SpeedSample] {
@@ -2822,6 +2864,20 @@ public actor TokenUsageEngine {
         var pendingStep: PendingAntigravityStep? = nil
         var prevStepType: String? = nil
         var prevStepTsSec: Double? = nil
+        var lastKnownModel: String? = nil
+        var plannerOrdinal: Int = 0
+        var didLoadGenMeta = false
+        var genMetaIndex: AntigravityGenMetadataIndex? = nil
+
+        let loadGenMetaIfNeeded: () -> AntigravityGenMetadataIndex? = {
+            if !didLoadGenMeta {
+                didLoadGenMeta = true
+                if let rootURL {
+                    genMetaIndex = self.loadAntigravityGenMetadata(forUUID: convUUID, primaryRoot: rootURL, fallbackRoots: [])
+                }
+            }
+            return genMetaIndex
+        }
 
         forEachJSONLine(in: data) { lineData in
             guard let recType = Self.extractJSONString(in: lineData, afterKey: "type"),
@@ -2859,8 +2915,24 @@ public actor TokenUsageEngine {
                     let cacheRead = max(Int64(0), Self.extractJSONInt64(in: lineData, afterKey: "cache_read_tokens") ?? 0)
                     let totalTok = uncachedIn + cacheRead + outputTok
                     let stepIdx = Self.extractJSONInt64(in: lineData, afterKey: "step_index").map(Int.init)
+                    let isCheckpoint = (recType == "CHECKPOINT")
                     let rawModel = Self.extractJSONString(in: lineData, afterKey: "model")?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let modelId = Self.sanitizeModelId((rawModel?.isEmpty == false) ? rawModel! : "unknown")
+                    let modelId = Self.resolveAntigravityModelId(
+                        rawModel: rawModel,
+                        isCheckpoint: isCheckpoint,
+                        stepIndex: stepIdx,
+                        plannerOrdinal: plannerOrdinal,
+                        lastKnownModel: lastKnownModel,
+                        loadGenMetadata: loadGenMetaIfNeeded
+                    )
+                    if !isCheckpoint {
+                        plannerOrdinal += 1
+                        if Self.isConcreteAntigravityModelId(modelId) {
+                            lastKnownModel = modelId
+                        }
+                    } else if lastKnownModel == nil && Self.isConcreteAntigravityModelId(modelId) {
+                        lastKnownModel = modelId
+                    }
                     pendingStep = PendingAntigravityStep(
                         stepIndex: stepIdx,
                         type: recType,
@@ -2912,6 +2984,462 @@ public actor TokenUsageEngine {
         }
 
         return Array(speedByKey.values.sorted { $0.endedAtSec < $1.endedAtSec }.suffix(Self.speedMaxSamplesPerFile))
+    }
+
+    // MARK: - Antigravity `conversations/<uuid>.db` (`gen_metadata`) Protobuf & Read-Only SQLite Recovery
+
+    private struct AntigravityGenMetadataEntry {
+        let idx: Int
+        let modelId: String
+        let lastStepIndex: Int?
+    }
+
+    private struct AntigravityGenMetadataIndex {
+        let entries: [AntigravityGenMetadataEntry]
+        let byLastStepIndex: [Int: String]
+        let byOrdinalIdx: [Int: String]
+        let dominantModel: String?
+
+        func lookupModel(forStepIndex stepIdx: Int?, plannerOrdinal: Int) -> String? {
+            if let stepIdx {
+                // Fast exact match: Antigravity records `last_step_index == step_index - 1` for each PLANNER_RESPONSE.
+                if let exactPrev = byLastStepIndex[stepIdx - 1] {
+                    return exactPrev
+                }
+                // Closest preceding `last_step_index < stepIdx` within a reasonable step window.
+                var bestDelta = Int.max
+                var bestModel: String? = nil
+                for entry in entries {
+                    guard let lsi = entry.lastStepIndex, lsi < stepIdx else { continue }
+                    let delta = stepIdx - lsi
+                    if delta <= 64 && delta < bestDelta {
+                        bestDelta = delta
+                        bestModel = entry.modelId
+                    }
+                }
+                if let bestModel {
+                    return bestModel
+                }
+                if let sameStep = byLastStepIndex[stepIdx] {
+                    return sameStep
+                }
+            }
+            if let byIdx = byOrdinalIdx[plannerOrdinal] {
+                return byIdx
+            }
+            return nil
+        }
+    }
+
+    private static func isConcreteAntigravityModelId(_ modelId: String) -> Bool {
+        let lower = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !lower.isEmpty && lower != "unknown" && lower != "unknown-model"
+    }
+
+    private static func resolveAntigravityModelId(
+        rawModel: String?,
+        isCheckpoint: Bool,
+        stepIndex: Int?,
+        plannerOrdinal: Int,
+        lastKnownModel: String?,
+        loadGenMetadata: () -> AntigravityGenMetadataIndex?
+    ) -> String {
+        if let rawModel, Self.isConcreteAntigravityModelId(rawModel) {
+            return Self.sanitizeModelId(rawModel)
+        }
+
+        if isCheckpoint {
+            if let last = lastKnownModel, Self.isConcreteAntigravityModelId(last) {
+                return last
+            }
+            if let meta = loadGenMetadata() {
+                if let lookedUp = meta.lookupModel(forStepIndex: stepIndex, plannerOrdinal: plannerOrdinal) {
+                    return lookedUp
+                }
+                if let dominant = meta.dominantModel {
+                    return dominant
+                }
+            }
+            return "unknown"
+        } else {
+            if let meta = loadGenMetadata() {
+                if let lookedUp = meta.lookupModel(forStepIndex: stepIndex, plannerOrdinal: plannerOrdinal) {
+                    return lookedUp
+                }
+                if let last = lastKnownModel, Self.isConcreteAntigravityModelId(last) {
+                    return last
+                }
+                if let dominant = meta.dominantModel {
+                    return dominant
+                }
+            } else if let last = lastKnownModel, Self.isConcreteAntigravityModelId(last) {
+                return last
+            }
+            return "unknown"
+        }
+    }
+
+    /// Parses a single `gen_metadata.data` protobuf BLOB from `~/.gemini/antigravity/conversations/<uuid>.db`.
+    /// Strictly bounds-checked pure Swift wire decoder (zero external dependencies):
+    /// - Top-level field `1` (length-delimited submessage):
+    ///   - Field `19` (UTF-8): canonical model base ID (e.g. `"gemini-4-carbon"`, `"claude-opus-5-5-high"`).
+    ///   - Field `20` (repeated map entry `f1=key`, `f2=value`): extracts `"last_step_index"`.
+    ///   - Field `21` (UTF-8): human display name including reasoning tier (e.g. `"Gemini 4 Carbon (High)"`).
+    public static func parseAntigravityGenMetadataBlob(_ data: Data) -> (modelId: String?, lastStepIndex: Int?) {
+        guard !data.isEmpty else { return (nil, nil) }
+
+        return data.withUnsafeBytes { rawBuf -> (modelId: String?, lastStepIndex: Int?) in
+            guard let basePtr = rawBuf.bindMemory(to: UInt8.self).baseAddress else {
+                return (nil, nil)
+            }
+            let bytes = UnsafeBufferPointer(start: basePtr, count: rawBuf.count)
+
+            var baseModel: String? = nil
+            var displayName: String? = nil
+            var lastStepIndex: Int? = nil
+
+            var offset = 0
+            let end = bytes.count
+            while offset < end {
+                guard let tag = readProtoVarint(bytes, offset: &offset, end: end) else { break }
+                let fieldNumber = tag >> 3
+                let wireType = tag & 0x7
+                guard fieldNumber > 0 else { break }
+
+                if fieldNumber == 1 && wireType == 2 {
+                    guard let len64 = readProtoVarint(bytes, offset: &offset, end: end),
+                          len64 <= UInt64(end - offset) else {
+                        break
+                    }
+                    let subStart = offset
+                    let subEnd = offset + Int(len64)
+                    offset = subEnd
+
+                    parseAntigravityGenMetadataSubmessage(
+                        bytes,
+                        start: subStart,
+                        end: subEnd,
+                        baseModel: &baseModel,
+                        displayName: &displayName,
+                        lastStepIndex: &lastStepIndex
+                    )
+                } else {
+                    guard skipProtoField(bytes, wireType: wireType, offset: &offset, end: end) else {
+                        break
+                    }
+                }
+            }
+
+            let resolvedModel = normalizeAntigravityGenMetadataModel(
+                baseModel: baseModel,
+                displayName: displayName
+            )
+            return (resolvedModel, lastStepIndex)
+        }
+    }
+
+    private static func parseAntigravityGenMetadataSubmessage(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        start: Int,
+        end: Int,
+        baseModel: inout String?,
+        displayName: inout String?,
+        lastStepIndex: inout Int?
+    ) {
+        var offset = start
+        while offset < end {
+            guard let tag = readProtoVarint(bytes, offset: &offset, end: end) else { break }
+            let fieldNumber = tag >> 3
+            let wireType = tag & 0x7
+            guard fieldNumber > 0 else { break }
+
+            if wireType == 2 {
+                guard let len64 = readProtoVarint(bytes, offset: &offset, end: end),
+                      len64 <= UInt64(end - offset) else {
+                    break
+                }
+                let subStart = offset
+                let subEnd = offset + Int(len64)
+                offset = subEnd
+
+                switch fieldNumber {
+                case 19:
+                    if let str = decodeProtoUTF8(bytes, start: subStart, end: subEnd)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !str.isEmpty {
+                        baseModel = str
+                    }
+                case 20:
+                    var key: String? = nil
+                    var value: String? = nil
+                    var kvOffset = subStart
+                    while kvOffset < subEnd {
+                        guard let kvTag = readProtoVarint(bytes, offset: &kvOffset, end: subEnd) else { break }
+                        let kvField = kvTag >> 3
+                        let kvWire = kvTag & 0x7
+                        guard kvField > 0 else { break }
+                        if kvWire == 2 {
+                            guard let kvLen64 = readProtoVarint(bytes, offset: &kvOffset, end: subEnd),
+                                  kvLen64 <= UInt64(subEnd - kvOffset) else {
+                                break
+                            }
+                            let valStart = kvOffset
+                            let valEnd = kvOffset + Int(kvLen64)
+                            kvOffset = valEnd
+                            if kvField == 1 {
+                                key = decodeProtoUTF8(bytes, start: valStart, end: valEnd)
+                            } else if kvField == 2 {
+                                value = decodeProtoUTF8(bytes, start: valStart, end: valEnd)
+                            }
+                        } else {
+                            guard skipProtoField(bytes, wireType: kvWire, offset: &kvOffset, end: subEnd) else {
+                                break
+                            }
+                        }
+                    }
+                    if key == "last_step_index",
+                       let rawIdx = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       let parsedIdx = Int(rawIdx) {
+                        lastStepIndex = parsedIdx
+                    }
+                case 21:
+                    if let str = decodeProtoUTF8(bytes, start: subStart, end: subEnd)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !str.isEmpty {
+                        displayName = str
+                    }
+                default:
+                    break
+                }
+            } else {
+                guard skipProtoField(bytes, wireType: wireType, offset: &offset, end: end) else {
+                    break
+                }
+            }
+        }
+    }
+
+    private static func readProtoVarint(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        offset: inout Int,
+        end: Int
+    ) -> UInt64? {
+        var result: UInt64 = 0
+        var shift: UInt64 = 0
+        while offset < end {
+            let b = bytes[offset]
+            offset += 1
+            let low = UInt64(b & 0x7F)
+            if shift >= 64 || (shift == 63 && low > 1) {
+                return nil
+            }
+            result |= (low << shift)
+            if (b & 0x80) == 0 {
+                return result
+            }
+            shift += 7
+        }
+        return nil
+    }
+
+    private static func skipProtoField(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        wireType: UInt64,
+        offset: inout Int,
+        end: Int
+    ) -> Bool {
+        switch wireType {
+        case 0:
+            return readProtoVarint(bytes, offset: &offset, end: end) != nil
+        case 1:
+            guard end - offset >= 8 else { return false }
+            offset += 8
+            return true
+        case 2:
+            guard let len64 = readProtoVarint(bytes, offset: &offset, end: end),
+                  len64 <= UInt64(end - offset) else {
+                return false
+            }
+            offset += Int(len64)
+            return true
+        case 5:
+            guard end - offset >= 4 else { return false }
+            offset += 4
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func decodeProtoUTF8(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        start: Int,
+        end: Int
+    ) -> String? {
+        guard start <= end, end <= bytes.count else { return nil }
+        guard start < end else { return "" }
+        let slice = UnsafeBufferPointer(rebasing: bytes[start..<end])
+        return String(decoding: slice, as: UTF8.self)
+    }
+
+    private static func extractReasoningTierSuffix(from displayName: String?) -> String? {
+        guard let displayName else { return nil }
+        let lower = displayName.lowercased()
+        // Check `(xhigh)` before `(high)` so XHigh never misclassifies as High.
+        if lower.contains("(xhigh)") || lower.contains("（xhigh）") {
+            return "-xhigh"
+        }
+        if lower.contains("(high)") || lower.contains("（high）") {
+            return "-high"
+        }
+        if lower.contains("(medium)") || lower.contains("（medium）") {
+            return "-medium"
+        }
+        if lower.contains("(low)") || lower.contains("（low）") {
+            return "-low"
+        }
+        return nil
+    }
+
+    private static func normalizeAntigravityGenMetadataModel(
+        baseModel: String?,
+        displayName: String?
+    ) -> String? {
+        let tierSuffix = extractReasoningTierSuffix(from: displayName)
+        let knownTierSuffixes = ["-xhigh", "-high", "-medium", "-low"]
+
+        let candidateBase: String?
+        if let rawBase = baseModel?.trimmingCharacters(in: .whitespacesAndNewlines), !rawBase.isEmpty {
+            candidateBase = rawBase
+        } else if let rawDisplay = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !rawDisplay.isEmpty {
+            // Fallback when protobuf field 19 is absent and only field 21 (e.g. "Gemini 4 Carbon (High)") is present.
+            var stripped = rawDisplay
+            for token in ["(XHigh)", "(High)", "(Medium)", "(Low)", "(xhigh)", "(high)", "(medium)", "(low)"] {
+                stripped = stripped.replacingOccurrences(of: token, with: "")
+            }
+            let slug = stripped
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .split(whereSeparator: { $0.isWhitespace })
+                .joined(separator: "-")
+            if slug.hasPrefix("claude-") {
+                candidateBase = slug.replacingOccurrences(of: ".", with: "-")
+            } else {
+                candidateBase = slug.isEmpty ? nil : slug
+            }
+        } else {
+            candidateBase = nil
+        }
+
+        guard var model = candidateBase, !model.isEmpty else { return nil }
+        if let tierSuffix {
+            let lowerModel = model.lowercased()
+            let alreadyHasTier = knownTierSuffixes.contains { lowerModel.hasSuffix($0) }
+            if !alreadyHasTier {
+                model += tierSuffix
+            }
+        }
+        let sanitized = sanitizeModelId(model)
+        return isConcreteAntigravityModelId(sanitized) ? sanitized : nil
+    }
+
+    private static func sqliteReadOnlyImmutableURI(forPath path: String) -> String {
+        var encoded = path
+        encoded = encoded.replacingOccurrences(of: "%", with: "%25")
+        encoded = encoded.replacingOccurrences(of: "?", with: "%3F")
+        encoded = encoded.replacingOccurrences(of: "#", with: "%23")
+        encoded = encoded.replacingOccurrences(of: " ", with: "%20")
+        return "file:\(encoded)?mode=ro&immutable=1"
+    }
+
+    private func loadAntigravityGenMetadata(
+        forUUID uuid: String,
+        primaryRoot: URL,
+        fallbackRoots: [URL]
+    ) -> AntigravityGenMetadataIndex? {
+        let fm = FileManager.default
+        var candidateRoots: [URL] = [primaryRoot]
+        for r in fallbackRoots where r.path != primaryRoot.path {
+            candidateRoots.append(r)
+        }
+
+        var foundDBURL: URL? = nil
+        for root in candidateRoots {
+            let dbURL = root
+                .appendingPathComponent("conversations", isDirectory: true)
+                .appendingPathComponent("\(uuid).db", isDirectory: false)
+            if fm.fileExists(atPath: dbURL.path) {
+                foundDBURL = dbURL
+                break
+            }
+        }
+        guard let dbURL = foundDBURL else { return nil }
+
+        var db: OpaquePointer?
+        let uri = Self.sqliteReadOnlyImmutableURI(forPath: dbURL.path)
+        let uriFlags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX
+        var rc = sqlite3_open_v2(uri, &db, uriFlags, nil)
+        if rc != SQLITE_OK || db == nil {
+            if let db { sqlite3_close(db) }
+            db = nil
+            let plainFlags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
+            rc = sqlite3_open_v2(dbURL.path, &db, plainFlags, nil)
+        }
+        guard rc == SQLITE_OK, let db else {
+            if let db { sqlite3_close(db) }
+            return nil
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 100)
+
+        var stmt: OpaquePointer?
+        let sql = "SELECT idx, data FROM gen_metadata ORDER BY idx ASC"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var entries: [AntigravityGenMetadataEntry] = []
+        var byLastStepIndex: [Int: String] = [:]
+        var byOrdinalIdx: [Int: String] = [:]
+        var countsByModel: [String: (count: Int, lastIdx: Int)] = [:]
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let idx = Int(sqlite3_column_int64(stmt, 0))
+            guard let rawPtr = sqlite3_column_blob(stmt, 1) else { continue }
+            let byteCount = Int(sqlite3_column_bytes(stmt, 1))
+            guard byteCount > 0 else { continue }
+            let blobData = Data(bytes: rawPtr, count: byteCount)
+            let parsed = Self.parseAntigravityGenMetadataBlob(blobData)
+            guard let modelId = parsed.modelId else { continue }
+
+            entries.append(
+                AntigravityGenMetadataEntry(
+                    idx: idx,
+                    modelId: modelId,
+                    lastStepIndex: parsed.lastStepIndex
+                )
+            )
+            byOrdinalIdx[idx] = modelId
+            if let lsi = parsed.lastStepIndex {
+                byLastStepIndex[lsi] = modelId
+            }
+            let prev = countsByModel[modelId] ?? (0, idx)
+            countsByModel[modelId] = (prev.count + 1, max(prev.lastIdx, idx))
+        }
+
+        guard !entries.isEmpty else { return nil }
+        let dominantModel = countsByModel.max { lhs, rhs in
+            if lhs.value.count != rhs.value.count {
+                return lhs.value.count < rhs.value.count
+            }
+            return lhs.value.lastIdx < rhs.value.lastIdx
+        }?.key
+
+        return AntigravityGenMetadataIndex(
+            entries: entries,
+            byLastStepIndex: byLastStepIndex,
+            byOrdinalIdx: byOrdinalIdx,
+            dominantModel: dominantModel
+        )
     }
 
     private func loadAntigravityWorkspaces(roots: [URL]) -> [String: String] {

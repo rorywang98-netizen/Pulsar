@@ -1329,20 +1329,20 @@ public struct TokenUsagePopoverView: View {
         var id: String { rawValue }
     }
 
-    private enum BreakdownTab: String, CaseIterable, Identifiable {
-        case clients = "客户端分布"
+    public enum BreakdownTab: String, CaseIterable, Identifiable {
         case models = "模型排行"
         case projects = "项目排行"
-        var id: String { rawValue }
+        public var id: String { rawValue }
 
-        var shortTitle: String {
+        public var shortTitle: String {
             switch self {
-            case .clients: return "客户端"
             case .models: return "模型"
             case .projects: return "项目"
             }
         }
     }
+
+    public nonisolated static let defaultBreakdownTab: BreakdownTab = .models
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var envReduceMotion
@@ -1357,7 +1357,7 @@ public struct TokenUsagePopoverView: View {
     @State private var hoveredHeatmapDate: String? = nil
     @State private var hoveredHeatmapRow: Int? = nil
     @State private var hoveredTrendDate: String? = nil
-    @State private var selectedBreakdownTab: BreakdownTab = .clients
+    @State private var selectedBreakdownTab: BreakdownTab = .models
     @State private var showAllModels: Bool = false
     @State private var showAllProjects: Bool = false
     @State private var showCustomDatePopover: Bool = false
@@ -4192,7 +4192,7 @@ public struct TokenUsagePopoverView: View {
         }
     }
 
-    // MARK: - Card 5: Adaptive 3-Tab Deep Breakdown Section (.deepBreakdown)
+    // MARK: - Card 5: Adaptive 2-Tab Deep Breakdown Section (.deepBreakdown)
 
     private func deepBreakdownSection(
         summary: TokenRangeSummary,
@@ -4213,7 +4213,6 @@ public struct TokenUsagePopoverView: View {
                                 let isSelected = (selectedBreakdownTab == tab)
                                 let count: Int = {
                                     switch tab {
-                                    case .clients: return summary.byClient.count
                                     case .models: return summary.byModel.count
                                     case .projects: return summary.byProject.count
                                     }
@@ -4288,12 +4287,6 @@ public struct TokenUsagePopoverView: View {
                 ZStack(alignment: .top) {
                     Group {
                         switch selectedBreakdownTab {
-                        case .clients:
-                            clientsDeepTable(
-                                rows: summary.byClient,
-                                availableWidth: availableWidth,
-                                compactDensity: compactDensity
-                            )
                         case .models:
                             modelsDeepTable(
                                 allRows: summary.byModel,
@@ -4344,236 +4337,7 @@ public struct TokenUsagePopoverView: View {
         .transition(.opacity)
     }
 
-    // MARK: Breakdown Tab 1 — Clients Table
-
-    private func clientsDeepTable(
-        rows: [TokenClientBreakdown],
-        availableWidth: CGFloat,
-        compactDensity: Bool
-    ) -> some View {
-        let isNarrowRows = availableWidth < 480
-        let showMessageCol = availableWidth >= 600
-        let nameColW: CGFloat = showMessageCol ? 128 : 114
-        let tokColW: CGFloat = showMessageCol ? 58 : 54
-        let hitColW: CGFloat = showMessageCol ? 50 : 46
-        let costColW: CGFloat = showMessageCol ? 76 : 68
-
-        return VStack(spacing: 0) {
-            if !isNarrowRows {
-                HStack(spacing: 6) {
-                    Text("客户端")
-                        .frame(width: nameColW, alignment: .leading)
-                    Text("占比")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("总 Tokens")
-                        .frame(width: tokColW, alignment: .trailing)
-                    Text("缓存命中")
-                        .frame(width: hitColW, alignment: .trailing)
-                    Text("估算费用")
-                        .frame(width: costColW, alignment: .trailing)
-                    if showMessageCol {
-                        Text("消息数")
-                            .frame(width: 52, alignment: .trailing)
-                    }
-                }
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(nestedSubtleSurface)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            }
-
-            if rows.isEmpty {
-                emptyTableNotice("当前筛选条件下暂无客户端数据")
-            } else {
-                ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
-                    let tint = TokenAnalyticsStyle.color(for: row.client)
-                    let pct = max(0.0, min(1.0, row.shareOfTokens))
-                    let isClientActive = (selectedClient == row.client)
-
-                    Button {
-                        withAnimation(pillAnim) {
-                            selectedClient = isClientActive ? nil : row.client
-                        }
-                    } label: {
-                        if isNarrowRows {
-                            VStack(alignment: .leading, spacing: compactDensity ? 3.5 : 4.5) {
-                                HStack(spacing: 5) {
-                                    Circle()
-                                        .fill(tint)
-                                        .frame(width: 7, height: 7)
-
-                                    Text(row.client.displayName)
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundColor(.primary)
-                                        .lineLimit(1)
-                                        .truncationMode(.tail)
-
-                                    Text("· \(row.activeDays)天")
-                                        .font(.system(size: 9.5))
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-
-                                    Spacer(minLength: 4)
-
-                                    Text(TokenFormatters.compactTokens(row.totals.totalTokens))
-                                        .font(.system(size: 11, weight: .bold, design: .rounded))
-                                        .monospacedDigit()
-                                        .foregroundColor(.primary)
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-                                        .orbitNumericTransition()
-                                        .help("精确：\(TokenFormatters.exactTokens(row.totals.totalTokens))")
-
-                                    Text(TokenFormatters.usd(row.totals.estimatedCostUSD))
-                                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                                        .monospacedDigit()
-                                        .foregroundColor(.primary.opacity(0.88))
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-                                        .orbitNumericTransition()
-                                }
-
-                                HStack(spacing: 5.5) {
-                                    OrbitAnimatedProgressBar(
-                                        fraction: pct,
-                                        tint: tint,
-                                        trackColor: Color.primary.opacity(0.08),
-                                        height: 5,
-                                        minFillWidth: 4
-                                    )
-                                    .frame(maxWidth: .infinity)
-
-                                    Text(TokenFormatters.percent(pct))
-                                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                                        .monospacedDigit()
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-
-                                    Text("命中 \(TokenFormatters.percent(row.totals.cacheHitRate))")
-                                        .font(.system(size: 9.5, weight: .semibold, design: .rounded))
-                                        .monospacedDigit()
-                                        .foregroundColor(TokenAnalyticsStyle.cacheReadColor)
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-
-                                    if availableWidth >= 420 {
-                                        Text("\(TokenAnalyticsStyle.compactCount(row.totals.messageCount))条")
-                                            .font(.system(size: 9.5, design: .rounded))
-                                            .monospacedDigit()
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(1)
-                                            .fixedSize(horizontal: true, vertical: false)
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, 6.5)
-                            .padding(.vertical, compactDensity ? 5 : 6.5)
-                        } else {
-                            HStack(spacing: 6) {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(tint)
-                                        .frame(width: 7.5, height: 7.5)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(row.client.displayName)
-                                            .font(.system(size: 11.5, weight: .semibold))
-                                            .foregroundColor(.primary)
-                                            .lineLimit(1)
-                                            .truncationMode(.tail)
-                                        Text(showMessageCol
-                                            ? "活跃 \(row.activeDays) 天"
-                                            : "\(row.activeDays)天 · \(TokenAnalyticsStyle.compactCount(row.totals.messageCount))条")
-                                            .font(.system(size: 9.5))
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                }
-                                .frame(width: nameColW, alignment: .leading)
-
-                                HStack(spacing: 5) {
-                                    OrbitAnimatedProgressBar(
-                                        fraction: pct,
-                                        tint: tint,
-                                        trackColor: Color.primary.opacity(0.08),
-                                        height: 6,
-                                        minFillWidth: 4
-                                    )
-
-                                    Text(TokenFormatters.percent(pct))
-                                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                                        .monospacedDigit()
-                                        .foregroundColor(.secondary)
-                                        .frame(width: 38, alignment: .trailing)
-                                        .lineLimit(1)
-                                        .orbitNumericTransition()
-                                }
-                                .frame(maxWidth: .infinity)
-
-                                Text(TokenFormatters.compactTokens(row.totals.totalTokens))
-                                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
-                                    .monospacedDigit()
-                                    .foregroundColor(.primary)
-                                    .lineLimit(1)
-                                    .frame(width: tokColW, alignment: .trailing)
-                                    .orbitNumericTransition()
-                                    .help("精确：\(TokenFormatters.exactTokens(row.totals.totalTokens))")
-
-                                Text(TokenFormatters.percent(row.totals.cacheHitRate))
-                                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                                    .monospacedDigit()
-                                    .foregroundColor(TokenAnalyticsStyle.cacheReadColor)
-                                    .lineLimit(1)
-                                    .frame(width: hitColW, alignment: .trailing)
-                                    .orbitNumericTransition()
-
-                                Text(TokenFormatters.usd(row.totals.estimatedCostUSD))
-                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                    .monospacedDigit()
-                                    .foregroundColor(.primary)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.86)
-                                    .frame(width: costColW, alignment: .trailing)
-                                    .orbitNumericTransition()
-
-                                if showMessageCol {
-                                    Text(TokenAnalyticsStyle.exactCount(row.totals.messageCount))
-                                        .font(.system(size: 10.5, design: .rounded))
-                                        .monospacedDigit()
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
-                                        .minimumScaleFactor(0.86)
-                                        .frame(width: 52, alignment: .trailing)
-                                        .orbitNumericTransition()
-                                }
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, compactDensity ? 5.5 : 7)
-                        }
-                    }
-                    .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(isClientActive ? tint.opacity(0.09) : Color.clear)
-                    )
-                    .contentShape(Rectangle())
-                    .orbitInteractiveButton(
-                        pressedScale: 0.992,
-                        hoverTint: Color.primary.opacity(0.045),
-                        cornerRadius: 7
-                    )
-
-                    if idx < rows.count - 1 {
-                        Divider().opacity(0.28)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Breakdown Tab 2 — Models Table (with SpeedPillBadge)
+    // MARK: Breakdown Tab 1 — Models Table (with Share Progress Bar & SpeedPillBadge)
 
     private func modelsDeepTable(
         allRows: [TokenModelBreakdown],
@@ -4592,7 +4356,7 @@ public struct TokenUsagePopoverView: View {
                 HStack(spacing: isWide ? 8 : 6) {
                     Text("#")
                         .frame(width: isWide ? 22 : 18, alignment: .center)
-                    Text(isWide ? "模型 · 四分项 (入 / 出 / 缓读 / 缓写)" : "模型 · 测速与分项")
+                    Text(isWide ? "模型 · 占比与四分项 (入 / 出 / 缓读 / 缓写)" : "模型 · 占比与分项")
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Text("总 Tokens")
                         .frame(width: tokColW, alignment: .trailing)
@@ -4613,6 +4377,8 @@ public struct TokenUsagePopoverView: View {
                 ForEach(Array(displayedRows.enumerated()), id: \.element.id) { idx, item in
                     let speedStat = speed.speedStat(for: item.client, modelId: item.modelId)
                     let isModelLive = speed.isGenerating && speedStat != nil && speed.currentModel?.id == speedStat?.id
+                    let shareFraction = max(0.0, min(1.0, item.shareOfTokens))
+                    let clientTint = TokenAnalyticsStyle.color(for: item.client)
 
                     if isStackedNarrow {
                         VStack(alignment: .leading, spacing: compactDensity ? 3 : 4) {
@@ -4662,19 +4428,32 @@ public struct TokenUsagePopoverView: View {
 
                                 Spacer(minLength: 4)
 
-                                Text(TokenFormatters.percent(item.shareOfTokens))
-                                    .font(.system(size: 9.5, design: .rounded))
-                                    .monospacedDigit()
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                                    .fixedSize(horizontal: true, vertical: false)
-
                                 Text("命中 \(TokenFormatters.percent(item.totals.cacheHitRate))")
                                     .font(.system(size: 9.5, design: .rounded))
                                     .monospacedDigit()
                                     .foregroundColor(TokenAnalyticsStyle.cacheReadColor.opacity(0.95))
                                     .lineLimit(1)
                                     .fixedSize(horizontal: true, vertical: false)
+                            }
+                            .padding(.leading, 20)
+
+                            HStack(alignment: .center, spacing: 6) {
+                                OrbitAnimatedProgressBar(
+                                    fraction: shareFraction,
+                                    tint: clientTint,
+                                    trackColor: Color.primary.opacity(0.08),
+                                    height: 5,
+                                    minFillWidth: 4
+                                )
+                                .frame(maxWidth: .infinity)
+
+                                Text(TokenFormatters.percent(shareFraction))
+                                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                                    .monospacedDigit()
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 34, alignment: .trailing)
+                                    .lineLimit(1)
+                                    .orbitNumericTransition()
                             }
                             .padding(.leading, 20)
 
@@ -4692,7 +4471,7 @@ public struct TokenUsagePopoverView: View {
                                 .foregroundColor(idx < 3 ? .accentColor : .secondary)
                                 .frame(width: isWide ? 22 : 18, alignment: .center)
 
-                            VStack(alignment: .leading, spacing: 3) {
+                            VStack(alignment: .leading, spacing: compactDensity ? 3 : 3.5) {
                                 HStack(spacing: 5) {
                                     Text(item.modelId)
                                         .font(.system(size: 11.5, weight: .semibold))
@@ -4710,6 +4489,15 @@ public struct TokenUsagePopoverView: View {
                                             .help("实测均速 \(TokenFormatters.tokensPerSec(stat.averageOutputTokPerSec)) · 最新 \(TokenFormatters.tokensPerSec(stat.latestOutputTokPerSec)) · 峰值 \(TokenFormatters.tokensPerSec(stat.peakOutputTokPerSec))（\(stat.sampleCount) 轮样本）")
                                     }
                                 }
+
+                                OrbitAnimatedProgressBar(
+                                    fraction: shareFraction,
+                                    tint: clientTint,
+                                    trackColor: Color.primary.opacity(0.08),
+                                    height: 5,
+                                    minFillWidth: 4
+                                )
+                                .frame(maxWidth: .infinity)
 
                                 if !isWide, let stat = speedStat, stat.averageOutputTokPerSec >= 0.05 {
                                     HStack(spacing: 5) {
@@ -4731,7 +4519,7 @@ public struct TokenUsagePopoverView: View {
                                     .foregroundColor(.primary)
                                     .lineLimit(1)
                                     .orbitNumericTransition()
-                                Text(TokenFormatters.percent(item.shareOfTokens))
+                                Text(TokenFormatters.percent(shareFraction))
                                     .font(.system(size: 9.5, design: .rounded))
                                     .monospacedDigit()
                                     .foregroundColor(.secondary)
