@@ -4617,7 +4617,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.5.0", "AppStore.appVersion must match v1.5.0")
+        T.expectEqual(AppStore.appVersion, "1.5.1", "AppStore.appVersion must match v1.5.1")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -8196,7 +8196,7 @@ private func writeSyntheticGenMetadataDB(
 private func testV130RegressionSuite() async {
     // 20.1 QuotaHistoryStore: 0600 atomic persistence, dedup vs 15m heartbeat, 7-day pruning, reset-jump exclusion, hourly peak burn math (`20:00–21:00 -24%`) & AppStore integration
     await T.asyncSuite("V130.QuotaHistoryStorePersistenceAndBurnAnalysis") {
-        T.expectEqual(AppStore.appVersion, "1.5.0", "AppStore.appVersion must be 1.5.0")
+        T.expectEqual(AppStore.appVersion, "1.5.1", "AppStore.appVersion must be 1.5.1")
 
         let dir = try makeTempDir(prefix: "pulsar-v130-history")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -8757,7 +8757,7 @@ private func testV130RegressionSuite() async {
 private func testV140RegressionSuite() async {
     // 21.1 ProviderID, Default Adapters, Brand Icon & Backward-Compatible v1.3.0 -> v1.4.0 Upgrade Migration
     await T.asyncSuite("V140.ProviderMetadataAndUpgradeMigration") {
-        T.expectEqual(AppStore.appVersion, "1.5.0", "AppStore.appVersion must be 1.5.0")
+        T.expectEqual(AppStore.appVersion, "1.5.1", "AppStore.appVersion must be 1.5.1")
         T.expectEqual(
             ProviderID.allCases,
             [.antigravity, .codex, .claude, .grok, .cursor, .kimi, .deepseek],
@@ -9760,6 +9760,49 @@ private func testV150RegressionSuite() async {
 
         let activeAfterSwitch = await provider.syncLiveAccount(registry: &multiReg)
         T.expectEqual(activeAfterSwitch, "uuid-cli-max-pro2")
+
+        // (d.1) v1.5.1 NSNumber 0 / 0.0 / 1 / 1.0 vs CFBoolean regression (100% / 99% fresh quota must NEVER be dropped as Bool!)
+        let pro2CacheURL = quotasDir.appendingPathComponent("pro2.json")
+        let priorPro2CacheData = try? Data(contentsOf: pro2CacheURL)
+        let freshZeroJSON = """
+        {
+          "schemaVersion": 1,
+          "source": "claude_cli_statusline",
+          "profileId": "pro2",
+          "observedAt": "\(Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-30)))",
+          "accountUuid": "uuid-cli-max-pro2",
+          "email": "cli-max@example.com",
+          "plan": "pro",
+          "planDisplayName": "Pro",
+          "fiveHour": { "usedPercent": 0.0, "resetsAt": "\(Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(14_400)))" },
+          "sevenDay": { "usedPercent": 1, "resetsAt": "\(Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(3 * 86_400)))" }
+        }
+        """
+        try Data(freshZeroJSON.utf8).write(to: pro2CacheURL)
+        let freshZeroSnap = provider.resolvePassiveQuota(accountId: "uuid-cli-max-pro2", now: fixedNow)
+        T.expectEqual(freshZeroSnap.sourceLabel, "本地状态栏", "v1.5.1 fresh 0.0/1 usedPercent JSON must parse as ready")
+        T.expectEqual(freshZeroSnap.windows.map(\.id), ["claude_5h", "claude_weekly"])
+        T.expectEqual(freshZeroSnap.windows[0].remainingPercent, 100, "JSON 0.0 usedPercent must yield 100% remaining (not nil via is Bool)")
+        T.expectEqual(freshZeroSnap.windows[1].remainingPercent, 99, "JSON 1 usedPercent must yield 99% remaining (not nil via is Bool)")
+
+        // Boolean true/false values in JSON must still be rejected by CFBooleanGetTypeID()
+        let boolRejectJSON = """
+        {
+          "schemaVersion": 1,
+          "source": "claude_cli_statusline",
+          "profileId": "pro2",
+          "observedAt": "\(Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-10)))",
+          "accountUuid": "uuid-cli-max-pro2",
+          "fiveHour": { "usedPercent": false, "resetsAt": "\(Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(14_400)))" },
+          "sevenDay": { "usedPercent": true, "resetsAt": "\(Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(3 * 86_400)))" }
+        }
+        """
+        try Data(boolRejectJSON.utf8).write(to: pro2CacheURL)
+        let boolRejectSnap = provider.resolvePassiveQuota(accountId: "uuid-cli-max-pro2", now: fixedNow)
+        T.expect(boolRejectSnap.sourceLabel != "本地状态栏", "JSON booleans false/true must still be rejected as invalid usedPercent")
+        if let priorPro2CacheData {
+            try priorPro2CacheData.write(to: pro2CacheURL)
+        }
 
         // (e) createCLIProfile slug validation, proxy-stripped settings.json, symlinks, and deleteAccountCredentials
         T.expectEqual(ClaudeProvider.isValidProfileSlug("work3"), true)

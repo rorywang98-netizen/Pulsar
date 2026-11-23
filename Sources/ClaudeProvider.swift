@@ -1743,16 +1743,16 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
 
     private static func parseDouble(_ raw: Any?) -> Double? {
         guard let raw, !(raw is NSNull) else { return nil }
-        if raw is Bool { return nil }
-        if let d = raw as? Double, d.isFinite { return d }
-        if let i = raw as? Int { return Double(i) }
-        if let i64 = raw as? Int64 { return Double(i64) }
+        // Check NSNumber + CFBooleanGetTypeID FIRST: on Darwin/macOS, JSONSerialization
+        // decodes `0`, `0.0`, `1`, `1.0` as NSNumber which matches `raw is Bool` in Swift!
         if let n = raw as? NSNumber {
-            // Guard against CFBoolean bridging to NSNumber
             if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
             let d = n.doubleValue
             return d.isFinite ? d : nil
         }
+        if let d = raw as? Double, d.isFinite { return d }
+        if let i = raw as? Int { return Double(i) }
+        if let i64 = raw as? Int64 { return Double(i64) }
         if let s = raw as? String,
            let d = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)),
            d.isFinite {
@@ -1763,13 +1763,12 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
 
     private static func parseInt(_ raw: Any?) -> Int? {
         guard let raw, !(raw is NSNull) else { return nil }
-        if raw is Bool { return nil }
-        if let i = raw as? Int { return i }
-        if let i64 = raw as? Int64 { return Int(i64) }
         if let n = raw as? NSNumber {
             if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
             return n.intValue
         }
+        if let i = raw as? Int { return i }
+        if let i64 = raw as? Int64 { return Int(i64) }
         if let s = raw as? String {
             return Int(s.trimmingCharacters(in: .whitespacesAndNewlines))
         }

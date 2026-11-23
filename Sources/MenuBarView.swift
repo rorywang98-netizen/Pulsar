@@ -3624,6 +3624,9 @@ public struct MenuBarView: View {
     private func claudeUnconfiguredProfileBody(accountId: String, fallbackMessage: String) -> some View {
         let launchCommand = store.claudeLaunchCommand(for: accountId)
         let isCopied = (recentlyCopiedClaudeAccountId == accountId)
+        let hasLoggedInEmail = store.accounts(for: .claude)
+            .first(where: { $0.id == accountId })
+            .map { !$0.email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
         let green = Color(nsColor: .systemGreen)
         let isDark = (colorScheme == .dark)
 
@@ -3633,7 +3636,13 @@ public struct MenuBarView: View {
                     .font(.system(size: 10.5))
                     .foregroundColor(green)
                     .padding(.top, 1.5)
-                Text(launchCommand != nil ? "在终端运行后执行 /login 即可自动同步余量" : fallbackMessage)
+                Text(
+                    launchCommand != nil
+                        ? (hasLoggedInEmail
+                            ? "已登录 · 在该终端发一条消息或输入 /usage 后自动同步余量"
+                            : "在终端运行后执行 /login 即可自动同步余量")
+                        : fallbackMessage
+                )
                     .font(.system(size: 10.5))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
