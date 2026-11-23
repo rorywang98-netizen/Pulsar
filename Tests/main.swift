@@ -4617,7 +4617,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.4.0", "AppStore.appVersion must match v1.4.0")
+        T.expectEqual(AppStore.appVersion, "1.4.1", "AppStore.appVersion must match v1.4.1")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -8196,7 +8196,7 @@ private func writeSyntheticGenMetadataDB(
 private func testV130RegressionSuite() async {
     // 20.1 QuotaHistoryStore: 0600 atomic persistence, dedup vs 15m heartbeat, 7-day pruning, reset-jump exclusion, hourly peak burn math (`20:00–21:00 -24%`) & AppStore integration
     await T.asyncSuite("V130.QuotaHistoryStorePersistenceAndBurnAnalysis") {
-        T.expectEqual(AppStore.appVersion, "1.4.0", "AppStore.appVersion must be 1.4.0")
+        T.expectEqual(AppStore.appVersion, "1.4.1", "AppStore.appVersion must be 1.4.1")
 
         let dir = try makeTempDir(prefix: "pulsar-v130-history")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -8757,7 +8757,7 @@ private func testV130RegressionSuite() async {
 private func testV140RegressionSuite() async {
     // 21.1 ProviderID, Default Adapters, Brand Icon & Backward-Compatible v1.3.0 -> v1.4.0 Upgrade Migration
     await T.asyncSuite("V140.ProviderMetadataAndUpgradeMigration") {
-        T.expectEqual(AppStore.appVersion, "1.4.0", "AppStore.appVersion must be 1.4.0")
+        T.expectEqual(AppStore.appVersion, "1.4.1", "AppStore.appVersion must be 1.4.1")
         T.expectEqual(
             ProviderID.allCases,
             [.antigravity, .codex, .claude, .grok, .cursor, .kimi, .deepseek],
@@ -9085,6 +9085,132 @@ private func testV140RegressionSuite() async {
         var keyThrew = false
         do { try cliDetector.saveAPIKey("dummy", label: nil) } catch { keyThrew = true }
         T.expectEqual(keyThrew, true, "ClaudeProvider.saveAPIKey must refuse")
+
+        // (i) v1.4.1 CLI Profile Isolation & Hard Desktop Blocklist (when shared ~/.claude.json is polluted by Desktop)
+        let cliProfileURL = dir.appendingPathComponent("claude-cli-profile.json")
+        let isolatedPaths = ClaudeProvider.Paths(
+            claudeConfigURL: claudeConfigURL,
+            statusLineCacheURL: statusCacheURL,
+            cliProfileURL: cliProfileURL
+        )
+        let isolatedProvider = ClaudeProvider(
+            paths: isolatedPaths,
+            processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999)
+        )
+
+        try writeJSON([
+            "schemaVersion": 1,
+            "accountUuid": "uuid-cli-pro-user",
+            "email": "cli-pro@example.com",
+            "displayName": "CLI User",
+            "plan": "pro",
+            "planDisplayName": "Pro",
+            "billingType": "stripe_subscription",
+            "excludeDesktopEmails": ["desktop-max@example.com"],
+            "excludeDesktopAccountUuids": ["uuid-desktop-max-20x"],
+            "trustSharedClaudeJson": false,
+        ], to: cliProfileURL)
+
+        // Shared ~/.claude.json overwritten by Desktop (Max 20x)
+        try writeJSON([
+            "oauthAccount": [
+                "accountUuid": "uuid-desktop-max-20x",
+                "emailAddress": "desktop-max@example.com",
+                "displayName": "Desktop User",
+                "billingType": "stripe_subscription",
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_20x",
+            ],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int64(fixedNow.addingTimeInterval(-300).timeIntervalSince1970 * 1000.0),
+                "accountUuid": "uuid-desktop-max-20x",
+                "utilization": [
+                    "five_hour": ["utilization": 10, "resets_at": route1Reset5h],
+                    "seven_day": ["utilization": 25, "resets_at": route1Reset7d],
+                ],
+            ],
+        ], to: claudeConfigURL)
+
+        // Case 1: statusLine cache accidentally carries excluded Desktop email/UUID -> MUST be rejected (unconfigured, zero Desktop leakage)
+        try writeJSON([
+            "schemaVersion": 1,
+            "source": "claude_cli_statusline",
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-60)),
+            "accountUuid": "uuid-desktop-max-20x",
+            "email": "desktop-max@example.com",
+            "displayName": "Desktop User",
+            "fiveHour": ["usedPercent": 88.0, "resetsAt": route1Reset5h],
+            "sevenDay": ["usedPercent": 40.0, "resetsAt": route1Reset7d],
+        ], to: statusCacheURL)
+
+        var isoReg = RegistryData(accounts: [
+            AccountRecord(
+                id: "uuid-desktop-max-20x",
+                provider: .claude,
+                email: "desktop-max@example.com",
+                displayName: "Desktop User",
+                plan: PlanInfo(kind: .max, displayName: "Max 20x"),
+                isActiveLive: true
+            ),
+        ])
+        let isoSyncedId = await isolatedProvider.syncLiveAccount(registry: &isoReg)
+        T.expectEqual(isoSyncedId, "uuid-cli-pro-user", "v1.4.1 syncLiveAccount must replace polluted Desktop ID with pinned CLI profile ID")
+        T.expectEqual(isoReg.accounts(for: .claude).count, 1)
+        T.expectEqual(isoReg.accounts(for: .claude).first?.email, "cli-pro@example.com", "v1.4.1 must never leak Desktop email from shared ~/.claude.json")
+        T.expectEqual(isoReg.accounts(for: .claude).first?.plan?.kind, .pro)
+        T.expectEqual(isoReg.accounts(for: .claude).first?.plan?.displayName, "Pro", "v1.4.1 must display CLI Pro plan, never Desktop Max 20x")
+
+        let blockedSnap = isolatedProvider.resolvePassiveQuota(accountId: "uuid-desktop-max-20x", now: fixedNow)
+        T.expectEqual(blockedSnap.accountId, "uuid-cli-pro-user", "v1.4.1 must ignore excluded Desktop explicit accountId")
+        T.expectEqual(blockedSnap.plan?.displayName, "Pro")
+        T.expectEqual(blockedSnap.windows.isEmpty, true, "v1.4.1 must reject both Desktop ~/.claude.json cachedUsage and Desktop-tagged statusLine cache")
+        T.expectEqual(blockedSnap.status, .unconfigured(ClaudeProvider.passiveUnconfiguredMessage))
+
+        // Case 2: statusLine cache stamped with pinned CLI Pro account -> MUST return real CLI quota with Pro badge, ignoring Desktop ~/.claude.json
+        try writeJSON([
+            "schemaVersion": 1,
+            "source": "claude_cli_statusline",
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-60)),
+            "accountUuid": "uuid-cli-pro-user",
+            "email": "cli-pro@example.com",
+            "displayName": "CLI User",
+            "plan": "pro",
+            "planDisplayName": "Pro",
+            "fiveHour": ["usedPercent": 74.0, "resetsAt": route1Reset5h],
+            "sevenDay": ["usedPercent": 34.0, "resetsAt": route1Reset7d],
+        ], to: statusCacheURL)
+
+        let cliCleanSnap = isolatedProvider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(cliCleanSnap.accountId, "uuid-cli-pro-user")
+        T.expectEqual(cliCleanSnap.plan?.kind, .pro)
+        T.expectEqual(cliCleanSnap.plan?.displayName, "Pro")
+        T.expectEqual(cliCleanSnap.sourceLabel, "本地状态栏")
+        T.expectEqual(cliCleanSnap.windows.map(\.id), ["claude_5h", "claude_weekly"])
+        T.expectEqual(cliCleanSnap.windows[0].remainingPercent, 26)
+        T.expectEqual(cliCleanSnap.windows[1].remainingPercent, 66)
+
+        // Case 3: Route 1 accepted ONLY when ~/.claude.json cachedUsageUtilization.accountUuid explicitly matches pinned CLI UUID
+        try FileManager.default.removeItem(at: statusCacheURL)
+        try writeJSON([
+            "oauthAccount": [
+                "accountUuid": "uuid-desktop-max-20x",
+                "emailAddress": "desktop-max@example.com",
+                "organizationRateLimitTier": "default_claude_max_20x",
+            ],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int64(fixedNow.addingTimeInterval(-120).timeIntervalSince1970 * 1000.0),
+                "accountUuid": "uuid-cli-pro-user",
+                "utilization": [
+                    "five_hour": ["utilization": 20, "resets_at": route1Reset5h],
+                    "seven_day": ["utilization": 30, "resets_at": route1Reset7d],
+                ],
+            ],
+        ], to: claudeConfigURL)
+        let cliRoute1Match = isolatedProvider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(cliRoute1Match.sourceLabel, "本地缓存", "v1.4.1 may accept Route 1 ONLY when cachedUsageUtilization.accountUuid matches pinned CLI UUID")
+        T.expectEqual(cliRoute1Match.plan?.displayName, "Pro")
+        T.expectEqual(cliRoute1Match.windows[0].remainingPercent, 80)
+        T.expectEqual(cliRoute1Match.windows[1].remainingPercent, 70)
     }
 
     // 21.3 AccountPoolExporter (strict local_archive + zero secrets + unconfigured omission + cache gate) & QuotaHistoryStore Claude burn bucket

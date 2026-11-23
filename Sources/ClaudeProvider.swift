@@ -9,16 +9,23 @@ import Foundation
 /// - Zero credential or secret reads (no system vault, no cookies, no auth tokens).
 /// - Zero child-command spawning and zero interaction with Claude Desktop.
 /// - Reads ONLY non-secret metadata and cached utilization snapshots from:
-///   1. `~/.claude.json` (`oauthAccount` metadata + `cachedUsageUtilization`)
-///   2. `~/.cache/pulsar/claude-cli-quota.json` (local statusLine passive mirror)
+///   1. `~/.config/pulsar/claude-cli-profile.json` (optional CLI identity pin & Desktop exclusion guard)
+///   2. `~/.claude.json` (`oauthAccount` metadata + `cachedUsageUtilization`, gated against Desktop contamination)
+///   3. `~/.cache/pulsar/claude-cli-quota.json` (local statusLine passive mirror)
 public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
     public struct Paths: Equatable, Sendable {
         public var claudeConfigURL: URL
         public var statusLineCacheURL: URL
+        public var cliProfileURL: URL?
 
-        public init(claudeConfigURL: URL, statusLineCacheURL: URL) {
+        public init(
+            claudeConfigURL: URL,
+            statusLineCacheURL: URL,
+            cliProfileURL: URL? = nil
+        ) {
             self.claudeConfigURL = claudeConfigURL
             self.statusLineCacheURL = statusLineCacheURL
+            self.cliProfileURL = cliProfileURL
         }
 
         public static var liveDefaults: Paths {
@@ -37,9 +44,22 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
                 .appendingPathComponent(".cache", isDirectory: true)
                 .appendingPathComponent("pulsar", isDirectory: true)
                 .appendingPathComponent("claude-cli-quota.json", isDirectory: false)
+            let cliProfile: URL
+            if let profileOverride = ProcessInfo.processInfo.environment["PULSAR_CLAUDE_PROFILE_PATH"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !profileOverride.isEmpty {
+                let expanded = (profileOverride as NSString).expandingTildeInPath
+                cliProfile = URL(fileURLWithPath: expanded, isDirectory: false)
+            } else {
+                cliProfile = home
+                    .appendingPathComponent(".config", isDirectory: true)
+                    .appendingPathComponent("pulsar", isDirectory: true)
+                    .appendingPathComponent("claude-cli-profile.json", isDirectory: false)
+            }
             return Paths(
                 claudeConfigURL: claudeConfig,
-                statusLineCacheURL: statusLineCache
+                statusLineCacheURL: statusLineCache,
+                cliProfileURL: cliProfile
             )
         }
     }
@@ -55,6 +75,7 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
 
     private static let maxClaudeConfigBytes = 32 * 1024 * 1024
     private static let maxStatusLineCacheBytes = 2 * 1024 * 1024
+    private static let maxCLIProfileBytes = 256 * 1024
 
     public let id: ProviderID = .claude
     public let capabilities: ProviderCapability = [.quota]
@@ -100,22 +121,27 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     public func syncLiveAccount(registry: inout RegistryData) async -> String? {
+        let profile = readCLIProfileDocument()
         let claudeDoc = readClaudeConfigDocument()
-        let statusDoc = readStatusLineCacheDocument()
+        let rawStatusDoc = readStatusLineCacheDocument()
 
-        let oauth = claudeDoc?.oauthAccount
-        let accountUuid = Self.firstNonEmpty(oauth?.accountUuid, statusDoc?.accountUuid)
-        let email = Self.firstNonEmpty(oauth?.email, statusDoc?.email) ?? ""
-        let rawDisplay = Self.firstNonEmpty(oauth?.displayName, statusDoc?.displayName)
+        let oauth = Self.filterSharedOAuthAccount(claudeDoc?.oauthAccount, against: profile)
+        let statusDoc = Self.filterStatusLineCache(rawStatusDoc, against: profile)
+
+        let accountUuid = Self.firstNonEmpty(profile?.accountUuid, oauth?.accountUuid, statusDoc?.accountUuid)
+        let email = Self.firstNonEmpty(profile?.email, oauth?.email, statusDoc?.email) ?? ""
+        let rawDisplay = Self.firstNonEmpty(profile?.displayName, oauth?.displayName, statusDoc?.displayName)
         let displayName = Self.firstNonEmpty(rawDisplay, email) ?? "Claude CLI"
-        let resolvedPlan = Self.resolvePlan(oauth: oauth, statusLine: statusDoc)
+        let resolvedPlan = Self.resolvePlan(profile: profile, oauth: oauth, statusLine: statusDoc)
 
         let existing = registry.accounts(for: .claude)
         let canonicalId: String
         if let accountUuid {
             canonicalId = accountUuid
         } else if let existingReal = existing.first(where: {
-            $0.id != "claude:default" && $0.id != Self.defaultLocalAccountId
+            $0.id != "claude:default"
+                && $0.id != Self.defaultLocalAccountId
+                && !(profile?.isExcluded(email: $0.email, accountUuid: $0.id) ?? false)
         }) {
             canonicalId = existingReal.id
         } else {
@@ -128,11 +154,11 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
             email: email,
             displayName: displayName,
             plan: resolvedPlan,
-            addedAt: existing.first?.addedAt ?? Date(),
+            addedAt: existing.first(where: { $0.id == canonicalId })?.addedAt ?? Date(),
             isActiveLive: true
         )
 
-        // Keep strictly one local Claude CLI account entry (clean up placeholder IDs).
+        // Keep strictly one local Claude CLI account entry (clean up placeholder or excluded IDs).
         for old in existing where old.id != canonicalId {
             registry.removeAccount(id: old.id, provider: .claude)
         }
@@ -185,17 +211,36 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     public func resolvePassiveQuota(accountId explicitAccountId: String?, now: Date = Date()) -> QuotaSnapshot {
+        let profile = readCLIProfileDocument()
         let claudeDoc = readClaudeConfigDocument()
-        let statusDoc = readStatusLineCacheDocument()
+        let rawStatusDoc = readStatusLineCacheDocument()
 
-        let oauth = claudeDoc?.oauthAccount
-        let activeUuid = oauth?.accountUuid
+        let oauth = Self.filterSharedOAuthAccount(claudeDoc?.oauthAccount, against: profile)
+        let statusDoc = Self.filterStatusLineCache(rawStatusDoc, against: profile)
 
-        // Route 1 (`~/.claude.json`): reject cachedUsageUtilization if accountUuid disagrees with oauthAccount.
+        let pinnedUuid = profile?.accountUuid
+        let activeUuid = Self.firstNonEmpty(pinnedUuid, oauth?.accountUuid)
+
+        // Route 1 (`~/.claude.json`): reject Desktop-excluded or mismatched accountUuid snapshots.
+        // When `trustSharedClaudeJson == false`, accept Route 1 ONLY if its `accountUuid` explicitly matches `pinnedUuid`.
         let route1: PassiveSourceReading?
         if let cached = claudeDoc?.cachedUsage {
-            if let activeUuid, let cachedUuid = cached.accountUuid,
-               !Self.uuidsMatch(activeUuid, cachedUuid) {
+            let excluded = profile?.isExcluded(email: nil, accountUuid: cached.accountUuid) ?? false
+            let sharedBlocked: Bool
+            if let profile, !profile.trustSharedClaudeJson {
+                if let pinnedUuid, let cachedUuid = cached.accountUuid {
+                    sharedBlocked = !Self.uuidsMatch(pinnedUuid, cachedUuid)
+                } else {
+                    sharedBlocked = true
+                }
+            } else {
+                sharedBlocked = false
+            }
+
+            if excluded || sharedBlocked {
+                route1 = nil
+            } else if let activeUuid, let cachedUuid = cached.accountUuid,
+                      !Self.uuidsMatch(activeUuid, cachedUuid) {
                 route1 = nil
             } else {
                 route1 = PassiveSourceReading(
@@ -210,7 +255,7 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
             route1 = nil
         }
 
-        // Route 2 (`~/.cache/pulsar/claude-cli-quota.json`): also enforce accountUuid consistency when oauthAccount is known.
+        // Route 2 (`~/.cache/pulsar/claude-cli-quota.json`): already Desktop-filtered; enforce accountUuid consistency when known.
         let route2: PassiveSourceReading?
         if let statusDoc, (statusDoc.fiveHour != nil || statusDoc.sevenDay != nil) {
             if let activeUuid, let statusUuid = statusDoc.accountUuid,
@@ -229,14 +274,22 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
             route2 = nil
         }
 
+        let safeExplicitId: String?
+        if let explicitAccountId,
+           !(profile?.isExcluded(email: nil, accountUuid: explicitAccountId) ?? false) {
+            safeExplicitId = explicitAccountId
+        } else {
+            safeExplicitId = nil
+        }
+
         let resolvedAccountId = Self.firstNonEmpty(
-            explicitAccountId,
+            safeExplicitId,
             activeUuid,
             route2?.accountUuid,
             route1?.accountUuid
         ) ?? Self.defaultLocalAccountId
 
-        let resolvedPlan = Self.resolvePlan(oauth: oauth, statusLine: statusDoc)
+        let resolvedPlan = Self.resolvePlan(profile: profile, oauth: oauth, statusLine: statusDoc)
 
         // Choose newer source as primary; keep older source for same-account future-window backfill.
         let primary: PassiveSourceReading
@@ -389,6 +442,32 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
 
     // MARK: - Internal Parsed Models
 
+    private struct CLIProfileDocument {
+        let accountUuid: String?
+        let email: String?
+        let displayName: String?
+        let plan: String?
+        let planDisplayName: String?
+        let billingType: String?
+        let excludeDesktopEmails: Set<String>
+        let excludeDesktopAccountUuids: Set<String>
+        let trustSharedClaudeJson: Bool
+
+        func isExcluded(email candidateEmail: String?, accountUuid candidateUuid: String?) -> Bool {
+            if let e = candidateEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               !e.isEmpty,
+               excludeDesktopEmails.contains(e) {
+                return true
+            }
+            if let u = candidateUuid?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               !u.isEmpty,
+               excludeDesktopAccountUuids.contains(u) {
+                return true
+            }
+            return false
+        }
+    }
+
     private struct OAuthAccountMetadata {
         let accountUuid: String?
         let email: String?
@@ -421,6 +500,8 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
         let email: String?
         let displayName: String?
         let billingType: String?
+        let plan: String?
+        let planDisplayName: String?
         let fiveHour: PassiveWindowSample?
         let sevenDay: PassiveWindowSample?
     }
@@ -449,6 +530,59 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
             return nil
         }
         return root
+    }
+
+    private func readCLIProfileDocument() -> CLIProfileDocument? {
+        guard let url = paths.cliProfileURL,
+              let root = readJSONDictionary(at: url, maxBytes: Self.maxCLIProfileBytes) else {
+            return nil
+        }
+        let excludedEmails = Self.normalizedStringSet(root["excludeDesktopEmails"])
+        let excludedUuids = Self.normalizedStringSet(root["excludeDesktopAccountUuids"])
+        let trustShared: Bool
+        if let flag = root["trustSharedClaudeJson"] as? Bool {
+            trustShared = flag
+        } else {
+            trustShared = true
+        }
+        return CLIProfileDocument(
+            accountUuid: Self.nonEmptyString(root["accountUuid"]),
+            email: Self.nonEmptyString(root["email"]),
+            displayName: Self.nonEmptyString(root["displayName"]),
+            plan: Self.nonEmptyString(root["plan"]),
+            planDisplayName: Self.nonEmptyString(root["planDisplayName"]),
+            billingType: Self.nonEmptyString(root["billingType"]),
+            excludeDesktopEmails: excludedEmails,
+            excludeDesktopAccountUuids: excludedUuids,
+            trustSharedClaudeJson: trustShared
+        )
+    }
+
+    private static func filterSharedOAuthAccount(
+        _ oauth: OAuthAccountMetadata?,
+        against profile: CLIProfileDocument?
+    ) -> OAuthAccountMetadata? {
+        guard let oauth else { return nil }
+        if let profile {
+            if !profile.trustSharedClaudeJson {
+                return nil
+            }
+            if profile.isExcluded(email: oauth.email, accountUuid: oauth.accountUuid) {
+                return nil
+            }
+        }
+        return oauth
+    }
+
+    private static func filterStatusLineCache(
+        _ doc: StatusLineCacheDocument?,
+        against profile: CLIProfileDocument?
+    ) -> StatusLineCacheDocument? {
+        guard let doc else { return nil }
+        if let profile, profile.isExcluded(email: doc.email, accountUuid: doc.accountUuid) {
+            return nil
+        }
+        return doc
     }
 
     private func readClaudeConfigDocument() -> ClaudeConfigDocument? {
@@ -542,6 +676,8 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
             email: Self.nonEmptyString(root["email"]),
             displayName: Self.nonEmptyString(root["displayName"]),
             billingType: Self.nonEmptyString(root["billingType"]),
+            plan: Self.nonEmptyString(root["plan"]),
+            planDisplayName: Self.nonEmptyString(root["planDisplayName"]),
             fiveHour: fiveHour,
             sevenDay: sevenDay
         )
@@ -611,14 +747,20 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     private static func resolvePlan(
+        profile: CLIProfileDocument?,
         oauth: OAuthAccountMetadata?,
         statusLine: StatusLineCacheDocument?
     ) -> PlanInfo {
         let hints = [
+            profile?.planDisplayName,
+            profile?.plan,
+            statusLine?.planDisplayName,
+            statusLine?.plan,
             oauth?.organizationRateLimitTier,
             oauth?.organizationType,
             oauth?.billingType,
             statusLine?.billingType,
+            profile?.billingType,
         ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty }
 
@@ -705,6 +847,17 @@ public final class ClaudeProvider: ProviderAdapter, @unchecked Sendable {
         guard let str = raw as? String else { return nil }
         let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func normalizedStringSet(_ raw: Any?) -> Set<String> {
+        guard let arr = raw as? [Any] else { return [] }
+        var out: Set<String> = []
+        for item in arr {
+            if let s = nonEmptyString(item) {
+                out.insert(s.lowercased())
+            }
+        }
+        return out
     }
 
     private static func firstNonEmpty(_ values: String?...) -> String? {
