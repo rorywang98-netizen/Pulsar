@@ -73,7 +73,7 @@ public enum PopoverTab: String, CaseIterable, Identifiable, Hashable, Sendable {
 @MainActor
 public final class AppStore: ObservableObject {
     public nonisolated static let bundleIdentifier = "com.rory.roryorbit"
-    public nonisolated static let appVersion = "1.3.0"
+    public nonisolated static let appVersion = "1.4.0"
 
     public nonisolated static var defaultAvatarCacheDirectoryURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("avatars", isDirectory: true)
@@ -154,6 +154,7 @@ public final class AppStore: ObservableObject {
         [
             .antigravity: AntigravityProvider(keychain: keychain, processController: processController),
             .codex: CodexProvider(keychain: keychain, processController: processController),
+            .claude: ClaudeProvider(processController: processController),
             .grok: GrokProvider(keychain: keychain),
             .cursor: CursorProvider(keychain: keychain, allowInteractiveKeychain: allowInteractiveKeychain),
             .kimi: KimiProvider(keychain: keychain),
@@ -212,6 +213,7 @@ public final class AppStore: ObservableObject {
         self.providerRefreshTimeoutSeconds = max(0.5, providerRefreshTimeoutSeconds)
         self.perAccountRefreshTimeoutSeconds = perAccountRefreshTimeoutSeconds
 
+        let hadExistingRegistryFile = FileManager.default.fileExists(atPath: registryURL.path)
         let loadedRegistry: RegistryData
         var loadError: String? = nil
         do {
@@ -222,9 +224,11 @@ public final class AppStore: ObservableObject {
         }
         self.registry = loadedRegistry
 
+        let didMigrateClaude = migrateClaudePassiveProviderIfNeeded()
         sanitizeSelectedProvider()
         ensureDefaultAccountsForEnabledNonSwitchableProviders()
-        if backfillMissingAntigravityAvatarsFromBackup() {
+        let didBackfillAvatars = backfillMissingAntigravityAvatarsFromBackup()
+        if didBackfillAvatars || (didMigrateClaude && hadExistingRegistryFile) {
             persistRegistryQuietly()
         }
         refreshAPIKeyStatuses()
@@ -1554,6 +1558,7 @@ public final class AppStore: ObservableObject {
             let enabledSet = Set(updated.enabledProviders)
             updated.enabledProviders = ProviderID.allCases.filter { enabledSet.contains($0) }
         }
+        updated.claudePassiveProviderMigrated = true
         if !updated.enabledProviders.contains(updated.selectedProvider) {
             updated.selectedProvider = updated.enabledProviders[0]
         }
@@ -1946,7 +1951,7 @@ public final class AppStore: ObservableObject {
         case .codex:
             let core = snap.windows.filter { !$0.id.hasPrefix("add_") }
             candidateWindows = core.isEmpty ? snap.windows : core
-        case .grok, .cursor, .kimi, .deepseek:
+        case .claude, .grok, .cursor, .kimi, .deepseek:
             candidateWindows = snap.windows
         }
 
@@ -2951,6 +2956,20 @@ public final class AppStore: ObservableObject {
             return "\(hours) 小时前"
         }
         return "\(hours / 24) 天前"
+    }
+
+    @discardableResult
+    private func migrateClaudePassiveProviderIfNeeded() -> Bool {
+        guard !registry.settings.claudePassiveProviderMigrated else {
+            return false
+        }
+        registry.settings.claudePassiveProviderMigrated = true
+        if !registry.settings.enabledProviders.contains(.claude) {
+            var enabledSet = Set(registry.settings.enabledProviders)
+            enabledSet.insert(.claude)
+            registry.settings.enabledProviders = ProviderID.allCases.filter { enabledSet.contains($0) }
+        }
+        return true
     }
 
     private func sanitizeSelectedProvider() {

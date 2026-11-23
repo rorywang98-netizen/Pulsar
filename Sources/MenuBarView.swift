@@ -1372,9 +1372,9 @@ public struct MenuBarView: View {
             stateLabel = running ? "运行中" : "未运行"
         } else if let snap = store.primarySnapshot(for: selectedProvider) {
             switch snap.status {
-            case .ready: stateLabel = "已连接"
+            case .ready: stateLabel = (selectedProvider == .claude) ? "本地被动" : "已连接"
             case .loading: stateLabel = "刷新中"
-            case .unconfigured: stateLabel = "未配置"
+            case .unconfigured: stateLabel = (selectedProvider == .claude) ? "待 CLI 同步" : "未配置"
             case .reauthRequired: stateLabel = "需重新登录"
             case .failed: stateLabel = "获取异常"
             }
@@ -1389,29 +1389,60 @@ public struct MenuBarView: View {
         return stateLabel
     }
 
-    // MARK: - Provider Switcher Strip (Responsive 3×2 / 2×3)
+    // MARK: - Provider Switcher Strip (Balanced Adaptive Rows across 340pt–680pt)
+
+    /// Partitions enabled providers into balanced full-width rows (e.g. 7 providers -> [3, 2, 2] at 390pt,
+    /// [4, 3] at >= 510pt, [2, 2, 2, 1] at 340pt) with zero dangling half-empty grid columns.
+    public nonisolated static func providerSwitcherRows(
+        for providers: [ProviderID],
+        maxColumns: Int
+    ) -> [[ProviderID]] {
+        guard !providers.isEmpty else { return [] }
+        let safeCols = max(1, maxColumns)
+        let count = providers.count
+        let rowCount = Int(ceil(Double(count) / Double(safeCols)))
+        let baseSize = count / rowCount
+        let extraRows = count % rowCount
+
+        var rows: [[ProviderID]] = []
+        rows.reserveCapacity(rowCount)
+        var offset = 0
+        for rowIndex in 0..<rowCount {
+            let rowSize = baseSize + (rowIndex < extraRows ? 1 : 0)
+            rows.append(Array(providers[offset..<(offset + rowSize)]))
+            offset += rowSize
+        }
+        return rows
+    }
 
     private var providerPillColumnCount: Int {
         let isDualMode = (accountCardConfig.pillQuotaWindow == .both5hAndWeekly)
         if popoverWidth < 375 {
             return 2
         }
-        if isDualMode && popoverWidth < 440 {
-            return 2
+        if isDualMode {
+            return popoverWidth < 440 ? 2 : 3
+        }
+        if popoverWidth >= 510 {
+            return 4
         }
         return 3
     }
 
     private var providerSwitcherStrip: some View {
         let providers = store.enabledProvidersOrdered
-        let colCount = providerPillColumnCount
-        let isCompactThreeCol = (colCount == 3 && (popoverWidth < 420 || (accountCardConfig.pillQuotaWindow == .both5hAndWeekly && popoverWidth < 500)))
-        let gridSpacing: CGFloat = isCompactThreeCol ? 4 : 5
-        let columns = Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: colCount)
+        let maxCols = providerPillColumnCount
+        let rows = Self.providerSwitcherRows(for: providers, maxColumns: maxCols)
+        let isCompactMultiCol = (maxCols >= 3 && (popoverWidth < 420 || (accountCardConfig.pillQuotaWindow == .both5hAndWeekly && popoverWidth < 500)))
+        let gridSpacing: CGFloat = isCompactMultiCol ? 4 : 5
 
-        return LazyVGrid(columns: columns, spacing: 5) {
-            ForEach(providers) { provider in
-                providerPill(for: provider, columnCount: colCount)
+        return VStack(spacing: 5) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: gridSpacing) {
+                    ForEach(row) { provider in
+                        providerPill(for: provider, columnCount: row.count)
+                    }
+                }
             }
         }
     }
@@ -1420,15 +1451,17 @@ public struct MenuBarView: View {
         let isSelected = (provider == selectedProvider)
         let badge = pillMetricBadge(for: provider)
         let isDualMode = (accountCardConfig.pillQuotaWindow == .both5hAndWeekly)
-        let isDualThreeCol = (columnCount == 3 && isDualMode && popoverWidth < 500)
-        let isTightThreeCol = (columnCount == 3 && popoverWidth < 420) || isDualThreeCol
-        let iconSize: CGFloat = isTightThreeCol ? 12.5 : 14.5
-        let nameFontSize: CGFloat = isTightThreeCol ? 10 : 11
+        let isDualThreeCol = (columnCount >= 3 && isDualMode && popoverWidth < 500)
+        let isTightMultiCol = (columnCount == 3 && popoverWidth < 420)
+            || (columnCount >= 4 && popoverWidth < 570)
+            || isDualThreeCol
+        let iconSize: CGFloat = isTightMultiCol ? 12.5 : 14.5
+        let nameFontSize: CGFloat = isTightMultiCol ? 10 : 11
         let badgeFontSize: CGFloat = isDualThreeCol
             ? (popoverWidth < 475 ? 9 : 9.5)
-            : (isTightThreeCol ? 9.5 : 10.5)
-        let hPadding: CGFloat = isTightThreeCol ? 4.5 : 6.5
-        let innerSpacing: CGFloat = isTightThreeCol ? 2.5 : 4
+            : (isTightMultiCol ? 9.5 : 10.5)
+        let hPadding: CGFloat = isTightMultiCol ? 4.5 : 6.5
+        let innerSpacing: CGFloat = isTightMultiCol ? 2.5 : 4
 
         return Button {
             withAnimation(OrbitMotion.pill) {
@@ -1450,7 +1483,7 @@ public struct MenuBarView: View {
                     .allowsTightening(true)
                     .layoutPriority(1)
 
-                Spacer(minLength: isTightThreeCol ? 1 : 2)
+                Spacer(minLength: isTightMultiCol ? 1 : 2)
 
                 Text(badge.text)
                     .font(.system(size: badgeFontSize, weight: .semibold, design: .rounded))
@@ -1571,9 +1604,9 @@ public struct MenuBarView: View {
                 let stateLabel: String = {
                     guard let status = snap?.status else { return "待刷新" }
                     switch status {
-                    case .ready: return "已连接"
+                    case .ready: return (selectedProvider == .claude) ? "本地被动" : "已连接"
                     case .loading: return "刷新中"
-                    case .unconfigured: return "未配置"
+                    case .unconfigured: return (selectedProvider == .claude) ? "待 CLI 同步" : "未配置"
                     case .reauthRequired: return "需重新登录"
                     case .failed: return "获取异常"
                     }
@@ -3829,6 +3862,10 @@ public struct MenuBarView: View {
                 }
             }
 
+            if provider == .claude {
+                claudePassiveSafetyPill
+            }
+
             Divider().opacity(0.35)
 
             // Main Hero + Progress Bars
@@ -3882,6 +3919,30 @@ public struct MenuBarView: View {
             hoverLift: false
         )
         .animation(OrbitMotion.snappy, value: showInlineAPIKeyEditor)
+    }
+
+    private var claudePassiveSafetyPill: some View {
+        let green = Color(nsColor: .systemGreen)
+        let isDark = (colorScheme == .dark)
+        return HStack(spacing: 4.5) {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(green)
+            Text("纯本地被动 · 零联网 · 不碰桌面端")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(isDark ? green.opacity(0.95) : green.opacity(0.88))
+                .lineLimit(1)
+                .minimumScaleFactor(0.84)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3.5)
+        .background(green.opacity(isDark ? 0.14 : 0.10))
+        .overlay(
+            Capsule()
+                .strokeBorder(green.opacity(isDark ? 0.34 : 0.24), lineWidth: 0.65)
+        )
+        .clipShape(Capsule())
+        .help("仅离线读取 ~/.claude.json 与 ~/.cache/pulsar/claude-cli-quota.json，零网络请求、零钥匙串读取、不触碰 Claude 桌面端")
     }
 
     @ViewBuilder
@@ -4065,6 +4126,28 @@ public struct MenuBarView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+            }
+
+            if cfg.showResetFootnote,
+               let dualFootnote = focusFooterSummary(for: snapshot, visibleWindows: visibleWindows),
+               (provider == .claude || visibleWindows.filter({ $0.resetAt != nil }).count >= 2) {
+                HStack(spacing: 4.5) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.85))
+                    Text(dualFootnote.text)
+                        .font(.system(size: 10, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 2)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(Color.primary.opacity(0.035))
+                .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+                .help(dualFootnote.tooltip)
             }
 
             if isCurveExpanded {
@@ -4371,11 +4454,23 @@ public struct MenuBarView: View {
     }
 
     private func unconfiguredRecoveryCard(provider: ProviderID, message: String) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            statusMessageRow(icon: "key.fill", color: Color(nsColor: .systemOrange), message: message)
+        let iconName = (provider == .claude) ? "terminal.fill" : "key.fill"
+        let tint = (provider == .claude) ? Color(nsColor: .systemGreen) : Color(nsColor: .systemOrange)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            statusMessageRow(icon: iconName, color: tint, message: message)
 
             HStack(spacing: 8) {
-                if provider.supportsAPIKeyConfig {
+                if provider == .claude {
+                    Button {
+                        Task { await store.refreshProvider(.claude, userInitiated: true) }
+                    } label: {
+                        Label("重新读取本地缓存", systemImage: "arrow.clockwise")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                } else if provider.supportsAPIKeyConfig {
                     Button {
                         withAnimation(OrbitMotion.snappy) {
                             showInlineAPIKeyEditor.toggle()
@@ -4624,6 +4719,7 @@ public struct MenuBarView: View {
             return name
         }
         switch provider {
+        case .claude: return "Claude CLI 本地被动余量"
         case .grok: return "本机 Grok CLI / 账单配额"
         case .cursor: return "本机 Cursor 会话配额"
         case .kimi: return "Kimi Coding API 用量"

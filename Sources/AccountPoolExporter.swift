@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-// MARK: - AccountPool Export JSON Models (Zero Secrets, Zero Claude)
+// MARK: - AccountPool Export JSON Models (Zero Secrets, Passive Local-Archive Claude Only)
 
 public struct AccountPoolRateWindow: Codable, Equatable, Sendable {
     public let usedPercent: Double?
@@ -97,6 +97,8 @@ public struct AccountPoolProviderRow: Codable, Equatable, Sendable {
     public let provider: String
     public let account: String?
     public let accountId: String?
+    public let sourceKind: String?
+    public let sourceLabel: String?
     public let error: String?
     public let rateWindowLabels: [String: String]?
     public let credits: AccountPoolCredits?
@@ -107,6 +109,8 @@ public struct AccountPoolProviderRow: Codable, Equatable, Sendable {
         provider: String,
         account: String? = nil,
         accountId: String? = nil,
+        sourceKind: String? = nil,
+        sourceLabel: String? = nil,
         error: String? = nil,
         rateWindowLabels: [String: String]? = nil,
         credits: AccountPoolCredits? = nil,
@@ -116,6 +120,8 @@ public struct AccountPoolProviderRow: Codable, Equatable, Sendable {
         self.provider = provider
         self.account = account
         self.accountId = accountId
+        self.sourceKind = sourceKind
+        self.sourceLabel = sourceLabel
         self.error = error
         self.rateWindowLabels = rateWindowLabels
         self.credits = credits
@@ -172,7 +178,7 @@ public struct AccountPoolExportPayload: Codable, Equatable, Sendable {
 public final class AccountPoolExporter: @unchecked Sendable {
     public static let shared = AccountPoolExporter()
 
-    /// Strictly non-Claude providers exported to AccountPool.
+    /// Exported providers (Claude is strictly passive local_archive only, zero secrets/network).
     public static let exportedProviders: [ProviderID] = [
         .codex,
         .cursor,
@@ -180,7 +186,11 @@ public final class AccountPoolExporter: @unchecked Sendable {
         .deepseek,
         .kimi,
         .antigravity,
+        .claude,
     ]
+
+    public static let claudePassiveSourceKind = "local_archive"
+    public static let claudePassiveSourceLabel = "Claude CLI 本地被动"
 
     public static var defaultSnapshotURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("accountpool-snapshot.json", isDirectory: false)
@@ -254,7 +264,8 @@ public final class AccountPoolExporter: @unchecked Sendable {
 
     // MARK: - Payload Building & Atomic Snapshot Persistence
 
-    /// Builds the sanitized, zero-Claude `AccountPoolExportPayload` from current registry + quota snapshots.
+    /// Builds the sanitized `AccountPoolExportPayload` from current registry + quota snapshots.
+    /// Claude rows are emitted strictly as passive `local_archive` entries when ready (zero secrets, zero error fabrication).
     /// When `fallbackCached` is supplied, accounts whose current snapshot is missing or `.loading` retain
     /// their previous cached row so partial GUI startup refreshes never degrade AccountPool data.
     public func buildPayload(
@@ -267,7 +278,13 @@ public final class AccountPoolExporter: @unchecked Sendable {
 
         for provider in Self.exportedProviders {
             let accounts = sortedAccounts(for: provider, in: registry)
-            let prevRows = fallbackCached?.providers[provider.rawValue] ?? []
+            let prevRows: [AccountPoolProviderRow]
+            if provider == .claude {
+                prevRows = (fallbackCached?.providers[provider.rawValue] ?? [])
+                    .filter { $0.provider == "claude" && $0.sourceKind == Self.claudePassiveSourceKind }
+            } else {
+                prevRows = fallbackCached?.providers[provider.rawValue] ?? []
+            }
             var rows: [AccountPoolProviderRow] = []
 
             for account in accounts {
@@ -282,14 +299,27 @@ public final class AccountPoolExporter: @unchecked Sendable {
                     }
                 }
 
+                if provider == .claude {
+                    if let claudeRow = buildClaudeRow(account: account, snapshot: snap) {
+                        rows.append(claudeRow)
+                    }
+                    continue
+                }
+
                 let row = buildProviderRow(provider: provider, account: account, snapshot: snap)
                 rows.append(row)
             }
 
-            if rows.isEmpty && !prevRows.isEmpty {
-                rows = prevRows
+            if provider == .claude {
+                if !rows.isEmpty {
+                    providersMap[provider.rawValue] = rows
+                }
+            } else {
+                if rows.isEmpty && !prevRows.isEmpty {
+                    rows = prevRows
+                }
+                providersMap[provider.rawValue] = rows
             }
-            providersMap[provider.rawValue] = rows
         }
 
         // Build Antigravity numeric-sub registry (replaces deleted OrbitSwitch accounts.json).
@@ -473,6 +503,17 @@ public final class AccountPoolExporter: @unchecked Sendable {
         return try? JSONDecoder().decode(AccountPoolExportPayload.self, from: data)
     }
 
+    /// Validates passive-only safety invariants on any cached export payload:
+    /// if `"claude"` rows exist, every row MUST strictly declare `sourceKind == "local_archive"`.
+    public static func isValidCachedPayload(_ payload: AccountPoolExportPayload) -> Bool {
+        if let claudeRows = payload.providers["claude"] {
+            return claudeRows.allSatisfy {
+                $0.provider == "claude" && $0.sourceKind == Self.claudePassiveSourceKind
+            }
+        }
+        return true
+    }
+
     private func readFreshCachedData(maxAgeSeconds: TimeInterval, now: Date) -> Data? {
         guard FileManager.default.fileExists(atPath: snapshotURL.path),
               let data = try? Data(contentsOf: snapshotURL),
@@ -484,8 +525,8 @@ public final class AccountPoolExporter: @unchecked Sendable {
         guard age >= -60.0 && age <= max(0.0, maxAgeSeconds) else {
             return nil
         }
-        // Ensure payload has all 6 expected non-Claude providers and never contains claude.
-        guard payload.providers["claude"] == nil else {
+        // Safety gate: if "claude" is present, every row MUST strictly declare sourceKind == "local_archive".
+        guard Self.isValidCachedPayload(payload) else {
             return nil
         }
         return data
@@ -523,7 +564,63 @@ public final class AccountPoolExporter: @unchecked Sendable {
             return buildKimiRow(account: account, snapshot: snapshot)
         case .antigravity:
             return buildAntigravityRow(account: account, snapshot: snapshot)
+        case .claude:
+            return buildClaudeRow(account: account, snapshot: snapshot) ?? AccountPoolProviderRow(
+                provider: "claude",
+                sourceKind: Self.claudePassiveSourceKind,
+                sourceLabel: Self.claudePassiveSourceLabel,
+                error: Self.sanitizedStatusError(snapshot?.status)
+            )
         }
+    }
+
+    private func buildClaudeRow(account: AccountRecord, snapshot: QuotaSnapshot?) -> AccountPoolProviderRow? {
+        guard let snapshot, case .ready(let fetchedAt, _) = snapshot.status else {
+            // Never fabricate error rows for passive local Claude when unconfigured/unavailable.
+            return nil
+        }
+
+        let trimmedEmail = Self.nonEmptyTrimmed(account.email)
+        let email: String? = (trimmedEmail?.contains("@") == true) ? trimmedEmail : nil
+        let fallbackAccountId: String? = email == nil ? Self.nonEmptyTrimmed(account.id) : nil
+        let effectivePlan = snapshot.plan ?? account.plan
+        let loginMethod = Self.sanitizeSafeText(effectivePlan?.displayName) ?? "Claude CLI"
+
+        var primary: AccountPoolRateWindow?
+        var secondary: AccountPoolRateWindow?
+
+        for w in snapshot.windows {
+            if w.id == "claude_5h" || w.cadence == .fiveHour || w.windowSeconds == 18_000 {
+                if primary == nil {
+                    primary = Self.toRateWindow(w, defaultWindowMinutes: 300)
+                }
+            } else if w.id == "claude_weekly" || w.cadence == .weekly || w.windowSeconds == 604_800 {
+                if secondary == nil {
+                    secondary = Self.toRateWindow(w, defaultWindowMinutes: 10_080)
+                }
+            }
+        }
+
+        guard primary != nil || secondary != nil else {
+            return nil
+        }
+
+        return AccountPoolProviderRow(
+            provider: "claude",
+            account: nil,
+            accountId: fallbackAccountId,
+            sourceKind: Self.claudePassiveSourceKind,
+            sourceLabel: Self.claudePassiveSourceLabel,
+            rateWindowLabels: ["primary": "5 小时", "secondary": "每周"],
+            usage: AccountPoolUsageBody(
+                accountEmail: email,
+                identity: AccountPoolUsageIdentity(accountEmail: email, loginMethod: loginMethod),
+                loginMethod: loginMethod,
+                updatedAt: Self.formatRFC3339UTCSeconds(fetchedAt),
+                primary: primary,
+                secondary: secondary
+            )
+        )
     }
 
     private func buildCodexRow(account: AccountRecord, snapshot: QuotaSnapshot?) -> AccountPoolProviderRow {

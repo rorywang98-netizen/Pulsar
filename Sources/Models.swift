@@ -7,6 +7,7 @@ import Foundation
 public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
     case antigravity
     case codex
+    case claude
     case grok
     case cursor
     case kimi
@@ -18,6 +19,7 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
         switch self {
         case .antigravity: return "Antigravity"
         case .codex: return "Codex"
+        case .claude: return "Claude"
         case .grok: return "Grok"
         case .cursor: return "Cursor"
         case .kimi: return "Kimi"
@@ -29,6 +31,7 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
         switch self {
         case .antigravity: return "AGY"
         case .codex: return "Codex"
+        case .claude: return "Claude"
         case .grok: return "Grok"
         case .cursor: return "Cursor"
         case .kimi: return "Kimi"
@@ -40,6 +43,7 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
         switch self {
         case .antigravity: return "sparkles"
         case .codex: return "terminal.fill"
+        case .claude: return "sun.max.fill"
         case .grok: return "bolt.fill"
         case .cursor: return "cursorarrow.rays"
         case .kimi: return "moon.stars.fill"
@@ -51,10 +55,11 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
         switch self {
         case .antigravity: return 0
         case .codex: return 1
-        case .grok: return 2
-        case .cursor: return 3
-        case .kimi: return 4
-        case .deepseek: return 5
+        case .claude: return 2
+        case .grok: return 3
+        case .cursor: return 4
+        case .kimi: return 5
+        case .deepseek: return 6
         }
     }
 
@@ -62,7 +67,7 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
         switch self {
         case .antigravity, .codex:
             return true
-        case .grok, .cursor, .kimi, .deepseek:
+        case .claude, .grok, .cursor, .kimi, .deepseek:
             return false
         }
     }
@@ -75,7 +80,7 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
         switch self {
         case .kimi, .deepseek:
             return true
-        case .antigravity, .codex, .grok, .cursor:
+        case .antigravity, .codex, .claude, .grok, .cursor:
             return false
         }
     }
@@ -1740,6 +1745,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var autoCheckUpdates: Bool
     public var skippedUpdateVersion: String?
     public var lastUpdateCheckAt: Date?
+    public var claudePassiveProviderMigrated: Bool
 
     public init(
         enabledProviders: [ProviderID] = ProviderID.allCases,
@@ -1764,7 +1770,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         relaunchAntigravityInsiders: Bool = false,
         autoCheckUpdates: Bool = true,
         skippedUpdateVersion: String? = nil,
-        lastUpdateCheckAt: Date? = nil
+        lastUpdateCheckAt: Date? = nil,
+        claudePassiveProviderMigrated: Bool = false
     ) {
         self.enabledProviders = enabledProviders.isEmpty ? ProviderID.allCases : enabledProviders
         self.selectedProvider = selectedProvider
@@ -1790,6 +1797,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         let trimmedSkipped = skippedUpdateVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.skippedUpdateVersion = (trimmedSkipped?.isEmpty == false) ? trimmedSkipped : nil
         self.lastUpdateCheckAt = lastUpdateCheckAt
+        self.claudePassiveProviderMigrated = claudePassiveProviderMigrated
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1816,6 +1824,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case autoCheckUpdates
         case skippedUpdateVersion
         case lastUpdateCheckAt
+        case claudePassiveProviderMigrated
     }
 
     public init(from decoder: Decoder) throws {
@@ -1854,6 +1863,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         self.skippedUpdateVersion = (rawSkipped?.isEmpty == false) ? rawSkipped : nil
         self.lastUpdateCheckAt = try? c.decodeIfPresent(Date.self, forKey: .lastUpdateCheckAt)
+        self.claudePassiveProviderMigrated = (try? c.decodeIfPresent(Bool.self, forKey: .claudePassiveProviderMigrated)) ?? false
     }
 
     // MARK: - Token Client Filter Custom Ordering

@@ -2585,6 +2585,14 @@ private func testAccountPoolExporter() async {
             plan: PlanInfo(kind: .pro, displayName: "Google AI Pro"),
             isActiveLive: true
         ))
+        reg.upsertAccount(AccountRecord(
+            id: "claude-uuid-ap-001",
+            provider: .claude,
+            email: "claude-ap@example.test",
+            displayName: "Claude User",
+            plan: PlanInfo(kind: .max, displayName: "Max 20x"),
+            isActiveLive: true
+        ))
 
         // Explicit zero credits & zero resetCredits MUST be preserved
         CodexProvider.recordCreditMetadata(
@@ -2641,13 +2649,37 @@ private func testAccountPoolExporter() async {
                 status: .ready(fetchedAt: now, stale: false),
                 primaryRemainingPercent: 80
             ),
+            "claude|claude-uuid-ap-001": QuotaSnapshot(
+                provider: .claude,
+                accountId: "claude-uuid-ap-001",
+                plan: PlanInfo(kind: .max, displayName: "Max 20x"),
+                windows: [
+                    QuotaWindow(id: "claude_5h", label: "Claude · 5小时", remainingFraction: 0.88, usedPercent: 12.0, resetAt: now.addingTimeInterval(10_800), windowSeconds: 18_000, isPrimary: true),
+                    QuotaWindow(id: "claude_weekly", label: "Claude · 周", remainingFraction: 0.75, usedPercent: 25.0, resetAt: now.addingTimeInterval(200_000), windowSeconds: 604_800),
+                ],
+                status: .ready(fetchedAt: now.addingTimeInterval(-120), stale: false),
+                sourceLabel: "本地状态栏",
+                primaryRemainingPercent: 88
+            ),
         ]
 
         let payload = try exporter.writeSnapshot(registry: reg, snapshots: snaps, now: now)
 
-        // 1. Strict zero-Claude provider set
-        T.expectEqual(Set(payload.providers.keys), Set(["codex", "cursor", "grok", "deepseek", "kimi", "antigravity"]))
-        T.expectEqual(payload.providers["claude"], nil, "AccountPool export MUST NEVER contain claude provider")
+        // 1. Passive local_archive-only Claude policy alongside the 6 active providers
+        T.expectEqual(Set(payload.providers.keys), Set(["codex", "cursor", "grok", "deepseek", "kimi", "antigravity", "claude"]))
+        let claudeRows = payload.providers["claude"] ?? []
+        T.expectEqual(claudeRows.count, 1, "AccountPool export must include ready passive Claude CLI row")
+        if let claudeRow = claudeRows.first {
+            T.expectEqual(claudeRow.sourceKind, "local_archive", "Claude export MUST strictly use local_archive sourceKind")
+            T.expectEqual(claudeRow.sourceLabel, "Claude CLI 本地被动")
+            T.expect(claudeRow.sourceKind != "vendor_api" && claudeRow.sourceKind != "codexbar", "Claude export must NEVER use vendor_api or codexbar")
+            T.expectEqual(claudeRow.rateWindowLabels?["primary"], "5 小时")
+            T.expectEqual(claudeRow.rateWindowLabels?["secondary"], "每周")
+            T.expectEqual(claudeRow.usage?.accountEmail, "claude-ap@example.test")
+            T.expectEqual(claudeRow.usage?.loginMethod, "Max 20x")
+            T.expectEqual(claudeRow.usage?.primary?.usedPercent, 12.0)
+            T.expectEqual(claudeRow.usage?.secondary?.usedPercent, 25.0)
+        }
 
         // 2. Codex zero credits + Pro Lite -> Pro 100 + safe_text middle-dot replacement
         let codexRow = payload.providers["codex"]?.first
@@ -3703,8 +3735,8 @@ private func testPhase2RegressionSuite() async {
     T.suite("Phase2.OfficialProviderBrandIcons") {
         ProviderBrandIcon.clearCache()
 
-        let expectedProviders: [ProviderID] = [.antigravity, .codex, .grok, .cursor, .kimi, .deepseek]
-        T.expectEqual(ProviderID.allCases, expectedProviders, "all 6 providers must be present")
+        let expectedProviders: [ProviderID] = [.antigravity, .codex, .claude, .grok, .cursor, .kimi, .deepseek]
+        T.expectEqual(ProviderID.allCases, expectedProviders, "all 7 providers must be present")
 
         // Verify template vs full-color classification
         T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .codex), true)
@@ -3713,6 +3745,8 @@ private func testPhase2RegressionSuite() async {
         T.expectEqual(ProviderBrandIcon.isMonochromeMark(for: .grok), true)
         T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .antigravity), false)
         T.expectEqual(ProviderBrandIcon.isMonochromeMark(for: .antigravity), false)
+        T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .claude), false)
+        T.expectEqual(ProviderBrandIcon.isMonochromeMark(for: .claude), false)
         T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .cursor), false)
         T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .kimi), false)
         T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .deepseek), false)
@@ -4583,7 +4617,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.3.0", "AppStore.appVersion must match v1.3.0")
+        T.expectEqual(AppStore.appVersion, "1.4.0", "AppStore.appVersion must match v1.4.0")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -8162,7 +8196,7 @@ private func writeSyntheticGenMetadataDB(
 private func testV130RegressionSuite() async {
     // 20.1 QuotaHistoryStore: 0600 atomic persistence, dedup vs 15m heartbeat, 7-day pruning, reset-jump exclusion, hourly peak burn math (`20:00–21:00 -24%`) & AppStore integration
     await T.asyncSuite("V130.QuotaHistoryStorePersistenceAndBurnAnalysis") {
-        T.expectEqual(AppStore.appVersion, "1.3.0", "AppStore.appVersion must be 1.3.0")
+        T.expectEqual(AppStore.appVersion, "1.4.0", "AppStore.appVersion must be 1.4.0")
 
         let dir = try makeTempDir(prefix: "pulsar-v130-history")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -8718,6 +8752,636 @@ private func testV130RegressionSuite() async {
     }
 }
 
+// MARK: - Test 21: v1.4.0 Regression Suite (Passive Local-Only Claude CLI Provider, Dual-Source Merge, Reset-Aware Handling, AccountPool local_archive Gate, Burn History & 7-Provider UI)
+
+private func testV140RegressionSuite() async {
+    // 21.1 ProviderID, Default Adapters, Brand Icon & Backward-Compatible v1.3.0 -> v1.4.0 Upgrade Migration
+    await T.asyncSuite("V140.ProviderMetadataAndUpgradeMigration") {
+        T.expectEqual(AppStore.appVersion, "1.4.0", "AppStore.appVersion must be 1.4.0")
+        T.expectEqual(
+            ProviderID.allCases,
+            [.antigravity, .codex, .claude, .grok, .cursor, .kimi, .deepseek],
+            "ProviderID.allCases must have exact 7-provider order with .claude third"
+        )
+        T.expectEqual(ProviderID.claude.displayName, "Claude")
+        T.expectEqual(ProviderID.claude.shortName, "Claude")
+        T.expectEqual(ProviderID.claude.symbolName, "sun.max.fill")
+        T.expectEqual(ProviderID.claude.defaultMenuOrder, 2)
+        T.expectEqual(ProviderID.claude.supportsAccountSwitch, false)
+        T.expectEqual(ProviderID.claude.supportsLocalRPC, false)
+        T.expectEqual(ProviderID.claude.supportsAPIKeyConfig, false)
+        T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .claude), false, "Claude sunburst icon must be full-color")
+
+        let adapters = AppStore.makeDefaultAdapters(
+            keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+            processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999)
+        )
+        guard let claudeAdapter = adapters[.claude] as? ClaudeProvider else {
+            T.expect(false, "AppStore.makeDefaultAdapters must register ClaudeProvider for .claude")
+            return
+        }
+        T.expectEqual(claudeAdapter.id, .claude)
+        T.expectEqual(claudeAdapter.capabilities, [.quota])
+        T.expectEqual(claudeAdapter.transportPolicy, .systemProxy)
+        T.expectEqual(claudeAdapter.isolatedStoreNamespace, "com.rory.roryorbit.claude.local")
+        T.expectEqual(claudeAdapter.hasStoredAPIKey(), false)
+
+        // Simulate existing v1.3.0 registry.json (missing claudePassiveProviderMigrated and lacking .claude)
+        let dir = try makeTempDir(prefix: "pulsar-v140-mig")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let regURL = dir.appendingPathComponent("registry.json")
+
+        let legacyV130JSON = """
+        {
+          "schemaVersion": 1,
+          "accounts": [],
+          "settings": {
+            "enabledProviders": ["antigravity", "codex", "grok", "cursor", "kimi", "deepseek"],
+            "selectedProvider": "antigravity"
+          }
+        }
+        """
+        try Data(legacyV130JSON.utf8).write(to: regURL)
+
+        let decodedBefore = try RegistryData.load(from: regURL)
+        T.expectEqual(decodedBefore.settings.claudePassiveProviderMigrated, false, "v1.3.0 JSON must decode claudePassiveProviderMigrated == false")
+        T.expectEqual(decodedBefore.settings.enabledProviders.contains(.claude), false)
+
+        let hermeticEngine = TokenUsageEngine(
+            homeDirectoryURL: dir.appendingPathComponent("empty-home", isDirectory: true),
+            appSupportURL: dir.appendingPathComponent("empty-support", isDirectory: true),
+            legacyTokenMonitorDirURL: dir.appendingPathComponent("empty-tm", isDirectory: true)
+        )
+
+        // First v1.4.0 launch: auto-migrates once to include .claude
+        await MainActor.run {
+            let store1 = AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+                adapters: [:],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: hermeticEngine,
+                persistAccountPoolExport: false,
+                quotaHistoryStore: QuotaHistoryStore(fileURL: nil)
+            )
+            T.expectEqual(store1.registry.settings.claudePassiveProviderMigrated, true, "migration flag must flip to true on first launch")
+            T.expectEqual(store1.enabledProvidersOrdered, [.antigravity, .codex, .claude, .grok, .cursor, .kimi, .deepseek], "v1.3.0 upgrade must auto-enable .claude once")
+
+            // User explicitly toggles .claude OFF in Settings
+            store1.updateSettings { settings in
+                settings.enabledProviders.removeAll { $0 == .claude }
+            }
+            T.expectEqual(store1.enabledProvidersOrdered.contains(.claude), false, "user must be able to disable .claude in Settings")
+        }
+
+        // Reload on subsequent launch: must honor user's opt-out and NOT re-add .claude
+        let persistedAfterToggleOff = try RegistryData.load(from: regURL)
+        T.expectEqual(persistedAfterToggleOff.settings.claudePassiveProviderMigrated, true)
+        T.expectEqual(persistedAfterToggleOff.settings.enabledProviders.contains(.claude), false)
+
+        await MainActor.run {
+            let store2 = AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+                adapters: [:],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: hermeticEngine,
+                persistAccountPoolExport: false,
+                quotaHistoryStore: QuotaHistoryStore(fileURL: nil)
+            )
+            T.expectEqual(store2.enabledProvidersOrdered.contains(.claude), false, "subsequent launch must preserve user disabling .claude")
+        }
+    }
+
+    // 21.2 ClaudeProvider: Route 1, Route 2, Dual-Source Merge & Backfill, accountUuid Mismatch, Past-resetsAt Reset, Unconfigured, Desktop Exclusion & Refusals
+    await T.asyncSuite("V140.ClaudeProviderDualSourceReconciliationAndSafety") {
+        let dir = try makeTempDir(prefix: "pulsar-v140-claude-provider")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let claudeConfigURL = dir.appendingPathComponent(".claude.json")
+        let statusCacheURL = dir.appendingPathComponent("claude-cli-quota.json")
+        let paths = ClaudeProvider.Paths(claudeConfigURL: claudeConfigURL, statusLineCacheURL: statusCacheURL)
+
+        let fixedNow = Formatters.parseRFC3339("2026-11-23T06:00:00Z")!
+
+        func writeJSON(_ obj: [String: Any], to url: URL) throws {
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+            try data.write(to: url)
+        }
+
+        // (a) Unconfigured fallback when neither file exists
+        let provider = ClaudeProvider(
+            paths: paths,
+            processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999)
+        )
+        let unconfSnap = provider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(unconfSnap.provider, .claude)
+        T.expectEqual(unconfSnap.windows.isEmpty, true)
+        T.expectEqual(unconfSnap.status, .unconfigured(ClaudeProvider.passiveUnconfiguredMessage))
+
+        // (b) Route 1 only (`~/.claude.json`), including `limits` fallback & microsecond ISO-8601 resets_at
+        let route1FetchedAt = fixedNow.addingTimeInterval(-1_800) // 30m ago
+        let route1Reset5h = "2026-11-23T09:00:00.123456+00:00"
+        let route1Reset7d = "2026-11-26T03:00:00.436758+00:00"
+        try writeJSON([
+            "oauthAccount": [
+                "accountUuid": "uuid-claude-primary",
+                "emailAddress": "dev@claude.local",
+                "displayName": "Dev Claude",
+                "billingType": "stripe_subscription",
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_20x",
+            ],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int64(route1FetchedAt.timeIntervalSince1970 * 1000.0),
+                "accountUuid": "uuid-claude-primary",
+                "utilization": [
+                    "seven_day": [
+                        "utilization": 28,
+                        "resets_at": route1Reset7d,
+                    ],
+                    "limits": [
+                        ["kind": "session", "group": "session", "percent": 15, "resets_at": route1Reset5h, "is_active": true],
+                        ["kind": "weekly_all", "group": "weekly", "percent": 28, "resets_at": route1Reset7d, "is_active": true],
+                    ],
+                ],
+            ],
+        ], to: claudeConfigURL)
+
+        var reg = RegistryData(accounts: [
+            AccountRecord(id: "claude:default", provider: .claude, email: "", displayName: "Claude", isActiveLive: true)
+        ])
+        let syncedId = await provider.syncLiveAccount(registry: &reg)
+        T.expectEqual(syncedId, "uuid-claude-primary", "syncLiveAccount must resolve accountUuid from ~/.claude.json")
+        let claudeAccts = reg.accounts(for: .claude)
+        T.expectEqual(claudeAccts.count, 1, "syncLiveAccount must keep strictly 1 Claude account record")
+        T.expectEqual(claudeAccts.first?.email, "dev@claude.local")
+        T.expectEqual(claudeAccts.first?.displayName, "Dev Claude")
+        T.expectEqual(claudeAccts.first?.plan?.kind, .max)
+        T.expectEqual(claudeAccts.first?.plan?.displayName, "Max 20x")
+
+        let route1Snap = provider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(route1Snap.sourceLabel, "本地缓存")
+        T.expectEqual(route1Snap.accountId, "uuid-claude-primary")
+        T.expectEqual(route1Snap.plan?.displayName, "Max 20x")
+        if case .ready(let fetchedAt, let stale) = route1Snap.status {
+            T.expect(abs(fetchedAt.timeIntervalSince(route1FetchedAt)) < 1.0, "Route 1 fetchedAt must match fetchedAtMs")
+            T.expectEqual(stale, false, "30m-old snapshot must not be stale")
+        } else {
+            T.expect(false, "expected .ready for Route 1, got \(route1Snap.status)")
+        }
+        T.expectEqual(route1Snap.windows.map(\.id), ["claude_5h", "claude_weekly"])
+        T.expectEqual(route1Snap.windows[0].label, "Claude · 5小时")
+        T.expectEqual(route1Snap.windows[0].remainingPercent, 85, "limits fallback 15% used -> 85% remaining")
+        T.expectEqual(route1Snap.windows[0].windowSeconds, 18_000)
+        T.expectEqual(route1Snap.windows[0].isPrimary, true)
+        T.expectEqual(route1Snap.windows[1].label, "Claude · 周")
+        T.expectEqual(route1Snap.windows[1].remainingPercent, 72, "seven_day 28% used -> 72% remaining")
+        T.expectEqual(route1Snap.windows[1].windowSeconds, 604_800)
+        T.expectEqual(route1Snap.windows[1].isPrimary, false)
+
+        // Stale when > 24h old
+        let staleCheckSnap = provider.resolvePassiveQuota(now: route1FetchedAt.addingTimeInterval(86_500))
+        if case .ready(_, let isStale) = staleCheckSnap.status {
+            T.expectEqual(isStale, true, ">24h passive snapshot must be marked stale")
+        } else {
+            T.expect(false, "expected .ready(stale: true) when >24h old")
+        }
+
+        // (c) Route 2 newer-wins merge + missing sevenDay backfill from Route 1 (same account, future resetsAt)
+        // Also tests Unix epoch seconds for fiveHour.resetsAt
+        let route2ObservedAt = fixedNow.addingTimeInterval(-120) // 2m ago (newer than Route 1's 30m ago)
+        let route2Reset5hEpoch = Int(fixedNow.addingTimeInterval(14_400).timeIntervalSince1970) // +4h
+        try writeJSON([
+            "schemaVersion": 1,
+            "source": "claude_cli_statusline",
+            "observedAt": Formatters.formatRFC3339UTC(route2ObservedAt),
+            "accountUuid": "uuid-claude-primary",
+            "email": "dev@claude.local",
+            "displayName": "Dev Claude",
+            "billingType": "claude_max",
+            "fiveHour": [
+                "usedPercent": 42.0,
+                "resetsAt": route2Reset5hEpoch,
+            ],
+        ], to: statusCacheURL)
+
+        let mergedSnap = provider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(mergedSnap.sourceLabel, "本地状态栏", "newer statusLine cache must win as primary")
+        T.expectEqual(mergedSnap.windows.map(\.id), ["claude_5h", "claude_weekly"], "missing sevenDay must backfill from same-account future Route 1")
+        T.expectEqual(mergedSnap.windows[0].remainingPercent, 58, "5h must take newer Route 2 value (42% used -> 58% rem)")
+        T.expectEqual(mergedSnap.windows[0].resetAt?.timeIntervalSince1970, Double(route2Reset5hEpoch), "Unix epoch resetsAt must decode accurately")
+        T.expectEqual(mergedSnap.windows[1].remainingPercent, 72, "7d must backfill from Route 1 (28% used -> 72% rem)")
+        T.expectEqual(mergedSnap.status.isStale, false)
+
+        // (d) Route 2 standalone with Unix ms resetsAt when ~/.claude.json is absent
+        try FileManager.default.removeItem(at: claudeConfigURL)
+        let reset7dMs = Int64(fixedNow.addingTimeInterval(3 * 86_400).timeIntervalSince1970 * 1000.0)
+        try writeJSON([
+            "schemaVersion": 1,
+            "observedAt": Int64(route2ObservedAt.timeIntervalSince1970 * 1000.0),
+            "accountUuid": "uuid-route2-only",
+            "email": "solo@claude.local",
+            "displayName": "Solo",
+            "billingType": "pro",
+            "fiveHour": ["usedPercent": 10.0, "resetsAt": "2026-11-23T10:00:00Z"],
+            "sevenDay": ["usedPercent": 35.0, "resetsAt": reset7dMs],
+        ], to: statusCacheURL)
+        let route2OnlySnap = provider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(route2OnlySnap.sourceLabel, "本地状态栏")
+        T.expectEqual(route2OnlySnap.plan?.kind, .pro)
+        T.expectEqual(route2OnlySnap.windows[0].remainingPercent, 90)
+        T.expectEqual(route2OnlySnap.windows[1].remainingPercent, 65)
+        T.expect(abs((route2OnlySnap.windows[1].resetAt?.timeIntervalSince1970 ?? 0) - Double(reset7dMs) / 1000.0) < 1.0, "Unix ms resetsAt must decode accurately")
+
+        // (e) accountUuid mismatch rejection in ~/.claude.json (cachedUsageUtilization.accountUuid != oauthAccount.accountUuid)
+        try FileManager.default.removeItem(at: statusCacheURL)
+        try writeJSON([
+            "oauthAccount": [
+                "accountUuid": "uuid-new-account",
+                "emailAddress": "new@claude.local",
+                "displayName": "New User",
+                "billingType": "pro",
+            ],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int64(route1FetchedAt.timeIntervalSince1970 * 1000.0),
+                "accountUuid": "uuid-stale-other-account",
+                "utilization": [
+                    "five_hour": ["utilization": 99, "resets_at": route1Reset5h],
+                    "seven_day": ["utilization": 95, "resets_at": route1Reset7d],
+                ],
+            ],
+        ], to: claudeConfigURL)
+        let mismatchSnap = provider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(mismatchSnap.status, .unconfigured(ClaudeProvider.passiveUnconfiguredMessage), "accountUuid mismatch MUST reject cachedUsageUtilization")
+        T.expectEqual(mismatchSnap.windows.isEmpty, true)
+
+        // (f) Past-resetsAt automatic local reset to 100% remaining (zero false alarms, stale: true)
+        let past5hReset = Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-600)) // 10m ago
+        let future7dReset = Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(2 * 86_400))
+        try FileManager.default.removeItem(at: claudeConfigURL)
+        try writeJSON([
+            "schemaVersion": 1,
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-3_600)),
+            "accountUuid": "uuid-reset-test",
+            "email": "reset@claude.local",
+            "fiveHour": ["usedPercent": 96.0, "resetsAt": past5hReset],
+            "sevenDay": ["usedPercent": 40.0, "resetsAt": future7dReset],
+        ], to: statusCacheURL)
+        let resetAwareSnap = provider.resolvePassiveQuota(now: fixedNow)
+        T.expectEqual(resetAwareSnap.windows.count, 2)
+        T.expectEqual(resetAwareSnap.windows[0].id, "claude_5h")
+        T.expectEqual(resetAwareSnap.windows[0].remainingFraction, 1.0, "elapsed 5h reset must recover remainingFraction to 1.0")
+        T.expectEqual(resetAwareSnap.windows[0].usedPercent, 0.0, "elapsed 5h reset must reset usedPercent to 0.0")
+        T.expectEqual(resetAwareSnap.windows[0].resetAt, nil, "elapsed 5h reset must clear resetAt")
+        T.expectEqual(resetAwareSnap.windows[0].detail, ClaudeProvider.resetElapsedDetailMessage)
+        T.expectEqual(resetAwareSnap.windows[1].id, "claude_weekly")
+        T.expectEqual(resetAwareSnap.windows[1].remainingPercent, 60, "future 7d window must retain real utilization")
+        T.expectEqual(resetAwareSnap.status.isStale, true, "anyResetElapsed must flag snapshot stale == true")
+
+        // (g) Desktop exclusion in detectClientStatus
+        let mockInspector = MockProcessInspector()
+        mockInspector.processes = [
+            ClientProcessInfo(id: 101, name: "Claude", executablePath: "/Applications/Claude.app/Contents/MacOS/Claude", bundleId: "com.anthropic.claudefordesktop", isInteractiveCLI: false),
+            ClientProcessInfo(id: 102, name: "Claude Helper", executablePath: "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", bundleId: nil, isInteractiveCLI: false),
+            ClientProcessInfo(id: 103, name: "claude", executablePath: "/Users/rory/Library/Application Support/Claude/bin/claude", bundleId: nil, isInteractiveCLI: false),
+            ClientProcessInfo(id: 104, name: "pulsar-claude-statusline", executablePath: "/Users/rory/.local/bin/pulsar-claude-statusline", bundleId: nil, isInteractiveCLI: false),
+            ClientProcessInfo(id: 201, name: "claude", executablePath: "/opt/homebrew/bin/claude", bundleId: nil, isInteractiveCLI: true),
+            ClientProcessInfo(id: 202, name: "claude", executablePath: "/Users/rory/.local/bin/claude", bundleId: nil, isInteractiveCLI: true),
+        ]
+        let cliDetector = ClaudeProvider(
+            paths: paths,
+            processController: ProcessController(inspector: mockInspector, selfPid: 9999)
+        )
+        let runtime = await cliDetector.detectClientStatus()
+        T.expectEqual(runtime.isRunning, true)
+        T.expectEqual(runtime.runningProcesses.map(\.id), [201, 202], "detectClientStatus must include ONLY real CLI binaries and strictly exclude Claude Desktop / Application Support")
+        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Applications/Claude.app/Contents/MacOS/Claude"), false)
+        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Users/rory/Library/Application Support/Claude/claude"), false)
+        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/opt/homebrew/Cellar/claude/2.0/bin/claude"), true)
+        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Users/rory/.local/share/claude/versions/2.1.12"), true)
+
+        // (h) Strict refusal of mutating / process-control / credential operations
+        let ctrlRestart = await cliDetector.controlClient(restart: true, allowForceQuit: false)
+        let ctrlStop = await cliDetector.controlClient(restart: false, allowForceQuit: true)
+        let switchRes = await cliDetector.switchAccount(
+            to: AccountRecord(id: "uuid-reset-test", provider: .claude, email: "reset@claude.local", displayName: "Reset"),
+            allowForceQuit: false
+        )
+        T.expectEqual(ctrlRestart, .failed(ClaudeProvider.policyRefusalMessage))
+        T.expectEqual(ctrlStop, .failed(ClaudeProvider.policyRefusalMessage))
+        T.expectEqual(switchRes, .failed(ClaudeProvider.policyRefusalMessage))
+
+        var addThrew = false
+        do { _ = try await cliDetector.addAccount() } catch { addThrew = true }
+        T.expectEqual(addThrew, true, "ClaudeProvider.addAccount must refuse")
+
+        var importThrew = false
+        do { _ = try await cliDetector.importLiveAccount() } catch { importThrew = true }
+        T.expectEqual(importThrew, true, "ClaudeProvider.importLiveAccount must refuse")
+
+        var keyThrew = false
+        do { try cliDetector.saveAPIKey("dummy", label: nil) } catch { keyThrew = true }
+        T.expectEqual(keyThrew, true, "ClaudeProvider.saveAPIKey must refuse")
+    }
+
+    // 21.3 AccountPoolExporter (strict local_archive + zero secrets + unconfigured omission + cache gate) & QuotaHistoryStore Claude burn bucket
+    await T.asyncSuite("V140.AccountPoolExporterClaudeAndQuotaHistory") {
+        let dir = try makeTempDir(prefix: "pulsar-v140-export-history")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let now = Formatters.parseRFC3339("2026-11-23T08:00:00Z")!
+        let observedAt = now.addingTimeInterval(-300)
+        let reset5h = now.addingTimeInterval(14_400)
+        let reset7d = now.addingTimeInterval(4 * 86_400)
+
+        let exporter = AccountPoolExporter(appSupportURL: dir)
+        var reg = RegistryData()
+        reg.upsertAccount(AccountRecord(
+            id: "uuid-claude-export",
+            provider: .claude,
+            email: "passive@claude.local",
+            displayName: "Passive Claude",
+            plan: PlanInfo(kind: .max, displayName: "Max 20x"),
+            isActiveLive: true
+        ))
+
+        // Unconfigured Claude -> MUST be omitted (no fabricated error row)
+        let unconfSnaps: [String: QuotaSnapshot] = [
+            "claude|uuid-claude-export": QuotaSnapshot.unconfigured(
+                provider: .claude,
+                accountId: "uuid-claude-export",
+                sourceLabel: "本地被动",
+                message: ClaudeProvider.passiveUnconfiguredMessage
+            ),
+        ]
+        let unconfPayload = exporter.buildPayload(registry: reg, snapshots: unconfSnaps, now: now)
+        T.expectEqual(unconfPayload.providers["claude"], nil, "unconfigured Claude must not fabricate an error row")
+
+        // Ready passive Claude -> strictly local_archive, real observedAt, zero secrets
+        let readySnaps: [String: QuotaSnapshot] = [
+            "claude|uuid-claude-export": QuotaSnapshot(
+                provider: .claude,
+                accountId: "uuid-claude-export",
+                plan: PlanInfo(kind: .max, displayName: "Max 20x"),
+                windows: [
+                    QuotaWindow(id: "claude_5h", label: "Claude · 5小时", remainingFraction: 0.76, usedPercent: 24.0, resetAt: reset5h, windowSeconds: 18_000, isPrimary: true),
+                    QuotaWindow(id: "claude_weekly", label: "Claude · 周", remainingFraction: 0.62, usedPercent: 38.0, resetAt: reset7d, windowSeconds: 604_800),
+                ],
+                status: .ready(fetchedAt: observedAt, stale: false),
+                sourceLabel: "本地状态栏"
+            ),
+        ]
+        let payload = try exporter.writeSnapshot(registry: reg, snapshots: readySnaps, now: now)
+        T.expectEqual(AccountPoolExporter.isValidCachedPayload(payload), true)
+
+        guard let row = payload.providers["claude"]?.first else {
+            T.expect(false, "expected exported Claude row")
+            return
+        }
+        T.expectEqual(row.provider, "claude")
+        T.expectEqual(row.sourceKind, "local_archive")
+        T.expectEqual(row.sourceLabel, "Claude CLI 本地被动")
+        T.expectEqual(row.rateWindowLabels, ["primary": "5 小时", "secondary": "每周"])
+        T.expectEqual(row.usage?.updatedAt, "2026-11-23T07:55:00Z", "exported updatedAt must use real observedAt")
+        T.expectEqual(row.usage?.primary?.usedPercent, 24.0)
+        T.expectEqual(row.usage?.primary?.windowMinutes, 300)
+        T.expectEqual(row.usage?.secondary?.usedPercent, 38.0)
+        T.expectEqual(row.usage?.secondary?.windowMinutes, 10_080)
+
+        let rawJSON = try String(contentsOf: dir.appendingPathComponent("accountpool-snapshot.json"), encoding: .utf8)
+        T.expect(!rawJSON.contains("sk-ant") && !rawJSON.contains("Bearer ") && !rawJSON.contains("Cookie") && !rawJSON.contains("eyJ"), "exported JSON must contain zero credentials/secrets")
+
+        // Tampered non-local_archive Claude cached payload MUST be rejected by isValidCachedPayload
+        let tamperedVendor = AccountPoolExportPayload(
+            generatedAt: payload.generatedAt,
+            providers: [
+                "claude": [AccountPoolProviderRow(provider: "claude", sourceKind: "vendor_api", sourceLabel: "Forbidden")],
+            ],
+            antigravityRegistry: []
+        )
+        let tamperedCodexBar = AccountPoolExportPayload(
+            generatedAt: payload.generatedAt,
+            providers: [
+                "claude": [AccountPoolProviderRow(provider: "claude", sourceKind: "codexbar", sourceLabel: "Forbidden")],
+            ],
+            antigravityRegistry: []
+        )
+        T.expectEqual(AccountPoolExporter.isValidCachedPayload(tamperedVendor), false, "vendor_api Claude row must be rejected")
+        T.expectEqual(AccountPoolExporter.isValidCachedPayload(tamperedCodexBar), false, "codexbar Claude row must be rejected")
+
+        // QuotaHistoryStore records Claude CLI updates and computes hourly peak burn bucket
+        let historyStore = QuotaHistoryStore(fileURL: dir.appendingPathComponent("quota-history.json"))
+        var shanghaiCal = Calendar(identifier: .gregorian)
+        shanghaiCal.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        func makeDate(hour: Int, minute: Int) -> Date {
+            var comps = DateComponents()
+            comps.calendar = shanghaiCal
+            comps.timeZone = shanghaiCal.timeZone
+            comps.year = 2026
+            comps.month = 11
+            comps.day = 23
+            comps.hour = hour
+            comps.minute = minute
+            return shanghaiCal.date(from: comps)!
+        }
+
+        let tA = makeDate(hour: 13, minute: 10)
+        let tB = makeDate(hour: 14, minute: 05)
+        let tC = makeDate(hour: 14, minute: 55) // -28% inside 14:00-15:00!
+        let tD = makeDate(hour: 15, minute: 20) // -4% inside 15:00-16:00
+        let claudeKey = QuotaHistoryStore.accountKey(provider: .claude, accountId: "uuid-claude-export")
+
+        let historyPoints: [(Date, Double, Double)] = [
+            (tA, 0.96, 0.84),
+            (tB, 0.92, 0.83),
+            (tC, 0.64, 0.78),
+            (tD, 0.60, 0.77),
+        ]
+        for (ts, rem5h, rem7d) in historyPoints {
+            let recorded = historyStore.record(
+                snapshot: QuotaSnapshot(
+                    provider: .claude,
+                    accountId: "uuid-claude-export",
+                    windows: [
+                        QuotaWindow(id: "claude_5h", label: "Claude · 5小时", remainingFraction: rem5h, resetAt: makeDate(hour: 18, minute: 0), windowSeconds: 18_000, isPrimary: true),
+                        QuotaWindow(id: "claude_weekly", label: "Claude · 周", remainingFraction: rem7d, resetAt: reset7d, windowSeconds: 604_800),
+                    ],
+                    status: .ready(fetchedAt: ts, stale: false),
+                    sourceLabel: "本地状态栏"
+                ),
+                now: ts
+            )
+            T.expectEqual(recorded, true, "each Claude CLI quota change must be recorded")
+        }
+
+        let series = historyStore.analyze(
+            accountKey: claudeKey,
+            range: .hours24,
+            preferredWindowIds: ["claude_5h", "claude_weekly"],
+            now: makeDate(hour: 15, minute: 30),
+            calendar: shanghaiCal
+        )
+        T.expectEqual(series.map(\.windowId), ["claude_5h", "claude_weekly"])
+        if let s5h = series.first {
+            T.expect(abs(s5h.totalConsumedPercent - 36.0) < 0.5, "total 5h consumed must be ~36% (got \(s5h.totalConsumedPercent))")
+            T.expectEqual(s5h.peakBucket?.label, "14:00–15:00", "peak burn bucket must be 14:00–15:00")
+            T.expect((s5h.peakBucket?.dropPercent ?? 0) >= 27.5, "peak bucket drop must reflect ~28% burn (got \(s5h.peakBucket?.dropPercent ?? 0))")
+        } else {
+            T.expect(false, "expected claude_5h burn series")
+        }
+    }
+
+    // 21.4 NSHostingView UI Smoke Tests (7-Provider Switcher Rows + .claude Card & Curve at 340pt/390pt Light & Dark)
+    await T.asyncSuite("V140.UINSHostingViewSmokeTests") {
+        // Verify balanced 7-provider switcher partitioning across widths
+        let rows2 = MenuBarView.providerSwitcherRows(for: ProviderID.allCases, maxColumns: 2)
+        let rows3 = MenuBarView.providerSwitcherRows(for: ProviderID.allCases, maxColumns: 3)
+        let rows4 = MenuBarView.providerSwitcherRows(for: ProviderID.allCases, maxColumns: 4)
+        T.expectEqual(rows2.map(\.count), [2, 2, 2, 1], "7 providers @ 2 cols -> [2, 2, 2, 1]")
+        T.expectEqual(rows3.map(\.count), [3, 2, 2], "7 providers @ 3 cols -> [3, 2, 2] balanced rows")
+        T.expectEqual(rows4.map(\.count), [4, 3], "7 providers @ 4 cols -> [4, 3] balanced rows")
+
+        let dir = try makeTempDir(prefix: "pulsar-v140-ui")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let now = Date()
+        let reset5h = now.addingTimeInterval(2 * 3600 + 15 * 60)
+        let reset7d = now.addingTimeInterval(3 * 86_400 + 4 * 3600)
+
+        let claudeSnap = QuotaSnapshot(
+            provider: .claude,
+            accountId: "claude-ui-acct",
+            plan: PlanInfo(kind: .max, displayName: "Max 20x"),
+            windows: [
+                QuotaWindow(id: "claude_5h", label: "Claude · 5小时", remainingFraction: 0.74, usedPercent: 26.0, resetAt: reset5h, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "claude_weekly", label: "Claude · 周", remainingFraction: 0.68, usedPercent: 32.0, resetAt: reset7d, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now.addingTimeInterval(-90), stale: false),
+            sourceLabel: "本地状态栏"
+        )
+
+        // Verify dual 5h + 周 reset footnote formatting on Claude snapshot
+        let dualFootnote = MenuBarView.buildFocusFooterSummary(
+            for: claudeSnap,
+            visibleWindows: claudeSnap.windows,
+            popoverWidth: 390,
+            showResetRelative: true,
+            now: now
+        )
+        T.expect(dualFootnote != nil, "Claude dual windows must produce 5h + 周 reset footnote")
+        T.expect(dualFootnote?.text.contains("5h") == true && dualFootnote?.text.contains("周") == true, "dual reset footnote must show both 5h and 周 countdowns (got \(dualFootnote?.text ?? "nil"))")
+
+        let regURL = dir.appendingPathComponent("registry.json")
+        let reg = RegistryData(
+            accounts: [
+                AccountRecord(id: "claude-ui-acct", provider: .claude, email: "ui@claude.local", displayName: "Claude CLI", plan: PlanInfo(kind: .max, displayName: "Max 20x"), isActiveLive: true),
+            ],
+            settings: AppSettings(
+                enabledProviders: ProviderID.allCases,
+                selectedProvider: .claude,
+                claudePassiveProviderMigrated: true
+            )
+        )
+        try reg.save(to: regURL)
+
+        let historyStore = QuotaHistoryStore(fileURL: nil)
+        let claudeKey = QuotaHistoryStore.accountKey(provider: .claude, accountId: "claude-ui-acct")
+        for (offsetMin, r5, rw) in [(-180, 0.96, 0.76), (-120, 0.88, 0.73), (-60, 0.78, 0.70), (-5, 0.74, 0.68)] {
+            let ts = now.addingTimeInterval(Double(offsetMin) * 60.0)
+            _ = historyStore.record(
+                snapshot: QuotaSnapshot(
+                    provider: .claude,
+                    accountId: "claude-ui-acct",
+                    windows: [
+                        QuotaWindow(id: "claude_5h", label: "Claude · 5小时", remainingFraction: r5, resetAt: reset5h, windowSeconds: 18_000, isPrimary: true),
+                        QuotaWindow(id: "claude_weekly", label: "Claude · 周", remainingFraction: rw, resetAt: reset7d, windowSeconds: 604_800),
+                    ],
+                    status: .ready(fetchedAt: ts, stale: false),
+                    sourceLabel: "本地状态栏"
+                ),
+                now: ts
+            )
+        }
+        let claudeSeries = historyStore.analyze(accountKey: claudeKey, range: .hours24, preferredWindowIds: ["claude_5h", "claude_weekly"], now: now)
+
+        let hermeticEngine = TokenUsageEngine(
+            homeDirectoryURL: dir.appendingPathComponent("empty-home", isDirectory: true),
+            appSupportURL: dir.appendingPathComponent("empty-support", isDirectory: true),
+            legacyTokenMonitorDirURL: dir.appendingPathComponent("empty-tm", isDirectory: true)
+        )
+
+        await MainActor.run {
+            let app = NSApplication.shared
+            app.setActivationPolicy(.prohibited)
+
+            let store = AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+                adapters: [:],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: hermeticEngine,
+                persistAccountPoolExport: false,
+                quotaHistoryStore: historyStore
+            )
+            store.snapshots[AppStore.snapshotKey(provider: .claude, accountId: "claude-ui-acct")] = claudeSnap
+
+            @MainActor
+            func smokeHost<V: View>(_ view: V, width: CGFloat, height: CGFloat, fixedHeight: Bool, appearance: NSAppearance.Name, label: String) {
+                let framed: AnyView = fixedHeight
+                    ? AnyView(view.frame(width: width, height: height))
+                    : AnyView(view.frame(width: width))
+                let host = NSHostingView(rootView: framed)
+                host.appearance = NSAppearance(named: appearance)
+                host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+                host.layoutSubtreeIfNeeded()
+                let fit = host.fittingSize
+                T.expect(fit.width > 0 && fit.height > 0 && fit.width.isFinite && fit.height.isFinite, "\(label) @\(Int(width))pt must lay out with valid finite fittingSize (\(fit))")
+            }
+
+            // 1. MenuBarView with 7-provider switcher & ready .claude card at 340pt, 390pt & 540pt in Light & Dark
+            for w in [CGFloat(340), CGFloat(390), CGFloat(540)] {
+                store.registry.settings.popoverWidth = Double(w)
+                smokeHost(MenuBarView(store: store, onOpenSettings: {}), width: w, height: 620, fixedHeight: true, appearance: .aqua, label: "V140.MenuBarView.ClaudeReady.Light")
+                smokeHost(MenuBarView(store: store, onOpenSettings: {}), width: w, height: 620, fixedHeight: true, appearance: .darkAqua, label: "V140.MenuBarView.ClaudeReady.Dark")
+            }
+
+            // 2. QuotaCurvePanelView for Claude 5h + 周 dual curve at 340pt & 390pt Light & Dark
+            for w in [CGFloat(340), CGFloat(390)] {
+                let panel = QuotaCurvePanelView(
+                    seriesList: claudeSeries,
+                    selectedRange: .hours24,
+                    onSelectRange: { _ in },
+                    referenceNow: now,
+                    compact: w < 365,
+                    availableWidth: w - 36
+                )
+                smokeHost(panel, width: w - 24, height: 220, fixedHeight: false, appearance: .aqua, label: "V140.ClaudeCurve.Light")
+                smokeHost(panel, width: w - 24, height: 220, fixedHeight: false, appearance: .darkAqua, label: "V140.ClaudeCurve.Dark")
+            }
+
+            // 3. MenuBarView with unconfigured .claude card at 340pt & 390pt
+            store.snapshots[AppStore.snapshotKey(provider: .claude, accountId: "claude-ui-acct")] = QuotaSnapshot.unconfigured(
+                provider: .claude,
+                accountId: "claude-ui-acct",
+                sourceLabel: "本地被动",
+                message: ClaudeProvider.passiveUnconfiguredMessage
+            )
+            for w in [CGFloat(340), CGFloat(390)] {
+                store.registry.settings.popoverWidth = Double(w)
+                smokeHost(MenuBarView(store: store, onOpenSettings: {}), width: w, height: 620, fixedHeight: true, appearance: .darkAqua, label: "V140.MenuBarView.ClaudeUnconfigured.Dark")
+            }
+
+            // 4. SettingsView with all 7 providers & passive Claude notice in Light & Dark
+            smokeHost(SettingsView(store: store), width: 620, height: 560, fixedHeight: true, appearance: .aqua, label: "V140.SettingsView.Light")
+            smokeHost(SettingsView(store: store), width: 620, height: 560, fixedHeight: true, appearance: .darkAqua, label: "V140.SettingsView.Dark")
+        }
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -8742,6 +9406,7 @@ Task {
     await testV122RegressionSuite()
     await testV123RegressionSuite()
     await testV130RegressionSuite()
+    await testV140RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)

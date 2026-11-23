@@ -37,13 +37,13 @@ public enum ProviderBrandIcon {
     /// as a template (auto-adapting black/white for macOS Light/Dark mode and accent tints).
     ///
     /// - `codex` (OpenAI 6-petal blossom) and `grok` (xAI Grok slash-orbit): monochrome template marks (`true`)
-    /// - `antigravity` (Google gradient A), `cursor` (3D metallic cube), `kimi` (Kimi K + blue dot app icon),
-    ///   `deepseek` (DeepSeek `#4D6BFE` blue whale): full-color official artwork (`false`)
+    /// - `antigravity` (Google gradient A), `claude` (Claude terracotta 12-ray sunburst), `cursor` (3D metallic cube),
+    ///   `kimi` (Kimi K + blue dot app icon), `deepseek` (DeepSeek `#4D6BFE` blue whale): full-color official artwork (`false`)
     public static func isTemplateMark(for provider: ProviderID) -> Bool {
         switch provider {
         case .codex, .grok:
             return true
-        case .antigravity, .cursor, .kimi, .deepseek:
+        case .antigravity, .claude, .cursor, .kimi, .deepseek:
             return false
         }
     }
@@ -136,7 +136,7 @@ public enum ProviderBrandIcon {
     ///
     /// - Monochrome marks (`codex`, `grok`) are flagged `isTemplate = true` so AppKit adapts them
     ///   automatically for Light/Dark menu bars and inactive displays.
-    /// - Full-color official brand icons (`antigravity`, `cursor`, `kimi`, `deepseek`) keep
+    /// - Full-color official brand icons (`antigravity`, `claude`, `cursor`, `kimi`, `deepseek`) keep
     ///   `isTemplate = false` at full Retina clarity.
     /// - Falls back gracefully to the provider's SF Symbol if no PNG asset can be found.
     public static func menuBarImage(for provider: ProviderID, size: CGFloat = 15) -> NSImage? {

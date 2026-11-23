@@ -19,7 +19,7 @@ enum CLIRunner {
           RoryOrbit --help                                显示此帮助信息并退出
           RoryOrbit --migrate-legacy                      执行一次性历史账号与密钥迁移（输出 JSON 统计，零密钥）
           RoryOrbit --smoke-quota                         对已配置服务执行只读配额自检并打印脱敏摘要表
-          RoryOrbit --export-accountpool-json [选项]      导出 AccountPool 兼容 JSON（零密钥、零 Claude）
+          RoryOrbit --export-accountpool-json [选项]      导出 AccountPool 兼容 JSON（零密钥，Claude 仅限本地被动归档）
               --max-age <秒>                              缓存最大有效期，默认 240 秒
               --refresh                                   强制在跨进程文件锁保护下执行实时刷新
           RoryOrbit --export-usage-archive [--full]       执行纯本地日志扫描、写出日归档并输出 1 行 JSON 摘要

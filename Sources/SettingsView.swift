@@ -2425,17 +2425,17 @@ public struct SettingsView: View {
                     }
                 }
 
-                // Static read-only Phase 2 reservation notice (ZERO Claude code or access).
+                // Passive local-only Claude CLI safety notice (zero network, zero Keychain, zero Desktop access).
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "lock.shield")
+                    Image(systemName: "checkmark.shield.fill")
                         .font(.system(size: 13))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Color(nsColor: .systemGreen))
                         .padding(.top, 1)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("第二期预留：Claude CLI 17890 隔离通道 — 敬请二期启用")
+                        Text("Claude CLI 纯本地被动模式（零联网 · 不碰桌面端）")
                             .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundColor(.secondary)
-                        Text("当前版本未启用该通道，不会读取或访问任何相关本地凭证、配置或远端接口。")
+                            .foregroundColor(.primary)
+                        Text("仅离线读取 ~/.claude.json 与 ~/.cache/pulsar/claude-cli-quota.json 中的非敏感余量，绝不请求远端接口、读取系统钥匙串/Cookie 或触碰 Claude 桌面端。")
                             .font(.system(size: 10.5))
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2443,10 +2443,10 @@ public struct SettingsView: View {
                 }
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.035))
+                .background(Color(nsColor: .systemGreen).opacity(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+                        .stroke(Color(nsColor: .systemGreen).opacity(0.24), lineWidth: 0.7)
                 )
                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
@@ -2540,6 +2540,7 @@ public struct SettingsView: View {
         switch provider {
         case .antigravity: return "多账号切换 · 本地 RPC + Cloud Code"
         case .codex: return "多账号切换 · 5小时 / 本周配额"
+        case .claude: return "纯本地被动 · 零联网 · 5h / 周余量"
         case .grok: return "CLI 账单配额监控"
         case .cursor: return "本地会话配额监控"
         case .kimi: return "API 用量监控"
