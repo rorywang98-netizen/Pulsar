@@ -4617,7 +4617,7 @@ private func testV110RegressionSuite() async {
     T.suite("V110.PulsarBrandIconsAndBundleAssets") {
         ProviderBrandIcon.clearCache()
 
-        T.expectEqual(AppStore.appVersion, "1.4.1", "AppStore.appVersion must match v1.4.1")
+        T.expectEqual(AppStore.appVersion, "1.5.0", "AppStore.appVersion must match v1.5.0")
 
         // pulsarAppImage() full-color cached loader
         guard let appImg1 = ProviderBrandIcon.pulsarAppImage(),
@@ -8196,7 +8196,7 @@ private func writeSyntheticGenMetadataDB(
 private func testV130RegressionSuite() async {
     // 20.1 QuotaHistoryStore: 0600 atomic persistence, dedup vs 15m heartbeat, 7-day pruning, reset-jump exclusion, hourly peak burn math (`20:00–21:00 -24%`) & AppStore integration
     await T.asyncSuite("V130.QuotaHistoryStorePersistenceAndBurnAnalysis") {
-        T.expectEqual(AppStore.appVersion, "1.4.1", "AppStore.appVersion must be 1.4.1")
+        T.expectEqual(AppStore.appVersion, "1.5.0", "AppStore.appVersion must be 1.5.0")
 
         let dir = try makeTempDir(prefix: "pulsar-v130-history")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -8607,7 +8607,7 @@ private func testV130RegressionSuite() async {
             ],
             byProject: [
                 TokenProjectBreakdown(
-                    id: "/Users/rory/Tools/rory-orbit",
+                    id: "/Users/demo/Tools/rory-orbit",
                     projectName: "rory-orbit",
                     pathDisplay: "~/Tools/rory-orbit",
                     clients: [.antigravity],
@@ -8757,7 +8757,7 @@ private func testV130RegressionSuite() async {
 private func testV140RegressionSuite() async {
     // 21.1 ProviderID, Default Adapters, Brand Icon & Backward-Compatible v1.3.0 -> v1.4.0 Upgrade Migration
     await T.asyncSuite("V140.ProviderMetadataAndUpgradeMigration") {
-        T.expectEqual(AppStore.appVersion, "1.4.1", "AppStore.appVersion must be 1.4.1")
+        T.expectEqual(AppStore.appVersion, "1.5.0", "AppStore.appVersion must be 1.5.0")
         T.expectEqual(
             ProviderID.allCases,
             [.antigravity, .codex, .claude, .grok, .cursor, .kimi, .deepseek],
@@ -8767,7 +8767,9 @@ private func testV140RegressionSuite() async {
         T.expectEqual(ProviderID.claude.shortName, "Claude")
         T.expectEqual(ProviderID.claude.symbolName, "sun.max.fill")
         T.expectEqual(ProviderID.claude.defaultMenuOrder, 2)
-        T.expectEqual(ProviderID.claude.supportsAccountSwitch, false)
+        T.expectEqual(ProviderID.claude.supportsMultiAccount, true)
+        T.expectEqual(ProviderID.claude.supportsAccountSwitch, true)
+        T.expectEqual(ProviderID.claude.supportsClientControl, false)
         T.expectEqual(ProviderID.claude.supportsLocalRPC, false)
         T.expectEqual(ProviderID.claude.supportsAPIKeyConfig, false)
         T.expectEqual(ProviderBrandIcon.isTemplateMark(for: .claude), false, "Claude sunburst icon must be full-color")
@@ -9046,10 +9048,10 @@ private func testV140RegressionSuite() async {
         mockInspector.processes = [
             ClientProcessInfo(id: 101, name: "Claude", executablePath: "/Applications/Claude.app/Contents/MacOS/Claude", bundleId: "com.anthropic.claudefordesktop", isInteractiveCLI: false),
             ClientProcessInfo(id: 102, name: "Claude Helper", executablePath: "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", bundleId: nil, isInteractiveCLI: false),
-            ClientProcessInfo(id: 103, name: "claude", executablePath: "/Users/rory/Library/Application Support/Claude/bin/claude", bundleId: nil, isInteractiveCLI: false),
-            ClientProcessInfo(id: 104, name: "pulsar-claude-statusline", executablePath: "/Users/rory/.local/bin/pulsar-claude-statusline", bundleId: nil, isInteractiveCLI: false),
+            ClientProcessInfo(id: 103, name: "claude", executablePath: "/Users/demo/Library/Application Support/Claude/bin/claude", bundleId: nil, isInteractiveCLI: false),
+            ClientProcessInfo(id: 104, name: "pulsar-claude-statusline", executablePath: "/Users/demo/.local/bin/pulsar-claude-statusline", bundleId: nil, isInteractiveCLI: false),
             ClientProcessInfo(id: 201, name: "claude", executablePath: "/opt/homebrew/bin/claude", bundleId: nil, isInteractiveCLI: true),
-            ClientProcessInfo(id: 202, name: "claude", executablePath: "/Users/rory/.local/bin/claude", bundleId: nil, isInteractiveCLI: true),
+            ClientProcessInfo(id: 202, name: "claude", executablePath: "/Users/demo/.local/bin/claude", bundleId: nil, isInteractiveCLI: true),
         ]
         let cliDetector = ClaudeProvider(
             paths: paths,
@@ -9059,9 +9061,9 @@ private func testV140RegressionSuite() async {
         T.expectEqual(runtime.isRunning, true)
         T.expectEqual(runtime.runningProcesses.map(\.id), [201, 202], "detectClientStatus must include ONLY real CLI binaries and strictly exclude Claude Desktop / Application Support")
         T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Applications/Claude.app/Contents/MacOS/Claude"), false)
-        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Users/rory/Library/Application Support/Claude/claude"), false)
+        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Users/demo/Library/Application Support/Claude/claude"), false)
         T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/opt/homebrew/Cellar/claude/2.0/bin/claude"), true)
-        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Users/rory/.local/share/claude/versions/2.1.12"), true)
+        T.expectEqual(ClaudeProvider.isClaudeCLIExecutablePath("/Users/demo/.local/share/claude/versions/2.1.12"), true)
 
         // (h) Strict refusal of mutating / process-control / credential operations
         let ctrlRestart = await cliDetector.controlClient(restart: true, allowForceQuit: false)
@@ -9508,6 +9510,912 @@ private func testV140RegressionSuite() async {
     }
 }
 
+// MARK: - Test 22: v1.5.0 Regression Suite (Claude Multi-Profile & Switch, Cursor SafeStorage KeychainStore Cache, Grok OIDC Auto-Refresh, UI Smoke Tests)
+
+private func testV150RegressionSuite() async {
+    // 22.1 Claude Multi-Profile Discovery, Legacy Fallback, Route 1/Route 2 Isolation, Desktop Exclusion, Switch, Create/Delete, AccountPoolExporter & TokenUsageEngine
+    await T.asyncSuite("V150.ClaudeMultiProfileAndSwitch") {
+        let dir = try makeTempDir(prefix: "pulsar-v150-claude-multi")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fm = FileManager.default
+        let fakeHome = dir.appendingPathComponent("home", isDirectory: true)
+        let configDir = fakeHome.appendingPathComponent(".config/pulsar", isDirectory: true)
+        let cacheDir = fakeHome.appendingPathComponent(".cache/pulsar", isDirectory: true)
+        let quotasDir = cacheDir.appendingPathComponent("claude-cli-quotas", isDirectory: true)
+        let profilesBaseDir = fakeHome.appendingPathComponent(".claude-profiles", isDirectory: true)
+        let templateClaudeDir = fakeHome.appendingPathComponent(".claude", isDirectory: true)
+        let pro2Dir = profilesBaseDir.appendingPathComponent("pro2", isDirectory: true)
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: quotasDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: pro2Dir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: templateClaudeDir.appendingPathComponent("skills/demo-skill", isDirectory: true), withIntermediateDirectories: true)
+
+        func writeJSON(_ obj: [String: Any], to url: URL) throws {
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+            try data.write(to: url)
+        }
+
+        // Seed hermetic template ~/.claude/settings.json (with proxy env vars to strip + non-proxy env to keep) + CLAUDE.md
+        try writeJSON([
+            "env": [
+                "HTTP_PROXY": "http://127.0.0.1:7890",
+                "HTTPS_PROXY": "http://127.0.0.1:7890",
+                "http_proxy": "http://127.0.0.1:7890",
+                "https_proxy": "http://127.0.0.1:7890",
+                "KEEP_CUSTOM_FLAG": "enabled",
+            ],
+            "theme": "dark",
+        ], to: templateClaudeDir.appendingPathComponent("settings.json"))
+        try Data("# Shared Instructions\n".utf8).write(to: templateClaudeDir.appendingPathComponent("CLAUDE.md"))
+
+        let sharedClaudeConfigURL = fakeHome.appendingPathComponent(".claude.json")
+        let legacyStatusCacheURL = cacheDir.appendingPathComponent("claude-cli-quota.json")
+        let legacyProfileURL = configDir.appendingPathComponent("claude-cli-profile.json")
+        let profilesURL = configDir.appendingPathComponent("claude-cli-profiles.json")
+        let activeProfileURL = configDir.appendingPathComponent("claude-active-profile")
+
+        let paths = ClaudeProvider.Paths(
+            claudeConfigURL: sharedClaudeConfigURL,
+            statusLineCacheURL: legacyStatusCacheURL,
+            cliProfileURL: legacyProfileURL,
+            cliProfilesURL: profilesURL,
+            activeProfileURL: activeProfileURL,
+            statusLineCacheDirURL: quotasDir,
+            profilesBaseDirURL: profilesBaseDir
+        )
+
+        let fixedNow = Formatters.parseRFC3339("2026-11-23T08:00:00Z")!
+        let reset5h = "2026-11-23T11:30:00Z"
+        let reset7d = "2026-11-28T08:00:00Z"
+
+        let mockInspector = MockProcessInspector()
+        mockInspector.processes = [
+            ClientProcessInfo(id: 501, name: "claude", executablePath: "/opt/homebrew/bin/claude", bundleId: nil, isInteractiveCLI: true),
+        ]
+        let mockProc = ProcessController(inspector: mockInspector, selfPid: 9999)
+        let provider = ClaudeProvider(paths: paths, processController: mockProc)
+
+        // (a) Backward compatibility with legacy single-profile `claude-cli-profile.json` when `claude-cli-profiles.json` is absent
+        try writeJSON([
+            "schemaVersion": 1,
+            "accountUuid": "uuid-legacy-cli-default",
+            "email": "cli-pro@example.com",
+            "displayName": "Legacy Pro CLI",
+            "plan": "pro",
+            "planDisplayName": "Pro",
+            "excludeDesktopEmails": ["desktop-max@example.com"],
+            "excludeDesktopAccountUuids": ["uuid-desktop-max-20x"],
+            "trustSharedClaudeJson": false,
+        ], to: legacyProfileURL)
+        try writeJSON([
+            "schemaVersion": 1,
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-90)),
+            "accountUuid": "uuid-legacy-cli-default",
+            "email": "cli-pro@example.com",
+            "plan": "pro",
+            "planDisplayName": "Pro",
+            "fiveHour": ["usedPercent": 20.0, "resetsAt": reset5h],
+            "sevenDay": ["usedPercent": 15.0, "resetsAt": reset7d],
+        ], to: legacyStatusCacheURL)
+
+        var legacyReg = RegistryData()
+        let legacySyncedId = await provider.syncLiveAccount(registry: &legacyReg)
+        T.expectEqual(legacySyncedId, "uuid-legacy-cli-default", "legacy single-profile fallback must still work when v2 profiles file is absent")
+        T.expectEqual(legacyReg.accounts(for: .claude).count, 1)
+        let legacyQuota = provider.resolvePassiveQuota(accountId: "uuid-legacy-cli-default", now: fixedNow)
+        T.expectEqual(legacyQuota.windows.first?.remainingPercent, 80)
+
+        // (b) v2 Multi-Profile discovery (`default` + `pro2` with isolated `.claude.json` + excluded Desktop entry)
+        try writeJSON([
+            "oauthAccount": [
+                "accountUuid": "uuid-desktop-max-20x",
+                "emailAddress": "desktop-max@example.com",
+                "displayName": "Desktop Max",
+                "organizationRateLimitTier": "default_claude_max_20x",
+            ],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int64(fixedNow.addingTimeInterval(-60).timeIntervalSince1970 * 1000.0),
+                "accountUuid": "uuid-desktop-max-20x",
+                "utilization": [
+                    "five_hour": ["utilization": 5, "resets_at": reset5h],
+                    "seven_day": ["utilization": 10, "resets_at": reset7d],
+                ],
+            ],
+        ], to: sharedClaudeConfigURL)
+
+        // Isolated `pro2/.claude.json` with live oauthAccount + Route 1 cache
+        try writeJSON([
+            "oauthAccount": [
+                "accountUuid": "uuid-cli-max-pro2",
+                "emailAddress": "cli-max@example.com",
+                "displayName": "CLI Max Pro2",
+                "billingType": "stripe_subscription",
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_5x",
+            ],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int64(fixedNow.addingTimeInterval(-300).timeIntervalSince1970 * 1000.0),
+                "accountUuid": "uuid-cli-max-pro2",
+                "utilization": [
+                    "five_hour": ["utilization": 18, "resets_at": reset5h],
+                    "seven_day": ["utilization": 22, "resets_at": reset7d],
+                ],
+            ],
+        ], to: pro2Dir.appendingPathComponent(".claude.json"))
+
+        try writeJSON([
+            "schemaVersion": 2,
+            "defaultProxyPort": 17_892,
+            "excludeDesktopEmails": ["desktop-max@example.com"],
+            "excludeDesktopAccountUuids": ["uuid-desktop-max-20x"],
+            "profiles": [
+                [
+                    "id": "default",
+                    "label": "主力 Pro",
+                    "configDir": fakeHome.path,
+                    "accountUuid": "uuid-cli-pro-default",
+                    "email": "cli-pro@example.com",
+                    "displayName": "主力 Pro",
+                    "plan": "pro",
+                    "planDisplayName": "Pro",
+                    "billingType": "stripe_subscription",
+                    "trustSharedClaudeJson": false,
+                    "addedAt": "2026-11-20T08:00:00Z",
+                ],
+                [
+                    "id": "pro2",
+                    "label": "副号 Max",
+                    "configDir": pro2Dir.path,
+                    "trustSharedClaudeJson": true,
+                    "addedAt": "2026-11-21T08:00:00Z",
+                ],
+                [
+                    "id": "sneaky-desktop",
+                    "label": "Should Be Blocked",
+                    "configDir": fakeHome.path,
+                    "accountUuid": "uuid-desktop-max-20x",
+                    "email": "desktop-max@example.com",
+                    "trustSharedClaudeJson": true,
+                ],
+            ],
+        ], to: profilesURL)
+
+        var multiReg = RegistryData()
+        let activeIdBeforeSwitch = await provider.syncLiveAccount(registry: &multiReg)
+        T.expectEqual(activeIdBeforeSwitch, "uuid-cli-pro-default", "default profile must be active when claude-active-profile is absent")
+        let syncedClaudeAccounts = multiReg.accounts(for: .claude)
+        T.expectEqual(syncedClaudeAccounts.count, 2, "must discover default + pro2 and exclude Desktop profile")
+        T.expect(!syncedClaudeAccounts.contains(where: { $0.email.lowercased() == "desktop-max@example.com" || $0.id == "uuid-desktop-max-20x" }), "Desktop email/UUID must be blocked across all profiles")
+        T.expectEqual(provider.profileId(for: "uuid-cli-pro-default"), "default")
+        T.expectEqual(provider.profileId(for: "uuid-cli-max-pro2"), "pro2")
+        T.expectEqual(provider.profileId(for: "uuid-desktop-max-20x"), nil, "excluded Desktop UUID must never resolve to a profile slug")
+        T.expectEqual(provider.launchCommand(for: "uuid-cli-pro-default"), "CLAUDE_PROFILE=default claude")
+        T.expectEqual(provider.launchCommand(for: "uuid-cli-max-pro2"), "CLAUDE_PROFILE=pro2 claude")
+
+        // (c) Per-profile Route 1 & Route 2 isolation (default uses quotasDir/default.json, pro2 uses pro2/.claude.json or quotasDir/pro2.json; zero cross-profile bleed)
+        try writeJSON([
+            "schemaVersion": 1,
+            "source": "claude_cli_statusline",
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-60)),
+            "accountUuid": "uuid-cli-pro-default",
+            "email": "cli-pro@example.com",
+            "plan": "pro",
+            "planDisplayName": "Pro",
+            "fiveHour": ["usedPercent": 74.0, "resetsAt": reset5h],
+            "sevenDay": ["usedPercent": 30.0, "resetsAt": reset7d],
+        ], to: quotasDir.appendingPathComponent("default.json"))
+
+        // Before pro2.json exists, pro2 reads strictly its isolated Route 1 cache (18% used -> 82% rem), NOT legacyStatusCacheURL!
+        let pro2Route1Snap = provider.resolvePassiveQuota(accountId: "uuid-cli-max-pro2", now: fixedNow)
+        T.expectEqual(pro2Route1Snap.sourceLabel, "本地缓存", "pro2 must read isolated Route 1 when pro2.json is absent")
+        T.expectEqual(pro2Route1Snap.windows.first?.remainingPercent, 82)
+        T.expectEqual(pro2Route1Snap.plan?.displayName, "Max 5x")
+
+        // Now write per-profile Route 2 `pro2.json` -> supersedes pro2 Route 1 without affecting `default`
+        try writeJSON([
+            "schemaVersion": 1,
+            "source": "claude_cli_statusline",
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-30)),
+            "accountUuid": "uuid-cli-max-pro2",
+            "email": "cli-max@example.com",
+            "plan": "max",
+            "planDisplayName": "Max 5x",
+            "fiveHour": ["usedPercent": 12.0, "resetsAt": reset5h],
+            "sevenDay": ["usedPercent": 15.0, "resetsAt": reset7d],
+        ], to: quotasDir.appendingPathComponent("pro2.json"))
+
+        let defQuota = provider.resolvePassiveQuota(accountId: "uuid-cli-pro-default", now: fixedNow)
+        let pro2Quota = provider.resolvePassiveQuota(accountId: "uuid-cli-max-pro2", now: fixedNow)
+        T.expectEqual(defQuota.windows.first?.remainingPercent, 26, "default profile must keep 26% 5h remaining")
+        T.expectEqual(defQuota.windows.last?.remainingPercent, 70, "default profile must keep 70% weekly remaining")
+        T.expectEqual(pro2Quota.windows.first?.remainingPercent, 88, "pro2 profile must read 88% 5h remaining from pro2.json")
+        T.expectEqual(pro2Quota.windows.last?.remainingPercent, 85, "pro2 profile must read 85% weekly remaining from pro2.json")
+
+        // Desktop-polluted pro2.json must be rejected cleanly
+        let pollutedDir = profilesBaseDir.appendingPathComponent("polluted", isDirectory: true)
+        try fm.createDirectory(at: pollutedDir, withIntermediateDirectories: true)
+        try writeJSON([
+            "schemaVersion": 1,
+            "observedAt": Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(-10)),
+            "accountUuid": "uuid-desktop-max-20x",
+            "email": "desktop-max@example.com",
+            "fiveHour": ["usedPercent": 1.0, "resetsAt": reset5h],
+        ], to: quotasDir.appendingPathComponent("polluted.json"))
+        let desktopExplicitSnap = provider.resolvePassiveQuota(accountId: "uuid-desktop-max-20x", now: fixedNow)
+        T.expectEqual(desktopExplicitSnap.accountId, "uuid-cli-pro-default", "Desktop explicit UUID must be ignored rather than exposing Desktop data")
+
+        // (d) Pure local default-profile switch (`claude-active-profile`, 0600, zero process kills, zero Keychain)
+        guard let pro2Account = syncedClaudeAccounts.first(where: { $0.id == "uuid-cli-max-pro2" }),
+              let defaultAccount = syncedClaudeAccounts.first(where: { $0.id == "uuid-cli-pro-default" }) else {
+            T.expect(false, "expected both default and pro2 accounts")
+            return
+        }
+        let switchRes = await provider.switchAccount(to: pro2Account, allowForceQuit: true)
+        T.expectEqual(switchRes, .switched(reopenedApps: []), "Claude switchAccount must return .switched(reopenedApps: []) with zero process restarts")
+        T.expectEqual(try String(contentsOf: activeProfileURL, encoding: .utf8), "pro2\n")
+        T.expectEqual(try posixPermissions(at: activeProfileURL), 0o600, "claude-active-profile must be 0600")
+        T.expectEqual(provider.activeProfileId(), "pro2")
+        T.expectEqual(mockInspector.terminateRequests.isEmpty && mockInspector.signalsSent.isEmpty, true, "Claude switchAccount must NEVER terminate or signal any running process")
+
+        let activeAfterSwitch = await provider.syncLiveAccount(registry: &multiReg)
+        T.expectEqual(activeAfterSwitch, "uuid-cli-max-pro2")
+
+        // (e) createCLIProfile slug validation, proxy-stripped settings.json, symlinks, and deleteAccountCredentials
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("work3"), true)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("team_a-1.b"), true)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("default"), false)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("desktop"), false)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("../escape"), false)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("UpperBad"), false)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug("-leading-dash"), false)
+        T.expectEqual(ClaudeProvider.isValidProfileSlug(String(repeating: "a", count: 33)), false)
+
+        let createdWork3 = try provider.createCLIProfile(id: "work3", label: "Work Pro")
+        T.expectEqual(createdWork3.profileId, "work3")
+        T.expectEqual(createdWork3.launchCommand, "CLAUDE_PROFILE=work3 claude")
+        let work3Dir = profilesBaseDir.appendingPathComponent("work3", isDirectory: true)
+        let work3SettingsURL = work3Dir.appendingPathComponent("settings.json")
+        T.expectEqual(try posixPermissions(at: work3Dir), 0o700, "new profile directory must be 0700")
+        T.expectEqual(try posixPermissions(at: work3SettingsURL), 0o600, "copied settings.json must be 0600")
+        T.expectEqual(try posixPermissions(at: profilesURL), 0o600, "updated claude-cli-profiles.json must be 0600")
+
+        let work3SettingsData = try Data(contentsOf: work3SettingsURL)
+        let work3Settings = try JSONSerialization.jsonObject(with: work3SettingsData, options: []) as? [String: Any]
+        let work3Env = work3Settings?["env"] as? [String: Any]
+        T.expectEqual(work3Env?["HTTP_PROXY"] == nil && work3Env?["HTTPS_PROXY"] == nil && work3Env?["http_proxy"] == nil && work3Env?["https_proxy"] == nil, true, "all proxy env vars must be stripped from copied settings.json")
+        T.expectEqual(work3Env?["KEEP_CUSTOM_FLAG"] as? String, "enabled", "non-proxy env keys must be preserved")
+        let statusLineCmd = (work3Settings?["statusLine"] as? [String: Any])?["command"] as? String ?? ""
+        T.expect(statusLineCmd.hasSuffix("/.local/bin/pulsar-claude-statusline"), "statusLine.command must point to pulsar-claude-statusline")
+
+        let skillsSymlink = work3Dir.appendingPathComponent("skills")
+        let claudeMdSymlink = work3Dir.appendingPathComponent("CLAUDE.md")
+        T.expectEqual(try fm.destinationOfSymbolicLink(atPath: skillsSymlink.path), templateClaudeDir.appendingPathComponent("skills").path, "skills must be symlinked to template .claude/skills")
+        T.expectEqual(try fm.destinationOfSymbolicLink(atPath: claudeMdSymlink.path), templateClaudeDir.appendingPathComponent("CLAUDE.md").path, "CLAUDE.md must be symlinked to template .claude/CLAUDE.md")
+
+        var dupThrew = false
+        do { _ = try provider.createCLIProfile(id: "work3", label: "Dup") } catch { dupThrew = true }
+        T.expectEqual(dupThrew, true, "duplicate profile slug must throw")
+
+        // Verify deleteAccountCredentials refuses/no-ops on `default`, unregisters non-default & resets active pointer while preserving directory
+        try provider.deleteAccountCredentials(accountId: defaultAccount.id)
+        var afterDefaultDeleteReg = RegistryData()
+        _ = await provider.syncLiveAccount(registry: &afterDefaultDeleteReg)
+        T.expectEqual(afterDefaultDeleteReg.accounts(for: .claude).count, 3, "deleteAccountCredentials must NEVER remove default profile")
+
+        // (f) AppStore integration: switchAccount banner, bestRemaining badge, createClaudeCLIProfile, removeAccount (block default, allow non-default) & controlClient guard
+        let storeRegURL = dir.appendingPathComponent("store-registry.json")
+        let hermeticEngine = TokenUsageEngine(
+            homeDirectoryURL: dir.appendingPathComponent("empty-home", isDirectory: true),
+            appSupportURL: dir.appendingPathComponent("empty-support", isDirectory: true),
+            legacyTokenMonitorDirURL: dir.appendingPathComponent("empty-tm", isDirectory: true)
+        )
+        let store = await MainActor.run {
+            AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: mockProc,
+                adapters: [.claude: provider],
+                registryURL: storeRegURL,
+                startScheduler: false,
+                tokenUsageEngine: hermeticEngine,
+                persistAccountPoolExport: false,
+                quotaHistoryStore: QuotaHistoryStore(fileURL: nil)
+            )
+        }
+        await store.refreshProvider(.claude, userInitiated: true)
+        await MainActor.run {
+            let accts = store.accounts(for: .claude)
+            T.expectEqual(accts.count, 3, "AppStore must list all 3 Claude profiles (default + pro2 + work3)")
+            T.expectEqual(store.claudeProfileId(for: "uuid-cli-pro-default"), "default")
+            T.expectEqual(store.claudeLaunchCommand(for: "claude-profile:work3"), "CLAUDE_PROFILE=work3 claude")
+            // pro2 (88% rem) beats default (26% rem) among the 2 ready profiles
+            let pro2Rec = accts.first(where: { $0.id == "uuid-cli-max-pro2" })
+            let defRec = accts.first(where: { $0.id == "uuid-cli-pro-default" })
+            let work3Rec = accts.first(where: { $0.id == "claude-profile:work3" })
+            T.expectEqual(pro2Rec?.isBestRemaining, true, "pro2 (88%) must get 余量最多 badge when 2+ Claude profiles are ready")
+            T.expectEqual(defRec?.isBestRemaining, false)
+            T.expectEqual(work3Rec?.isBestRemaining, false)
+            T.expectEqual(store.snapshot(for: .claude, accountId: "claude-profile:work3")?.status.isReady, false)
+        }
+
+        // Switch via AppStore -> must show non-restart banner
+        await store.switchAccount(provider: .claude, account: defaultAccount)
+        await MainActor.run {
+            T.expectEqual(
+                store.operationBanner,
+                "已将新终端 Claude CLI 默认账号切换为 \(defaultAccount.displayName)（不重启进行中的终端）",
+                "Claude AppStore.switchAccount must display exact non-restart default-switch banner"
+            )
+            T.expectEqual(store.operationBannerIsError, false)
+        }
+
+        // Create profile via AppStore
+        let appCreateRes = await store.createClaudeCLIProfile(id: "team4", label: "Team Max")
+        if case .success(let info) = appCreateRes {
+            T.expectEqual(info.profileId, "team4")
+            T.expectEqual(info.launchCommand, "CLAUDE_PROFILE=team4 claude")
+        } else {
+            T.expect(false, "AppStore.createClaudeCLIProfile must succeed for valid slug")
+        }
+        await MainActor.run {
+            T.expectEqual(
+                store.operationBanner,
+                "已创建配置 team4，登录命令已复制：CLAUDE_PROFILE=team4 claude",
+                "createClaudeCLIProfile must set exact creation + clipboard banner"
+            )
+            T.expect(store.accounts(for: .claude).contains(where: { $0.id == "claude-profile:team4" }), "newly created team4 must appear in AppStore accounts")
+        }
+
+        // Attempt to remove default via AppStore -> MUST be blocked
+        await store.removeAccount(provider: .claude, account: defaultAccount)
+        await MainActor.run {
+            T.expectEqual(store.operationBannerIsError, true, "removing default Claude profile must fail with error banner")
+            T.expect(store.accounts(for: .claude).contains(where: { $0.id == defaultAccount.id }), "default Claude profile must remain intact")
+        }
+
+        // Switch active to team4, write a dummy team4.json cache, then remove team4 -> resets active to default, removes cache, preserves directory!
+        let team4Account = await MainActor.run {
+            store.accounts(for: .claude).first(where: { $0.id == "claude-profile:team4" })!
+        }
+        await store.switchAccount(provider: .claude, account: team4Account)
+        T.expectEqual(provider.activeProfileId(), "team4")
+        let team4CacheFile = quotasDir.appendingPathComponent("team4.json")
+        try Data("{}".utf8).write(to: team4CacheFile)
+        await store.removeAccount(provider: .claude, account: team4Account)
+        T.expectEqual(provider.activeProfileId(), "default", "removing active non-default profile must reset claude-active-profile to default")
+        T.expectEqual(fm.fileExists(atPath: team4CacheFile.path), false, "removing non-default profile must delete its quota cache JSON")
+        T.expectEqual(fm.fileExists(atPath: profilesBaseDir.appendingPathComponent("team4").path), true, "removing non-default profile must preserve ~/.claude-profiles/<id> directory")
+        await MainActor.run {
+            T.expect(!store.accounts(for: .claude).contains(where: { $0.id == "claude-profile:team4" }), "removed team4 must no longer be listed")
+        }
+
+        // controlClient on .claude via AppStore must be refused
+        await store.controlClient(provider: .claude, restart: true)
+        await MainActor.run {
+            T.expectEqual(store.operationBanner, ClaudeProvider.policyRefusalMessage)
+            T.expectEqual(store.operationBannerIsError, true)
+        }
+
+        // (g) Multi-profile AccountPoolExporter `local_archive` export (2 ready exported with accountId, 1 unconfigured omitted)
+        let exportSupportDir = dir.appendingPathComponent("export-support", isDirectory: true)
+        let exporter = AccountPoolExporter(appSupportURL: exportSupportDir)
+        let exportReg = await MainActor.run { store.registry }
+        let exportSnaps = await MainActor.run { store.snapshots }
+        let exportedPayload = try exporter.writeSnapshot(registry: exportReg, snapshots: exportSnaps, now: fixedNow)
+        T.expectEqual(AccountPoolExporter.isValidCachedPayload(exportedPayload), true)
+        let exportedClaudeRows = exportedPayload.providers["claude"] ?? []
+        T.expectEqual(exportedClaudeRows.count, 2, "must export 2 ready Claude profiles and omit unconfigured work3")
+        T.expect(exportedClaudeRows.allSatisfy { $0.sourceKind == "local_archive" }, "all exported Claude rows must have sourceKind == local_archive")
+        let exportedIds = Set(exportedClaudeRows.compactMap(\.accountId))
+        T.expectEqual(exportedIds, Set(["uuid-cli-pro-default", "uuid-cli-max-pro2"]), "exported rows must preserve per-profile accountId")
+        let exportedRaw = try String(contentsOf: exportSupportDir.appendingPathComponent("accountpool-snapshot.json"), encoding: .utf8)
+        T.expect(!exportedRaw.contains("sk-ant") && !exportedRaw.contains("Bearer ") && !exportedRaw.contains("desktop-max@example.com"), "multi-profile export must contain zero secrets and zero Desktop emails")
+
+        // (h) TokenUsageEngine scans both ~/.claude/projects/**/*.jsonl and ~/.claude-profiles/*/projects/**/*.jsonl with global msgId dedup
+        let usageHome = dir.appendingPathComponent("usage-home", isDirectory: true)
+        let usageSupport = dir.appendingPathComponent("usage-support", isDirectory: true)
+        let defaultProjDir = usageHome.appendingPathComponent(".claude/projects/repo-main", isDirectory: true)
+        let profileProjDir = usageHome.appendingPathComponent(".claude-profiles/pro2/projects/repo-side", isDirectory: true)
+        try fm.createDirectory(at: defaultProjDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: profileProjDir, withIntermediateDirectories: true)
+
+        let defaultLogLines = [
+            #"{"type":"assistant","timestamp":"2026-11-23T02:00:00Z","cwd":"/Users/demo/repo-main","message":{"id":"msg_v150_shared","model":"claude-sonnet-4","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":300,"cache_creation_input_tokens":0}}}"#,
+            #"{"type":"assistant","timestamp":"2026-11-23T02:05:00Z","cwd":"/Users/demo/repo-main","message":{"id":"msg_v150_default","model":"claude-sonnet-4","usage":{"input_tokens":150,"output_tokens":150,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}}}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(defaultLogLines.utf8).write(to: defaultProjDir.appendingPathComponent("session-default.jsonl"))
+
+        let profileLogLines = [
+            // Duplicate msg_v150_shared across profile dir -> MUST deduplicate globally!
+            #"{"type":"assistant","timestamp":"2026-11-23T02:00:00Z","cwd":"/Users/demo/repo-side","message":{"id":"msg_v150_shared","model":"claude-sonnet-4","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":300,"cache_creation_input_tokens":0}}}"#,
+            // Unique message inside ~/.claude-profiles/pro2/projects/ -> total 500
+            #"{"type":"assistant","timestamp":"2026-11-23T02:10:00Z","cwd":"/Users/demo/repo-side","message":{"id":"msg_v150_pro2","model":"claude-opus-4","usage":{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0}}}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(profileLogLines.utf8).write(to: profileProjDir.appendingPathComponent("session-pro2.jsonl"))
+
+        let usageEngine = TokenUsageEngine(homeDirectoryURL: usageHome, appSupportURL: usageSupport)
+        let usageSnap = await usageEngine.scanAndExportArchive(forceFullRescan: true, now: fixedNow)
+        let claudeUsage = usageSnap.summary(for: .today, clientFilter: .claude)
+        T.expectEqual(claudeUsage.totals.totalTokens, 1500, "must sum ~/.claude (600+400) + ~/.claude-profiles/pro2 (500) with msgId dedup = 1500")
+        T.expectEqual(claudeUsage.totals.messageCount, 3, "deduplicated Claude message count across default + pro2 profiles must be 3")
+    }
+
+    // 22.2 Cursor SafeStorage KeychainStore Persistence & Stale Cache Self-Repair
+    await T.asyncSuite("V150.CursorSafeStorageKeychainCache") {
+        let dir = try makeTempDir(prefix: "pulsar-v150-cursor-cache")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        func writeCursorStateDB(to dbURL: URL, email: String, encryptedToken: String) throws {
+            try? FileManager.default.removeItem(at: dbURL)
+            var db: OpaquePointer?
+            T.expectEqual(sqlite3_open(dbURL.path, &db), SQLITE_OK)
+            defer { sqlite3_close(db) }
+            let ddl = """
+            CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO ItemTable VALUES ('cursorAuth/cachedEmail', '\(email)');
+            INSERT INTO ItemTable VALUES ('cursorAuth/stripeMembershipType', 'pro');
+            INSERT INTO ItemTable VALUES ('cursorAuth/stripeSubscriptionStatus', 'active');
+            INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', '\(encryptedToken)');
+            """
+            T.expectEqual(sqlite3_exec(db, ddl, nil, nil, nil), SQLITE_OK)
+        }
+
+        let dbURL = dir.appendingPathComponent("state.vscdb")
+        let jwtV1 = makeUnsignedJWT(payload: ["sub": "auth0|user_cache_1", "exp": 1_950_000_000])
+        let passwordV1 = "safe-storage-secret-v1"
+        let encryptedV1 = encryptCursorSafeStorageVector(plaintext: jwtV1, password: passwordV1)
+        try writeCursorStateDB(to: dbURL, email: "cursor-pro@example.com", encryptedToken: encryptedV1)
+
+        StubURLProtocol.reset { req, _ in
+            let urlStr = req.url?.absoluteString ?? ""
+            let resp: (Int, String) -> (HTTPURLResponse, Data) = { code, json in
+                (HTTPURLResponse(url: req.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, Data(json.utf8))
+            }
+            if urlStr.contains("/api/usage-summary") {
+                return resp(200, """
+                {
+                  "membershipType": "pro",
+                  "billingCycleStart": "2026-11-01T00:00:00Z",
+                  "billingCycleEnd": "2026-12-01T00:00:00Z",
+                  "individualUsage": {
+                    "plan": { "used": 2500, "limit": 10000, "remaining": 7500, "totalPercentUsed": 25.0 },
+                    "onDemand": { "enabled": false, "used": 0, "limit": null }
+                  }
+                }
+                """)
+            }
+            if urlStr.contains("/get-sand-usage-status") {
+                return resp(404, "{}")
+            }
+            if urlStr.contains("/v2/usage-status") {
+                return resp(200, "{\"availability\":\"missing_team_id\"}")
+            }
+            if urlStr.contains("/api/usage?") {
+                return resp(200, "{\"gpt-4\":{\"numRequests\":10,\"maxRequestUsage\":500}}")
+            }
+            return resp(404, "{}")
+        }
+
+        let acct = AccountRecord(
+            id: CursorProvider.defaultAccountId,
+            provider: .cursor,
+            email: "cursor-pro@example.com",
+            displayName: "cursor-pro@example.com"
+        )
+
+        // (a) Pre-seeded Pulsar KeychainStore cache ONLY (no "Cursor Safe Storage" entry at all) + allowInteractiveKeychain == false
+        let cacheOnlyBackend = InMemoryKeychainBackend()
+        let cacheOnlyKC = KeychainStore(backend: cacheOnlyBackend)
+        try cacheOnlyKC.writeSecret(
+            service: CursorProvider.safeStorageCacheService,
+            account: CursorProvider.safeStorageCacheAccount,
+            value: passwordV1
+        )
+        let cachedProvider = CursorProvider(
+            keychain: cacheOnlyKC,
+            stateDBURL: dbURL,
+            session: makeMockSession(),
+            allowInteractiveKeychain: false
+        )
+        let cachedSnap = await cachedProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expect(cachedSnap.status.isReady, "CursorProvider must decrypt accessToken non-interactively using cached com.rory.roryorbit.cursor/safe-storage-key")
+        T.expectEqual(cachedSnap.primaryRemainingPercent, 75)
+
+        // (b) Cold cache populates Pulsar KeychainStore on first successful decrypt, then survives even after Cursor Safe Storage is removed
+        let coldBackend = InMemoryKeychainBackend()
+        let coldKC = KeychainStore(backend: coldBackend)
+        try coldKC.writeExternalGenericPassword(service: "Cursor Safe Storage", account: "Cursor Key", value: passwordV1)
+        let coldProvider = CursorProvider(
+            keychain: coldKC,
+            stateDBURL: dbURL,
+            session: makeMockSession(),
+            allowInteractiveKeychain: false
+        )
+        let coldSnap = await coldProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expect(coldSnap.status.isReady, "cold CursorProvider must decrypt from Cursor Safe Storage")
+        let persistedKey = try coldKC.readSecret(
+            service: CursorProvider.safeStorageCacheService,
+            account: CursorProvider.safeStorageCacheAccount
+        )
+        T.expectEqual(persistedKey, passwordV1, "successful decrypt must persist SafeStorage password into Pulsar KeychainStore")
+
+        // Remove external "Cursor Safe Storage" and verify a brand-new CursorProvider still succeeds purely from Pulsar's cached key
+        try coldBackend.deleteGenericPassword(service: "Cursor Safe Storage", account: "Cursor Key")
+        let afterRemovalProvider = CursorProvider(
+            keychain: coldKC,
+            stateDBURL: dbURL,
+            session: makeMockSession(),
+            allowInteractiveKeychain: false
+        )
+        let afterRemovalSnap = await afterRemovalProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expect(afterRemovalSnap.status.isReady, "fresh CursorProvider must succeed non-interactively from persisted KeychainStore cache")
+
+        // (c) Stale cached key repair: rotate SafeStorage password & re-encrypt DB while Pulsar cache still holds stale passwordV1
+        let jwtV2 = makeUnsignedJWT(payload: ["sub": "auth0|user_cache_2", "exp": 1_960_000_000])
+        let passwordV2 = "safe-storage-secret-rotated-v2"
+        let encryptedV2 = encryptCursorSafeStorageVector(plaintext: jwtV2, password: passwordV2)
+        try writeCursorStateDB(to: dbURL, email: "cursor-pro@example.com", encryptedToken: encryptedV2)
+
+        try coldKC.writeSecret(
+            service: CursorProvider.safeStorageCacheService,
+            account: CursorProvider.safeStorageCacheAccount,
+            value: passwordV1 // stale!
+        )
+        try coldKC.writeExternalGenericPassword(service: "Cursor Safe Storage", account: "Cursor Key", value: passwordV2)
+
+        let repairProvider = CursorProvider(
+            keychain: coldKC,
+            stateDBURL: dbURL,
+            session: makeMockSession(),
+            allowInteractiveKeychain: false
+        )
+        let repairSnap = await repairProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expect(repairSnap.status.isReady, "CursorProvider must recover when cached SafeStorage key is stale")
+        let repairedKey = try coldKC.readSecret(
+            service: CursorProvider.safeStorageCacheService,
+            account: CursorProvider.safeStorageCacheAccount
+        )
+        T.expectEqual(repairedKey, passwordV2, "stale cached SafeStorage key must be automatically repaired to rotated password")
+    }
+
+    // 22.3 Grok OIDC Proactive & Reactive Auto-Refresh, Flock, Atomic 0600 Write-Back & invalid_grant Handling
+    await T.asyncSuite("V150.GrokOIDCAutoRefresh") {
+        let dir = try makeTempDir(prefix: "pulsar-v150-grok-oidc")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let authURL = dir.appendingPathComponent("auth.json")
+        let lockURL = URL(fileURLWithPath: authURL.path + ".lock")
+        let acct = AccountRecord(id: GrokProvider.defaultAccountId, provider: .grok, email: "grok-pro@example.com", displayName: "Ada L")
+
+        func makeBillingGRPCFrame(usedPercent: Float, resetTS: UInt64) -> Data {
+            let tsMsg = pbVarint(field: 1, value: resetTS)
+            let inner1 = pbFixed32(field: 1, value: usedPercent) + pbLengthDelimited(field: 5, payload: tsMsg)
+            let outer = pbLengthDelimited(field: 1, payload: inner1)
+            var framed = grpcWebFrame(flags: 0x00, body: outer)
+            framed.append(grpcWebFrame(flags: 0x80, body: Array("grpc-status: 0\r\n".utf8)))
+            return framed
+        }
+
+        let futureResetTS = UInt64(Date().addingTimeInterval(3600 * 6).timeIntervalSince1970)
+
+        // (a) Proactive refresh when expires_at is within 60s leeway -> POST /oauth2/token under flock, atomic 0600 write-back preserving unrelated fields
+        let nearExpiryToken = makeUnsignedJWT(payload: ["sub": "grok_u1", "exp": Int(Date().addingTimeInterval(15).timeIntervalSince1970)])
+        let refreshedToken1 = makeUnsignedJWT(payload: ["sub": "grok_u1", "exp": Int(Date().addingTimeInterval(3600).timeIntervalSince1970)])
+        let proactiveAuthDict: [String: Any] = [
+            "https://auth.x.ai::client-v150": [
+                "key": nearExpiryToken,
+                "refresh_token": "rt_proactive_old",
+                "email": "grok-pro@example.com",
+                "first_name": "Ada",
+                "last_name": "L",
+                "auth_mode": "oidc",
+                "coding_data_team": "personal",
+                "expires_at": Formatters.formatRFC3339UTC(Date().addingTimeInterval(15)),
+                "custom_keep_field": "preserve-me-150",
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: proactiveAuthDict, options: [.sortedKeys]).write(to: authURL)
+
+        var oauthRefreshCount = 0
+        var lastSeenBillingAuthHeader: String? = nil
+        StubURLProtocol.reset { req, body in
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr == "https://auth.x.ai/oauth2/token" {
+                oauthRefreshCount += 1
+                let bodyStr = String(data: body, encoding: .utf8) ?? ""
+                T.expect(bodyStr.contains("grant_type=refresh_token"), "OIDC token POST must include grant_type=refresh_token")
+                T.expect(bodyStr.contains("client_id=client-v150"), "OIDC token POST must include client_id")
+                T.expect(bodyStr.contains("refresh_token=rt_proactive_old"), "OIDC token POST must include refresh_token")
+                let respJSON = """
+                {
+                  "access_token": "\(refreshedToken1)",
+                  "refresh_token": "rt_proactive_rotated",
+                  "expires_in": 3600,
+                  "token_type": "Bearer"
+                }
+                """
+                return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(respJSON.utf8))
+            }
+            if urlStr.contains("GetGrokCreditsConfig") {
+                lastSeenBillingAuthHeader = req.value(forHTTPHeaderField: "Authorization")
+                return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, makeBillingGRPCFrame(usedPercent: 30.0, resetTS: futureResetTS))
+            }
+            return (HTTPURLResponse(url: req.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+        }
+
+        let grokProvider = GrokProvider(
+            keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+            authFileURL: authURL,
+            session: makeMockSession()
+        )
+        let proactiveSnap = await grokProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expect(proactiveSnap.status.isReady, "proactive OIDC refresh must produce .ready Grok snapshot")
+        T.expectEqual(proactiveSnap.primaryRemainingPercent, 70)
+        T.expectEqual(oauthRefreshCount, 1, "proactive refresh must call /oauth2/token exactly once")
+        T.expectEqual(lastSeenBillingAuthHeader, "Bearer \(refreshedToken1)", "billing call must use newly refreshed Bearer token")
+        T.expectEqual(FileManager.default.fileExists(atPath: lockURL.path), true, "OIDC refresh must create advisory .lock file")
+        T.expectEqual(try posixPermissions(at: authURL), 0o600, "rewritten auth.json must enforce 0600 permissions")
+
+        let persistedRoot = try JSONSerialization.jsonObject(with: Data(contentsOf: authURL), options: []) as? [String: Any]
+        let persistedEntry = persistedRoot?["https://auth.x.ai::client-v150"] as? [String: Any]
+        T.expectEqual(persistedEntry?["key"] as? String, refreshedToken1, "auth.json must store refreshed access_token")
+        T.expectEqual(persistedEntry?["refresh_token"] as? String, "rt_proactive_rotated", "auth.json must store rotated refresh_token")
+        T.expectEqual(persistedEntry?["email"] as? String, "grok-pro@example.com", "unrelated email field must be preserved")
+        T.expectEqual(persistedEntry?["first_name"] as? String, "Ada", "unrelated first_name field must be preserved")
+        T.expectEqual(persistedEntry?["custom_keep_field"] as? String, "preserve-me-150", "arbitrary extra fields must be preserved")
+
+        // (b) Reactive OIDC refresh on grpc-status: 16 (and/or 401): refreshes ONCE and retries billing once
+        let validLookingOldToken = makeUnsignedJWT(payload: ["sub": "grok_u1", "exp": Int(Date().addingTimeInterval(7200).timeIntervalSince1970)])
+        let reactiveNewToken = makeUnsignedJWT(payload: ["sub": "grok_u1", "exp": Int(Date().addingTimeInterval(10_800).timeIntervalSince1970)])
+        let reactiveAuthDict: [String: Any] = [
+            "https://auth.x.ai::client-v150": [
+                "key": validLookingOldToken,
+                "refresh_token": "rt_reactive_old",
+                "email": "grok-pro@example.com",
+                "first_name": "Ada",
+                "auth_mode": "oidc",
+                "coding_data_team": "personal",
+                "expires_at": Formatters.formatRFC3339UTC(Date().addingTimeInterval(7200)),
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: reactiveAuthDict, options: [.sortedKeys]).write(to: authURL)
+
+        var reactiveRefreshCalls = 0
+        var reactiveBillingCalls = 0
+        StubURLProtocol.reset { req, _ in
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr == "https://auth.x.ai/oauth2/token" {
+                reactiveRefreshCalls += 1
+                let respJSON = """
+                {
+                  "access_token": "\(reactiveNewToken)",
+                  "refresh_token": "rt_reactive_new",
+                  "expires_in": 3600
+                }
+                """
+                return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(respJSON.utf8))
+            }
+            if urlStr.contains("GetGrokCreditsConfig") {
+                reactiveBillingCalls += 1
+                if req.value(forHTTPHeaderField: "Authorization") == "Bearer \(validLookingOldToken)" {
+                    // Reject old token with gRPC UNAUTHENTICATED (status 16)
+                    let unauthFrame = grpcWebFrame(flags: 0x80, body: Array("grpc-status: 16\r\n".utf8))
+                    return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, unauthFrame)
+                }
+                return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, makeBillingGRPCFrame(usedPercent: 18.0, resetTS: futureResetTS))
+            }
+            return (HTTPURLResponse(url: req.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!, Data())
+        }
+
+        let reactiveSnap = await grokProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expect(reactiveSnap.status.isReady, "reactive OIDC refresh must recover on grpc-status: 16")
+        T.expectEqual(reactiveSnap.primaryRemainingPercent, 82)
+        T.expectEqual(reactiveRefreshCalls, 1, "reactive refresh must run strictly once")
+        T.expectEqual(reactiveBillingCalls, 2, "billing must be attempted initially + retried once with refreshed token")
+
+        // (c) 400 invalid_grant on OIDC refresh -> clean .reauthRequired("请重新登录 Grok CLI")
+        let expiredToken = makeUnsignedJWT(payload: ["sub": "grok_u1", "exp": Int(Date().addingTimeInterval(-300).timeIntervalSince1970)])
+        let revokedAuthDict: [String: Any] = [
+            "https://auth.x.ai::client-v150": [
+                "key": expiredToken,
+                "refresh_token": "rt_revoked",
+                "email": "grok-pro@example.com",
+                "auth_mode": "oidc",
+                "coding_data_team": "personal",
+                "expires_at": Formatters.formatRFC3339UTC(Date().addingTimeInterval(-300)),
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: revokedAuthDict, options: [.sortedKeys]).write(to: authURL)
+
+        StubURLProtocol.reset { req, _ in
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr == "https://auth.x.ai/oauth2/token" {
+                return (
+                    HTTPURLResponse(url: req.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                    Data(#"{"error":"invalid_grant","error_description":"refresh token revoked"}"#.utf8)
+                )
+            }
+            return (HTTPURLResponse(url: req.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!, Data())
+        }
+
+        let invalidGrantSnap = await grokProvider.fetchQuota(for: acct, isActiveLive: true)
+        T.expectEqual(invalidGrantSnap.status, .reauthRequired("请重新登录 Grok CLI"), "400 invalid_grant must return clean .reauthRequired")
+    }
+
+    // 22.4 v1.5.0 SwiftUI NSHostingView Smoke Tests (Claude 2-profile ready + unconfigured + inline creator + SettingsView across 340pt/390pt/540pt Light & Dark)
+    await T.asyncSuite("V150.UISmokeTests") {
+        let dir = try makeTempDir(prefix: "pulsar-v150-ui")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let now = Date()
+        let reset5h = now.addingTimeInterval(2 * 3600 + 40 * 60)
+        let reset7d = now.addingTimeInterval(4 * 86_400 + 2 * 3600)
+
+        let profilesURL = dir.appendingPathComponent("claude-cli-profiles.json")
+        let activeProfileURL = dir.appendingPathComponent("claude-active-profile")
+        let quotasDir = dir.appendingPathComponent("quotas", isDirectory: true)
+        let profilesBaseDir = dir.appendingPathComponent("profiles", isDirectory: true)
+        try FileManager.default.createDirectory(at: quotasDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: profilesBaseDir.appendingPathComponent("pro2", isDirectory: true), withIntermediateDirectories: true)
+
+        let profilesJSON: [String: Any] = [
+            "schemaVersion": 2,
+            "profiles": [
+                [
+                    "id": "default",
+                    "label": "主力 Pro",
+                    "configDir": dir.path,
+                    "accountUuid": "uuid-ui-cli-pro",
+                    "email": "cli-pro@example.com",
+                    "displayName": "主力 Pro",
+                    "plan": "pro",
+                    "planDisplayName": "Pro",
+                    "trustSharedClaudeJson": false,
+                ],
+                [
+                    "id": "pro2",
+                    "label": "副号 Pro2",
+                    "configDir": profilesBaseDir.appendingPathComponent("pro2").path,
+                    "trustSharedClaudeJson": true,
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: profilesJSON, options: [.sortedKeys]).write(to: profilesURL)
+
+        let claudeAdapter = ClaudeProvider(
+            paths: ClaudeProvider.Paths(
+                claudeConfigURL: dir.appendingPathComponent(".claude.json"),
+                statusLineCacheURL: dir.appendingPathComponent("legacy-quota.json"),
+                cliProfileURL: nil,
+                cliProfilesURL: profilesURL,
+                activeProfileURL: activeProfileURL,
+                statusLineCacheDirURL: quotasDir,
+                profilesBaseDirURL: profilesBaseDir
+            ),
+            processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999)
+        )
+
+        let regURL = dir.appendingPathComponent("registry.json")
+        let reg = RegistryData(
+            accounts: [
+                AccountRecord(
+                    id: "uuid-ui-cli-pro",
+                    provider: .claude,
+                    email: "cli-pro@example.com",
+                    displayName: "主力 Pro",
+                    plan: PlanInfo(kind: .pro, displayName: "Pro"),
+                    isActiveLive: true
+                ),
+                AccountRecord(
+                    id: "claude-profile:pro2",
+                    provider: .claude,
+                    email: "",
+                    displayName: "副号 Pro2",
+                    plan: nil,
+                    isActiveLive: false
+                ),
+            ],
+            settings: AppSettings(
+                enabledProviders: ProviderID.allCases,
+                selectedProvider: .claude,
+                claudePassiveProviderMigrated: true
+            )
+        )
+        try reg.save(to: regURL)
+
+        let readyProSnap = QuotaSnapshot(
+            provider: .claude,
+            accountId: "uuid-ui-cli-pro",
+            plan: PlanInfo(kind: .pro, displayName: "Pro"),
+            windows: [
+                QuotaWindow(id: "claude_5h", label: "Claude · 5小时", remainingFraction: 0.78, usedPercent: 22.0, resetAt: reset5h, windowSeconds: 18_000, isPrimary: true),
+                QuotaWindow(id: "claude_weekly", label: "Claude · 周", remainingFraction: 0.66, usedPercent: 34.0, resetAt: reset7d, windowSeconds: 604_800),
+            ],
+            status: .ready(fetchedAt: now.addingTimeInterval(-60), stale: false),
+            sourceLabel: "本地状态栏"
+        )
+        let unconfPro2Snap = QuotaSnapshot.unconfigured(
+            provider: .claude,
+            accountId: "claude-profile:pro2",
+            sourceLabel: "本地被动",
+            message: ClaudeProvider.passiveUnconfiguredMessage
+        )
+
+        let hermeticEngine = TokenUsageEngine(
+            homeDirectoryURL: dir.appendingPathComponent("empty-home", isDirectory: true),
+            appSupportURL: dir.appendingPathComponent("empty-support", isDirectory: true),
+            legacyTokenMonitorDirURL: dir.appendingPathComponent("empty-tm", isDirectory: true)
+        )
+
+        await MainActor.run {
+            let app = NSApplication.shared
+            app.setActivationPolicy(.prohibited)
+
+            let store = AppStore(
+                keychain: KeychainStore(backend: InMemoryKeychainBackend()),
+                processController: ProcessController(inspector: MockProcessInspector(), selfPid: 9999),
+                adapters: [.claude: claudeAdapter],
+                registryURL: regURL,
+                startScheduler: false,
+                tokenUsageEngine: hermeticEngine,
+                persistAccountPoolExport: false,
+                quotaHistoryStore: QuotaHistoryStore(fileURL: nil)
+            )
+            store.snapshots[AppStore.snapshotKey(provider: .claude, accountId: "uuid-ui-cli-pro")] = readyProSnap
+            store.snapshots[AppStore.snapshotKey(provider: .claude, accountId: "claude-profile:pro2")] = unconfPro2Snap
+
+            T.expectEqual(store.claudeProfileId(for: "uuid-ui-cli-pro"), "default")
+            T.expectEqual(store.claudeProfileId(for: "claude-profile:pro2"), "pro2")
+            T.expectEqual(store.claudeLaunchCommand(for: "claude-profile:pro2"), "CLAUDE_PROFILE=pro2 claude")
+
+            @MainActor
+            func smokeHost<V: View>(_ view: V, width: CGFloat, height: CGFloat, fixedHeight: Bool, appearance: NSAppearance.Name, label: String) {
+                let framed: AnyView = fixedHeight
+                    ? AnyView(view.frame(width: width, height: height))
+                    : AnyView(view.frame(width: width))
+                let host = NSHostingView(rootView: framed)
+                host.appearance = NSAppearance(named: appearance)
+                host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+                host.layoutSubtreeIfNeeded()
+                let fit = host.fittingSize
+                T.expect(fit.width > 0 && fit.height > 0 && fit.width.isFinite && fit.height.isFinite, "\(label) @\(Int(width))pt must lay out with valid finite fittingSize (\(fit))")
+            }
+
+            // 1. MenuBarView (Claude tab: 1 ready Pro + 1 unconfigured pro2) at 340pt, 390pt & 540pt Light & Dark
+            for w in [CGFloat(340), CGFloat(390), CGFloat(540)] {
+                store.registry.settings.popoverWidth = Double(w)
+                smokeHost(MenuBarView(store: store, onOpenSettings: {}), width: w, height: 620, fixedHeight: true, appearance: .aqua, label: "V150.MenuBarView.Claude2Profiles.Light")
+                smokeHost(MenuBarView(store: store, onOpenSettings: {}), width: w, height: 620, fixedHeight: true, appearance: .darkAqua, label: "V150.MenuBarView.Claude2Profiles.Dark")
+            }
+
+            // 2. MenuBarView with inline Claude profile creator open at 340pt, 390pt & 540pt Light & Dark
+            for w in [CGFloat(340), CGFloat(390), CGFloat(540)] {
+                store.registry.settings.popoverWidth = Double(w)
+                smokeHost(
+                    MenuBarView(store: store, onOpenSettings: {}, initialShowClaudeProfileCreator: true),
+                    width: w,
+                    height: 620,
+                    fixedHeight: true,
+                    appearance: .aqua,
+                    label: "V150.MenuBarView.ClaudeInlineCreator.Light"
+                )
+                smokeHost(
+                    MenuBarView(store: store, onOpenSettings: {}, initialShowClaudeProfileCreator: true),
+                    width: w,
+                    height: 620,
+                    fixedHeight: true,
+                    appearance: .darkAqua,
+                    label: "V150.MenuBarView.ClaudeInlineCreator.Dark"
+                )
+            }
+
+            // 3. SettingsView Light & Dark
+            smokeHost(SettingsView(store: store), width: 620, height: 560, fixedHeight: true, appearance: .aqua, label: "V150.SettingsView.Light")
+            smokeHost(SettingsView(store: store), width: 620, height: 560, fixedHeight: true, appearance: .darkAqua, label: "V150.SettingsView.Dark")
+        }
+    }
+}
+
 // MARK: - Main Entry Point
 
 Task {
@@ -9533,6 +10441,7 @@ Task {
     await testV123RegressionSuite()
     await testV130RegressionSuite()
     await testV140RegressionSuite()
+    await testV150RegressionSuite()
 
     print("Results: \(T.passed) assertions passed, \(T.failed) failed.")
     fflush(stdout)

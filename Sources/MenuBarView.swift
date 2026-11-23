@@ -217,6 +217,11 @@ public struct MenuBarView: View {
     @State private var confirmRemoveAccountId: String? = nil
     @State private var showInlineAPIKeyEditor: Bool = false
     @State private var inlineAPIKeyDraft: String = ""
+    @State private var showInlineClaudeProfileCreator: Bool = false
+    @State private var inlineClaudeProfileSlugDraft: String = ""
+    @State private var inlineClaudeProfileLabelDraft: String = ""
+    @State private var inlineClaudeProfileError: String? = nil
+    @State private var recentlyCopiedClaudeAccountId: String? = nil
     @State private var refreshSpinAngle: Double = 0
     @State private var showQuotaCustomizePopover: Bool = false
     @State private var expandedCurveAccountKeys: Set<String> = []
@@ -235,12 +240,14 @@ public struct MenuBarView: View {
         store: AppStore,
         onOpenSettings: @escaping () -> Void,
         onOpenDashboard: (() -> Void)? = nil,
-        onQuit: @escaping () -> Void = { NSApplication.shared.terminate(nil) }
+        onQuit: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
+        initialShowClaudeProfileCreator: Bool = false
     ) {
         self.store = store
         self.onOpenSettings = onOpenSettings
         self.onOpenDashboard = onOpenDashboard
         self.onQuit = onQuit
+        self._showInlineClaudeProfileCreator = State(initialValue: initialShowClaudeProfileCreator)
     }
 
     private var reduceMotion: Bool {
@@ -410,6 +417,11 @@ public struct MenuBarView: View {
             confirmRemoveAccountId = nil
             showInlineAPIKeyEditor = false
             inlineAPIKeyDraft = ""
+            showInlineClaudeProfileCreator = false
+            inlineClaudeProfileSlugDraft = ""
+            inlineClaudeProfileLabelDraft = ""
+            inlineClaudeProfileError = nil
+            recentlyCopiedClaudeAccountId = nil
         }
         .onChange(of: effectiveResizeEdge) { newEdge in
             syncResizeCursor(for: newEdge)
@@ -475,7 +487,7 @@ public struct MenuBarView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: isCompactCards ? 4.5 : 6) {
-                    if selectedProvider.supportsAccountSwitch {
+                    if selectedProvider.supportsMultiAccount {
                         switchableProviderContent(for: selectedProvider)
                     } else {
                         singleProviderContent(for: selectedProvider)
@@ -490,6 +502,7 @@ public struct MenuBarView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .animation(OrbitMotion.snappy, value: selectedProvider)
+            .animation(OrbitMotion.snappy, value: showInlineClaudeProfileCreator)
 
             glassHairlineDivider
             bottomActionBar
@@ -1313,7 +1326,22 @@ public struct MenuBarView: View {
         if store.selectedPopoverTab == .tokenUsage {
             return store.isScanningTokenUsage || store.tokenUsage != nil
         }
-        if selectedProvider.supportsAccountSwitch {
+        if selectedProvider == .claude {
+            let claudeAccounts = store.accounts(for: .claude)
+            let hasReadyOrLoading = claudeAccounts.contains { account in
+                guard let status = store.snapshot(for: .claude, accountId: account.id)?.status else {
+                    return false
+                }
+                switch status {
+                case .ready, .loading:
+                    return true
+                case .unconfigured, .reauthRequired, .failed:
+                    return false
+                }
+            }
+            return hasReadyOrLoading || (store.clientStatuses[.claude]?.isRunning == true)
+        }
+        if selectedProvider.supportsClientControl {
             return store.clientStatuses[selectedProvider]?.isRunning == true
         }
         if let status = store.primarySnapshot(for: selectedProvider)?.status {
@@ -1334,7 +1362,23 @@ public struct MenuBarView: View {
             }
             return Color(nsColor: .systemGreen)
         }
-        if selectedProvider.supportsAccountSwitch {
+        if selectedProvider == .claude {
+            let claudeAccounts = store.accounts(for: .claude)
+            let hasReady = claudeAccounts.contains {
+                store.snapshot(for: .claude, accountId: $0.id)?.status.isReady == true
+            }
+            if hasReady || (store.clientStatuses[.claude]?.isRunning == true) {
+                return Color(nsColor: .systemGreen)
+            }
+            let hasLoading = claudeAccounts.contains {
+                store.snapshot(for: .claude, accountId: $0.id)?.status == .loading
+            }
+            if hasLoading {
+                return Color(nsColor: .systemBlue)
+            }
+            return claudeAccounts.isEmpty ? Color.secondary.opacity(0.45) : Color(nsColor: .systemOrange)
+        }
+        if selectedProvider.supportsClientControl {
             if let status = store.clientStatuses[selectedProvider] {
                 return status.isRunning ? Color(nsColor: .systemGreen) : Color.secondary.opacity(0.55)
             }
@@ -1367,14 +1411,22 @@ public struct MenuBarView: View {
             return "纯本地只读 · 零 Claude 联网"
         }
         let stateLabel: String
-        if selectedProvider.supportsAccountSwitch {
+        if selectedProvider == .claude {
+            let count = store.accounts(for: .claude).count
+            let procCount = store.clientStatuses[.claude]?.runningProcesses.count ?? 0
+            if procCount > 0 {
+                stateLabel = "Claude CLI · 本地被动 · \(count) 账号 · \(procCount) 进程"
+            } else {
+                stateLabel = "Claude CLI · 本地被动 · \(count) 账号"
+            }
+        } else if selectedProvider.supportsClientControl {
             let running = store.clientStatuses[selectedProvider]?.isRunning ?? false
             stateLabel = running ? "运行中" : "未运行"
         } else if let snap = store.primarySnapshot(for: selectedProvider) {
             switch snap.status {
-            case .ready: stateLabel = (selectedProvider == .claude) ? "本地被动" : "已连接"
+            case .ready: stateLabel = "已连接"
             case .loading: stateLabel = "刷新中"
-            case .unconfigured: stateLabel = (selectedProvider == .claude) ? "待 CLI 同步" : "未配置"
+            case .unconfigured: stateLabel = "未配置"
             case .reauthRequired: stateLabel = "需重新登录"
             case .failed: stateLabel = "获取异常"
             }
@@ -1551,7 +1603,32 @@ public struct MenuBarView: View {
 
     private var quotaStatusToolbar: some View {
         HStack(spacing: 6) {
-            if selectedProvider.supportsAccountSwitch {
+            if selectedProvider == .claude {
+                let claudeAccounts = store.accounts(for: .claude)
+                let readyCount = claudeAccounts.filter {
+                    store.snapshot(for: .claude, accountId: $0.id)?.status.isReady == true
+                }.count
+                let procCount = store.clientStatuses[.claude]?.runningProcesses.count ?? 0
+                let isActive = (readyCount > 0 || procCount > 0)
+                let dotColor: Color = isActive
+                    ? Color(nsColor: .systemGreen)
+                    : (claudeAccounts.isEmpty ? Color.secondary.opacity(0.45) : Color(nsColor: .systemOrange))
+                let toolbarLabel = procCount > 0
+                    ? "Claude CLI · 本地被动 · \(claudeAccounts.count) 账号 · \(procCount) 进程"
+                    : "Claude CLI · 本地被动 · \(claudeAccounts.count) 账号"
+
+                OrbitPulseDot(
+                    color: dotColor,
+                    size: 6,
+                    isActive: isActive
+                )
+
+                Text(toolbarLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } else if selectedProvider.supportsClientControl {
                 let status = store.clientStatuses[selectedProvider]
                 let installedText: String = {
                     if let apps = status?.installedApps, !apps.isEmpty {
@@ -1604,9 +1681,9 @@ public struct MenuBarView: View {
                 let stateLabel: String = {
                     guard let status = snap?.status else { return "待刷新" }
                     switch status {
-                    case .ready: return (selectedProvider == .claude) ? "本地被动" : "已连接"
+                    case .ready: return "已连接"
                     case .loading: return "刷新中"
-                    case .unconfigured: return (selectedProvider == .claude) ? "待 CLI 同步" : "未配置"
+                    case .unconfigured: return "未配置"
                     case .reauthRequired: return "需重新登录"
                     case .failed: return "获取异常"
                     }
@@ -2634,11 +2711,23 @@ public struct MenuBarView: View {
         )
     }
 
-    // MARK: - Multi-Account Switchable View (Antigravity & Codex)
+    // MARK: - Multi-Account Switchable View (Antigravity, Codex & Claude CLI)
 
     @ViewBuilder
     private func switchableProviderContent(for provider: ProviderID) -> some View {
         let accountList = store.accounts(for: provider)
+        if provider == .claude {
+            HStack(spacing: 6) {
+                claudePassiveSafetyPill
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if showInlineClaudeProfileCreator {
+                inlineClaudeProfileCreatorCard
+                    .transition(OrbitMotion.panelTransition)
+            }
+        }
         if accountList.isEmpty {
             emptySwitchableAccountsCard(for: provider)
         } else {
@@ -2656,6 +2745,19 @@ public struct MenuBarView: View {
         let displayPlan = snap?.plan ?? account.plan
         let avatarTint = OrbitTheme.avatarColor(seed: account.email.isEmpty ? account.displayName : account.email)
         let cfg = accountCardConfig
+        let claudeSlug: String? = (provider == .claude) ? store.claudeProfileId(for: account.id) : nil
+        let isDefaultClaudeProfile = (provider == .claude && claudeSlug?.lowercased() == ClaudeProvider.defaultProfileSlug)
+        let canRemoveAccount = !isDefaultClaudeProfile
+        let showBestRemainingBadge: Bool = {
+            guard account.isBestRemaining else { return false }
+            if provider == .claude {
+                let readyCount = store.accounts(for: .claude).filter {
+                    store.snapshot(for: .claude, accountId: $0.id)?.status.isReady == true
+                }.count
+                return readyCount >= 2
+            }
+            return true
+        }()
         let activeAgPool: AntigravityPoolPreference = (provider == .antigravity)
             ? store.effectiveAntigravityPool()
             : .autoLowest
@@ -2679,9 +2781,9 @@ public struct MenuBarView: View {
             )
         }()
         let hasSourceBadge = cfg.showSourceBadge && (snap?.sourceLabel.isEmpty == false)
-        let showStandaloneFooter = hasSourceBadge || isConfirmingRemove
-        let showRemoveInFootnoteRow = !showStandaloneFooter && focusFooter != nil
-        let showRemoveInHeader = !showStandaloneFooter && focusFooter == nil && isHovered
+        let showStandaloneFooter = hasSourceBadge || (canRemoveAccount && isConfirmingRemove)
+        let showRemoveInFootnoteRow = canRemoveAccount && !showStandaloneFooter && focusFooter != nil
+        let showRemoveInHeader = canRemoveAccount && !showStandaloneFooter && focusFooter == nil && isHovered
 
         let accountKey = QuotaHistoryStore.accountKey(provider: provider, accountId: account.id)
         let canShowCurve = (snap?.status.isReady == true && !rawWindows.isEmpty)
@@ -2727,6 +2829,10 @@ public struct MenuBarView: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
 
+                        if let slug = claudeSlug, !slug.isEmpty {
+                            claudeProfileSlugBadge(slug, isDefault: isDefaultClaudeProfile)
+                        }
+
                         if let plan = displayPlan, plan.kind != .unknown {
                             planBadge(plan)
                         }
@@ -2753,20 +2859,20 @@ public struct MenuBarView: View {
                         )
                     }
 
-                    if account.isBestRemaining {
+                    if showBestRemainingBadge {
                         bestRemainingBadge
                     }
 
                     if account.isActiveLive {
-                        activeLiveBadge
+                        activeLiveBadge(for: provider)
                     } else {
                         Button {
                             Task { await store.switchAccount(provider: provider, account: account) }
                         } label: {
                             HStack(spacing: 3) {
-                                Image(systemName: "arrow.left.arrow.right")
+                                Image(systemName: provider == .claude ? "checkmark.circle" : "arrow.left.arrow.right")
                                     .font(.system(size: 9, weight: .semibold))
-                                Text("切换")
+                                Text(provider == .claude ? "设为默认" : "切换")
                                     .font(.system(size: 10.5, weight: .semibold))
                             }
                             .foregroundColor(.white)
@@ -2777,7 +2883,11 @@ public struct MenuBarView: View {
                         .orbitInteractiveButton(pressedScale: 0.94, hoverTint: nil, cornerRadius: 99)
                         .disabled(store.busyActionLabel != nil)
                         .opacity(store.busyActionLabel != nil ? 0.55 : 1.0)
-                        .help("切换当前 \(provider.displayName) 账号为 \(account.displayName)")
+                        .help(
+                            provider == .claude
+                                ? "将新终端 Claude CLI 默认账号切换为 \(account.displayName)（纯本地指针，不重启进行中的终端）"
+                                : "切换当前 \(provider.displayName) 账号为 \(account.displayName)"
+                        )
                     }
 
                     if showRemoveInHeader {
@@ -2797,7 +2907,7 @@ public struct MenuBarView: View {
                         }
                         .orbitInteractiveButton(pressedScale: 0.92, hoverTint: nil, cornerRadius: 99)
                         .disabled(store.busyActionLabel != nil)
-                        .help("移除此账号")
+                        .help(provider == .claude ? "移除此 Claude CLI 配置（保留本地目录）" : "移除此账号")
                         .transition(.opacity.combined(with: .scale(scale: 0.88)))
                     }
                 }
@@ -2807,6 +2917,7 @@ public struct MenuBarView: View {
 
             // Compact high-density single-row-per-pool quota matrix + optional focus reset footnote
             accountQuotaBody(
+                provider: provider,
                 snapshot: snap,
                 visibleWindows: visibleWindows,
                 focusFooter: focusFooter,
@@ -2853,7 +2964,7 @@ public struct MenuBarView: View {
 
                     Spacer(minLength: 4)
 
-                    if isConfirmingRemove {
+                    if canRemoveAccount && isConfirmingRemove {
                         inlineRemoveConfirmation(account: account, provider: provider)
                     } else {
                         if showCurveInStandaloneFooter {
@@ -2864,7 +2975,9 @@ public struct MenuBarView: View {
                                 compact: isNarrowLayout
                             )
                         }
-                        hoverRemovePillButton(accountId: account.id, isHovered: isHovered)
+                        if canRemoveAccount {
+                            hoverRemovePillButton(accountId: account.id, isHovered: isHovered)
+                        }
                     }
                 }
                 .frame(minHeight: isCompactCards ? 14 : 16)
@@ -2884,18 +2997,157 @@ public struct MenuBarView: View {
         )
         .contextMenu {
             if !account.isActiveLive {
-                Button("切换为此账号") {
+                Button(provider == .claude ? "设为新终端默认账号" : "切换为此账号") {
                     Task { await store.switchAccount(provider: provider, account: account) }
                 }
                 .disabled(store.busyActionLabel != nil)
             }
-            Button("移除账号", role: .destructive) {
-                withAnimation(OrbitMotion.snappy) {
-                    confirmRemoveAccountId = account.id
+            if provider == .claude, let launchCmd = store.claudeLaunchCommand(for: account.id) {
+                Button("复制登录命令（\(launchCmd)）") {
+                    store.copyClaudeLaunchCommand(launchCmd)
                 }
             }
-            .disabled(store.busyActionLabel != nil)
+            if canRemoveAccount {
+                Button(provider == .claude ? "移除配置" : "移除账号", role: .destructive) {
+                    withAnimation(OrbitMotion.snappy) {
+                        confirmRemoveAccountId = account.id
+                    }
+                }
+                .disabled(store.busyActionLabel != nil)
+            }
         }
+    }
+
+    private func claudeProfileSlugBadge(_ slug: String, isDefault: Bool) -> some View {
+        let tint: Color = isDefault ? Color(nsColor: .systemGreen) : Color(nsColor: .systemIndigo)
+        let isDark = (colorScheme == .dark)
+        return Text(slug)
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .foregroundColor(tint)
+            .padding(.horizontal, 5.5)
+            .padding(.vertical, 1.5)
+            .background(tint.opacity(isDark ? 0.18 : 0.12))
+            .overlay(
+                Capsule()
+                    .strokeBorder(tint.opacity(isDark ? 0.34 : 0.24), lineWidth: 0.55)
+            )
+            .clipShape(Capsule())
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .help(isDefault ? "默认 Claude CLI 配置（不可移除）" : "独立配置：CLAUDE_PROFILE=\(slug) claude")
+    }
+
+    private var inlineClaudeProfileCreatorCard: some View {
+        let normalizedSlug = inlineClaudeProfileSlugDraft
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let isSlugValid = ClaudeProvider.isValidProfileSlug(normalizedSlug)
+        let showValidationHint = !normalizedSlug.isEmpty && !isSlugValid
+        let previewCommand = isSlugValid ? "CLAUDE_PROFILE=\(normalizedSlug) claude" : nil
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(nsColor: .systemGreen))
+                Text("添加 Claude CLI 独立配置")
+                    .font(.system(size: 11.5, weight: .semibold))
+                Spacer(minLength: 4)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                TextField("配置别名（如 pro2）", text: $inlineClaudeProfileSlugDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .onChange(of: inlineClaudeProfileSlugDraft) { _ in
+                        inlineClaudeProfileError = nil
+                    }
+
+                TextField("备注名（可选，如 副号 Pro）", text: $inlineClaudeProfileLabelDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11.5))
+            }
+
+            if showValidationHint {
+                Text("仅支持 1-32 位小写字母、数字及 . _ -，以字母或数字开头，不能为 default 或 desktop")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color(nsColor: .systemOrange))
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let previewCommand {
+                HStack(spacing: 4.5) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(Color(nsColor: .systemGreen))
+                    Text(previewCommand)
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundColor(.primary.opacity(0.86))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3.5)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .systemGreen).opacity(colorScheme == .dark ? 0.13 : 0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+
+            if let errorText = inlineClaudeProfileError, !errorText.isEmpty {
+                Text(errorText)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color(nsColor: .systemRed))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 6) {
+                Button("创建") {
+                    let slugToCreate = normalizedSlug
+                    let trimmedLabel = inlineClaudeProfileLabelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let labelArg: String? = trimmedLabel.isEmpty ? nil : trimmedLabel
+                    Task {
+                        let res = await store.createClaudeCLIProfile(id: slugToCreate, label: labelArg)
+                        switch res {
+                        case .success:
+                            withAnimation(OrbitMotion.snappy) {
+                                inlineClaudeProfileSlugDraft = ""
+                                inlineClaudeProfileLabelDraft = ""
+                                inlineClaudeProfileError = nil
+                                showInlineClaudeProfileCreator = false
+                            }
+                        case .failure(let err):
+                            inlineClaudeProfileError = err.localizedDescription
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(!isSlugValid || store.busyActionLabel != nil)
+
+                Button("取消") {
+                    withAnimation(OrbitMotion.snappy) {
+                        inlineClaudeProfileSlugDraft = ""
+                        inlineClaudeProfileLabelDraft = ""
+                        inlineClaudeProfileError = nil
+                        showInlineClaudeProfileCreator = false
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer(minLength: 4)
+            }
+
+            Text("纯本地创建 ~/.claude-profiles/<别名> 隔离目录并复制去代理的 settings.json，不触碰 Claude 桌面端或钥匙串。")
+                .font(.system(size: 9.5))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.04))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color(nsColor: .systemGreen).opacity(0.35), lineWidth: 0.8)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 
     private func inlineRemoveConfirmation(account: AccountRecord, provider: ProviderID) -> some View {
@@ -2985,10 +3237,16 @@ public struct MenuBarView: View {
         }
     }
 
-    private var activeLiveBadge: some View {
-        HStack(spacing: 4) {
+    private func activeLiveBadge(for provider: ProviderID) -> some View {
+        let labelText: String = {
+            if provider == .claude {
+                return "当前默认"
+            }
+            return isNarrowLayout ? "当前" : "当前使用"
+        }()
+        return HStack(spacing: 4) {
             OrbitPulseDot(color: Color(nsColor: .systemGreen), size: 5.5, isActive: true)
-            Text(isNarrowLayout ? "当前" : "当前使用")
+            Text(labelText)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(Color(nsColor: .systemGreen))
         }
@@ -3254,6 +3512,7 @@ public struct MenuBarView: View {
 
     @ViewBuilder
     private func accountQuotaBody(
+        provider: ProviderID,
         snapshot: QuotaSnapshot?,
         visibleWindows: [QuotaWindow],
         focusFooter: (text: String, tooltip: String)?,
@@ -3340,7 +3599,11 @@ public struct MenuBarView: View {
                 statusMessageRow(icon: "key.slash.fill", color: Color(nsColor: .systemOrange), message: message)
 
             case .unconfigured(let message):
-                statusMessageRow(icon: "slider.horizontal.3", color: Color(nsColor: .systemOrange), message: message)
+                if provider == .claude {
+                    claudeUnconfiguredProfileBody(accountId: accountId, fallbackMessage: message)
+                } else {
+                    statusMessageRow(icon: "slider.horizontal.3", color: Color(nsColor: .systemOrange), message: message)
+                }
 
             case .failed(let message):
                 statusMessageRow(icon: "exclamationmark.triangle.fill", color: Color(nsColor: .systemRed), message: message)
@@ -3355,6 +3618,83 @@ public struct MenuBarView: View {
                     .foregroundColor(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func claudeUnconfiguredProfileBody(accountId: String, fallbackMessage: String) -> some View {
+        let launchCommand = store.claudeLaunchCommand(for: accountId)
+        let isCopied = (recentlyCopiedClaudeAccountId == accountId)
+        let green = Color(nsColor: .systemGreen)
+        let isDark = (colorScheme == .dark)
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "terminal.fill")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(green)
+                    .padding(.top, 1.5)
+                Text(launchCommand != nil ? "在终端运行后执行 /login 即可自动同步余量" : fallbackMessage)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let launchCommand {
+                HStack(spacing: 6) {
+                    Text(launchCommand)
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundColor(.primary.opacity(0.9))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        store.copyClaudeLaunchCommand(launchCommand)
+                        recentlyCopiedClaudeAccountId = accountId
+                        Task {
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                            if recentlyCopiedClaudeAccountId == accountId {
+                                recentlyCopiedClaudeAccountId = nil
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(isCopied ? "已复制" : "复制命令")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .foregroundColor(isCopied ? green : .accentColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background(
+                            Capsule()
+                                .fill((isCopied ? green : Color.accentColor).opacity(isDark ? 0.18 : 0.12))
+                        )
+                    }
+                    .orbitInteractiveButton(pressedScale: 0.94, hoverTint: nil, cornerRadius: 99)
+                    .help("复制 \(launchCommand)")
+                }
+                .padding(.horizontal, 7.5)
+                .padding(.vertical, 5)
+                .background(Color.primary.opacity(isDark ? 0.06 : 0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(Color.primary.opacity(isDark ? 0.11 : 0.08), lineWidth: 0.65)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            }
+        }
+        .padding(7.5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(green.opacity(isDark ? 0.09 : 0.065))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(green.opacity(isDark ? 0.24 : 0.18), lineWidth: 0.65)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     @ViewBuilder
@@ -3786,13 +4126,17 @@ public struct MenuBarView: View {
                 size: 28,
                 renderingAccent: .secondary
             )
-            Text("尚未添加 \(provider.displayName) 账号")
+            Text(provider == .claude ? "尚未检测到 Claude CLI 配置" : "尚未添加 \(provider.displayName) 账号")
                 .font(.system(size: 13, weight: .semibold))
-            Text("点击下方「+ 添加账号」进行授权登录，或点击「导入当前」将本机正在使用的账号纳入管理。")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                provider == .claude
+                    ? "点击下方「+ 添加配置」创建独立配置，或在终端使用 Claude CLI 回复 / 输入 /usage 后自动同步余量。"
+                    : "点击下方「+ 添加账号」进行授权登录，或点击「导入当前」将本机正在使用的账号纳入管理。"
+            )
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 26)
@@ -3942,7 +4286,7 @@ public struct MenuBarView: View {
                 .strokeBorder(green.opacity(isDark ? 0.34 : 0.24), lineWidth: 0.65)
         )
         .clipShape(Capsule())
-        .help("仅离线读取 ~/.claude.json 与 ~/.cache/pulsar/claude-cli-quota.json，零网络请求、零钥匙串读取、不触碰 Claude 桌面端")
+        .help("仅离线读取 ~/.config/pulsar/claude-cli-profiles.json、独立配置目录 .claude.json 与 ~/.cache/pulsar/claude-cli-quotas/，零网络请求、零钥匙串读取、不触碰 Claude 桌面端")
     }
 
     @ViewBuilder
@@ -4739,7 +5083,7 @@ public struct MenuBarView: View {
 
     private var bottomActionBar: some View {
         HStack(spacing: isNarrowLayout ? 5 : 7) {
-            if selectedProvider.supportsAccountSwitch {
+            if selectedProvider.supportsClientControl {
                 Button {
                     Task { await store.addAccount(provider: selectedProvider) }
                 } label: {
@@ -4793,6 +5137,49 @@ public struct MenuBarView: View {
                 .controlSize(.small)
                 .disabled(store.busyActionLabel != nil)
                 .help("优雅退出当前运行的 \(selectedProvider.displayName)")
+            } else if selectedProvider == .claude {
+                Button {
+                    withAnimation(OrbitMotion.snappy) {
+                        showInlineClaudeProfileCreator.toggle()
+                        if !showInlineClaudeProfileCreator {
+                            inlineClaudeProfileSlugDraft = ""
+                            inlineClaudeProfileLabelDraft = ""
+                            inlineClaudeProfileError = nil
+                        }
+                    }
+                } label: {
+                    Label(
+                        showInlineClaudeProfileCreator
+                            ? "收起创建"
+                            : (isNarrowLayout ? "添加配置" : "添加配置"),
+                        systemImage: showInlineClaudeProfileCreator ? "xmark" : "plus"
+                    )
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(store.busyActionLabel != nil)
+                .help("创建独立的 Claude CLI 配置目录（零联网、不碰桌面端）")
+
+                Spacer(minLength: 4)
+
+                Button {
+                    Task { await store.refreshProvider(.claude, userInitiated: true) }
+                } label: {
+                    Label(
+                        isNarrowLayout ? "刷新" : "刷新 Claude",
+                        systemImage: "arrow.clockwise"
+                    )
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(store.refreshingProviders.contains(.claude))
+                .help("重新读取本地 Claude CLI 被动缓存与配置")
             } else {
                 Button {
                     Task { await store.refreshProvider(selectedProvider, userInitiated: true) }

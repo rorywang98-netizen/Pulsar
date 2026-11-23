@@ -14,6 +14,8 @@ public final class CursorProvider: ProviderAdapter, @unchecked Sendable {
     public static let unifiedUsageStatusURL = URL(string: "https://cursor.com/api/dashboard/v2/usage-status")!
     public static let fallbackUsageBaseURL = URL(string: "https://cursor.com/api/usage")!
     public static let safeStoragePrefix = "cursor-safe-storage:v1:"
+    public static let safeStorageCacheService = "com.rory.roryorbit.cursor"
+    public static let safeStorageCacheAccount = "safe-storage-key"
     public static let keychainDeniedNote = "需授权访问 Cursor 钥匙串或刷新浏览器会话"
 
     private static let safeStorageService = "Cursor Safe Storage"
@@ -458,9 +460,45 @@ public final class CursorProvider: ProviderAdapter, @unchecked Sendable {
     private func resolveAccessToken(from state: LocalCursorState) -> String? {
         if let rawToken = state.rawAccessToken {
             if rawToken.hasPrefix(Self.safeStoragePrefix) {
-                if let password = readSafeStoragePassword(),
-                   let decrypted = Self.decryptSafeStorageToken(rawToken, password: password),
+                // 1. In-memory cached SafeStorage master key (0ms)
+                cacheLock.lock()
+                let memPassword = cachedSafeStoragePassword
+                cacheLock.unlock()
+                if let memPassword {
+                    if let decrypted = Self.decryptSafeStorageToken(rawToken, password: memPassword),
+                       Self.looksLikeJWT(decrypted) {
+                        return decrypted
+                    }
+                    cacheLock.lock()
+                    cachedSafeStoragePassword = nil
+                    cacheLock.unlock()
+                }
+
+                // 2. Persistent Pulsar KeychainStore cache (`com.rory.roryorbit.cursor` / `safe-storage-key`),
+                //    backed by `/usr/bin/security` so it survives every ad-hoc RoryOrbit.app rebuild with zero UI prompts.
+                let persistedPassword = readCachedSafeStorageKeyFromKeychainStore()
+                if let persistedPassword,
+                   let decrypted = Self.decryptSafeStorageToken(rawToken, password: persistedPassword),
                    Self.looksLikeJWT(decrypted) {
+                    cacheLock.lock()
+                    cachedSafeStoragePassword = persistedPassword
+                    keychainAccessDenied = false
+                    cacheLock.unlock()
+                    return decrypted
+                }
+
+                // 3. Fallback: read Electron's `"Cursor Safe Storage"` item (respecting allowInteractiveKeychain),
+                //    and upon successful decryption immediately persist it into Pulsar's KeychainStore.
+                if let cursorPassword = readSafeStoragePasswordFromCursorKeychain(),
+                   let decrypted = Self.decryptSafeStorageToken(rawToken, password: cursorPassword),
+                   Self.looksLikeJWT(decrypted) {
+                    if persistedPassword != cursorPassword {
+                        persistSafeStorageKeyToKeychainStore(cursorPassword)
+                    }
+                    cacheLock.lock()
+                    cachedSafeStoragePassword = cursorPassword
+                    keychainAccessDenied = false
+                    cacheLock.unlock()
                     return decrypted
                 }
             } else if Self.looksLikeJWT(rawToken) {
@@ -476,12 +514,27 @@ public final class CursorProvider: ProviderAdapter, @unchecked Sendable {
         return nil
     }
 
-    private func readSafeStoragePassword() -> String? {
-        cacheLock.lock()
-        if let cached = cachedSafeStoragePassword {
-            cacheLock.unlock()
-            return cached
+    private func readCachedSafeStorageKeyFromKeychainStore() -> String? {
+        guard let secret = try? keychain.readSecret(
+            service: Self.safeStorageCacheService,
+            account: Self.safeStorageCacheAccount
+        ), !secret.isEmpty else {
+            return nil
         }
+        return secret
+    }
+
+    private func persistSafeStorageKeyToKeychainStore(_ password: String) {
+        guard !password.isEmpty else { return }
+        try? keychain.writeSecret(
+            service: Self.safeStorageCacheService,
+            account: Self.safeStorageCacheAccount,
+            value: password
+        )
+    }
+
+    private func readSafeStoragePasswordFromCursorKeychain() -> String? {
+        cacheLock.lock()
         let wasDenied = keychainAccessDenied
         cacheLock.unlock()
 
@@ -492,10 +545,6 @@ public final class CursorProvider: ProviderAdapter, @unchecked Sendable {
                     service: Self.safeStorageService,
                     account: account
                 ), !pwd.isEmpty {
-                    cacheLock.lock()
-                    cachedSafeStoragePassword = pwd
-                    keychainAccessDenied = false
-                    cacheLock.unlock()
                     return pwd
                 }
             }
@@ -512,10 +561,6 @@ public final class CursorProvider: ProviderAdapter, @unchecked Sendable {
             let status = readKeychainNonInteractive(service: Self.safeStorageService, account: account)
             switch status {
             case .found(let secret):
-                cacheLock.lock()
-                cachedSafeStoragePassword = secret
-                keychainAccessDenied = false
-                cacheLock.unlock()
                 return secret
             case .notFound:
                 continue
@@ -531,10 +576,6 @@ public final class CursorProvider: ProviderAdapter, @unchecked Sendable {
             for account in blockedAccounts {
                 if let pwd = readKeychainInteractive(service: Self.safeStorageService, account: account),
                    !pwd.isEmpty {
-                    cacheLock.lock()
-                    cachedSafeStoragePassword = pwd
-                    keychainAccessDenied = false
-                    cacheLock.unlock()
                     return pwd
                 }
                 // Denied or canceled — stop immediately and cache denial for this session.

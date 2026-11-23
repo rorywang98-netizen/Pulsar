@@ -422,7 +422,7 @@ public final class AccountPoolExporter: @unchecked Sendable {
                         }
 
                         var accounts = scopedRegistry.accounts(for: provider)
-                        if !provider.supportsAccountSwitch {
+                        if !provider.supportsMultiAccount {
                             let defaultId = provider.supportsAPIKeyConfig
                                 ? "\(provider.rawValue):api"
                                 : "\(provider.rawValue):default"
@@ -582,7 +582,7 @@ public final class AccountPoolExporter: @unchecked Sendable {
 
         let trimmedEmail = Self.nonEmptyTrimmed(account.email)
         let email: String? = (trimmedEmail?.contains("@") == true) ? trimmedEmail : nil
-        let fallbackAccountId: String? = email == nil ? Self.nonEmptyTrimmed(account.id) : nil
+        let accountId = Self.nonEmptyTrimmed(account.id)
         let effectivePlan = snapshot.plan ?? account.plan
         let loginMethod = Self.sanitizeSafeText(effectivePlan?.displayName) ?? "Claude CLI"
 
@@ -608,7 +608,7 @@ public final class AccountPoolExporter: @unchecked Sendable {
         return AccountPoolProviderRow(
             provider: "claude",
             account: nil,
-            accountId: fallbackAccountId,
+            accountId: accountId,
             sourceKind: Self.claudePassiveSourceKind,
             sourceLabel: Self.claudePassiveSourceLabel,
             rateWindowLabels: ["primary": "5 小时", "secondary": "每周"],
@@ -970,7 +970,7 @@ public final class AccountPoolExporter: @unchecked Sendable {
 
     private func sortedAccounts(for provider: ProviderID, in registry: RegistryData) -> [AccountRecord] {
         let list = registry.accounts(for: provider)
-        guard provider.supportsAccountSwitch else { return list }
+        guard provider.supportsMultiAccount else { return list }
         return list.sorted { lhs, rhs in
             if lhs.isActiveLive != rhs.isActiveLive { return lhs.isActiveLive }
             if lhs.addedAt != rhs.addedAt { return lhs.addedAt < rhs.addedAt }
@@ -983,9 +983,22 @@ public final class AccountPoolExporter: @unchecked Sendable {
         provider: ProviderID,
         in rows: [AccountPoolProviderRow]
     ) -> AccountPoolProviderRow? {
+        let accountId = account.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !accountId.isEmpty {
+            if let hit = rows.first(where: {
+                ($0.accountId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == accountId
+            }) {
+                return hit
+            }
+        }
         let email = account.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !email.isEmpty && email.contains("@") {
-            if let hit = rows.first(where: { ($0.usage?.accountEmail ?? "").lowercased() == email }) {
+            if let hit = rows.first(where: {
+                let rowEmail = ($0.usage?.accountEmail ?? $0.usage?.identity?.accountEmail ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                return rowEmail == email
+            }) {
                 return hit
             }
         }
@@ -995,7 +1008,7 @@ public final class AccountPoolExporter: @unchecked Sendable {
                 return hit
             }
         }
-        if !provider.supportsAccountSwitch && rows.count == 1 {
+        if !provider.supportsMultiAccount && rows.count == 1 {
             return rows[0]
         }
         return nil

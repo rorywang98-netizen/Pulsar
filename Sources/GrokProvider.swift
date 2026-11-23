@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // MARK: - Grok Quota Provider
@@ -6,6 +7,8 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
     public static let defaultAccountId = "grok:live"
     public static let primaryCreditsURL = URL(string: "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig")!
     public static let fallbackBillingURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
+    public static let defaultOIDCIssuer = "https://auth.x.ai"
+    public static let oidcExpiryLeewaySeconds: TimeInterval = 60.0
 
     public let id: ProviderID = .grok
     public let capabilities: ProviderCapability = [.quota]
@@ -34,7 +37,7 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
         self.fallbackURL = fallbackURL
     }
 
-    // MARK: - Auth File Model (Read-Only)
+    // MARK: - Auth File Model
 
     public struct AuthEntry: Equatable, Sendable {
         public let entryKey: String
@@ -44,6 +47,36 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
         public let authMode: String?
         public let codingDataTeam: String?
         public let expiresAt: Date?
+        public let refreshToken: String?
+        public let oidcIssuer: String?
+        public let oidcClientId: String?
+        public let isFlatRoot: Bool
+
+        public init(
+            entryKey: String,
+            accessToken: String,
+            email: String,
+            displayName: String,
+            authMode: String?,
+            codingDataTeam: String?,
+            expiresAt: Date?,
+            refreshToken: String? = nil,
+            oidcIssuer: String? = nil,
+            oidcClientId: String? = nil,
+            isFlatRoot: Bool = false
+        ) {
+            self.entryKey = entryKey
+            self.accessToken = accessToken
+            self.email = email
+            self.displayName = displayName
+            self.authMode = authMode
+            self.codingDataTeam = codingDataTeam
+            self.expiresAt = expiresAt
+            self.refreshToken = refreshToken
+            self.oidcIssuer = oidcIssuer
+            self.oidcClientId = oidcClientId
+            self.isFlatRoot = isFlatRoot
+        }
 
         public var resolvedPlan: PlanInfo {
             if let team = codingDataTeam?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -52,6 +85,45 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
                 return PlanInfo(kind: .team, displayName: "SuperGrok · \(team)")
             }
             return PlanInfo(kind: .pro, displayName: "SuperGrok")
+        }
+
+        public var resolvedTokenEndpointURL: URL? {
+            let rawIssuer = oidcIssuer?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let issuerBase = (rawIssuer?.isEmpty == false ? rawIssuer! : GrokProvider.defaultOIDCIssuer)
+            var trimmed = issuerBase
+            while trimmed.hasSuffix("/") {
+                trimmed.removeLast()
+            }
+            guard let url = URL(string: "\(trimmed)/oauth2/token"),
+                  url.scheme?.lowercased() == "https",
+                  let host = url.host,
+                  !host.isEmpty else {
+                return nil
+            }
+            return url
+        }
+
+        public var canRefreshOIDC: Bool {
+            guard authMode?.lowercased() == "oidc",
+                  let rt = refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines), !rt.isEmpty,
+                  let cid = oidcClientId?.trimmingCharacters(in: .whitespacesAndNewlines), !cid.isEmpty else {
+                return false
+            }
+            return resolvedTokenEndpointURL != nil
+        }
+
+        public func needsProactiveRefresh(
+            now: Date = Date(),
+            leeway: TimeInterval = GrokProvider.oidcExpiryLeewaySeconds
+        ) -> Bool {
+            let cutoff = now.addingTimeInterval(leeway)
+            if let exp = expiresAt, exp <= cutoff {
+                return true
+            }
+            if let jwtExp = GrokProvider.jwtExpirationDate(from: accessToken), jwtExp <= cutoff {
+                return true
+            }
+            return false
         }
     }
 
@@ -138,7 +210,8 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     public func fetchQuota(for account: AccountRecord, isActiveLive: Bool) async -> QuotaSnapshot {
-        let entry: AuthEntry
+        _ = isActiveLive
+        var entry: AuthEntry
         do {
             guard let loaded = try readAuthEntry() else {
                 return QuotaSnapshot.unconfigured(
@@ -158,44 +231,138 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
             )
         }
 
+        var didAttemptOIDCRefresh = false
+
+        // 1. Proactive OIDC refresh when access token is expired or expiring within 60 seconds.
+        if entry.canRefreshOIDC && entry.needsProactiveRefresh() {
+            didAttemptOIDCRefresh = true
+            switch await refreshOIDCEntry(currentEntry: entry, forceRefresh: false) {
+            case .refreshed(let updated):
+                entry = updated
+            case .reauthRequired:
+                return QuotaSnapshot(
+                    provider: .grok,
+                    accountId: account.id,
+                    plan: entry.resolvedPlan,
+                    status: .reauthRequired("请重新登录 Grok CLI"),
+                    sourceLabel: "Grok CLI",
+                    paceNote: expiryHint(for: entry)
+                )
+            case .failed, .notApplicable:
+                break
+            }
+        }
+
+        // 2. Fetch billing (with at most ONE reactive OIDC refresh + retry on 401 / grpc-status: 16).
+        let firstAttempt = await fetchBillingWithFallback(
+            accountId: account.id,
+            entry: entry,
+            allowReactiveOIDCDefer: entry.canRefreshOIDC && !didAttemptOIDCRefresh
+        )
+        switch firstAttempt {
+        case .snapshot(let snap):
+            return snap
+        case .needsOIDCRefresh:
+            didAttemptOIDCRefresh = true
+            switch await refreshOIDCEntry(currentEntry: entry, forceRefresh: true) {
+            case .refreshed(let updated):
+                entry = updated
+                let retryAttempt = await fetchBillingWithFallback(
+                    accountId: account.id,
+                    entry: entry,
+                    allowReactiveOIDCDefer: false
+                )
+                if case .snapshot(let snap) = retryAttempt {
+                    return snap
+                }
+                return QuotaSnapshot(
+                    provider: .grok,
+                    accountId: account.id,
+                    plan: entry.resolvedPlan,
+                    status: .reauthRequired("请重新登录 Grok CLI"),
+                    sourceLabel: "Grok CLI",
+                    paceNote: expiryHint(for: entry)
+                )
+            case .reauthRequired:
+                return QuotaSnapshot(
+                    provider: .grok,
+                    accountId: account.id,
+                    plan: entry.resolvedPlan,
+                    status: .reauthRequired("请重新登录 Grok CLI"),
+                    sourceLabel: "Grok CLI",
+                    paceNote: expiryHint(for: entry)
+                )
+            case .failed, .notApplicable:
+                // Refresh endpoint had a transient issue; still try fallback billing once before concluding.
+                let fallbackResult = await fetchFallbackBilling(entry: entry)
+                if case .success(let parsed) = fallbackResult {
+                    return makeReadySnapshot(
+                        accountId: account.id,
+                        entry: entry,
+                        parsed: parsed,
+                        sourceLabel: sourceLabel(base: "Grok Billing API", team: entry.codingDataTeam)
+                    )
+                }
+                return QuotaSnapshot(
+                    provider: .grok,
+                    accountId: account.id,
+                    plan: entry.resolvedPlan,
+                    status: .reauthRequired("请重新登录 Grok CLI"),
+                    sourceLabel: "Grok CLI",
+                    paceNote: expiryHint(for: entry)
+                )
+            }
+        }
+    }
+
+    private enum BillingAttemptOutcome {
+        case snapshot(QuotaSnapshot)
+        case needsOIDCRefresh
+    }
+
+    private func fetchBillingWithFallback(
+        accountId: String,
+        entry: AuthEntry,
+        allowReactiveOIDCDefer: Bool
+    ) async -> BillingAttemptOutcome {
         let primaryResult = await fetchPrimaryGRPCWeb(entry: entry)
         switch primaryResult {
         case .success(let parsed):
-            return makeReadySnapshot(
-                accountId: account.id,
-                entry: entry,
-                parsed: parsed,
-                sourceLabel: sourceLabel(base: "Grok gRPC-web", team: entry.codingDataTeam)
+            return .snapshot(
+                makeReadySnapshot(
+                    accountId: accountId,
+                    entry: entry,
+                    parsed: parsed,
+                    sourceLabel: sourceLabel(base: "Grok gRPC-web", team: entry.codingDataTeam)
+                )
             )
 
         case .authRequired:
+            if allowReactiveOIDCDefer {
+                return .needsOIDCRefresh
+            }
             // Try fallback before concluding re-auth is required, in case only the web gateway rejected the token.
             let fallbackResult = await fetchFallbackBilling(entry: entry)
             switch fallbackResult {
             case .success(let parsed):
-                return makeReadySnapshot(
-                    accountId: account.id,
-                    entry: entry,
-                    parsed: parsed,
-                    sourceLabel: sourceLabel(base: "Grok Billing API", team: entry.codingDataTeam)
+                return .snapshot(
+                    makeReadySnapshot(
+                        accountId: accountId,
+                        entry: entry,
+                        parsed: parsed,
+                        sourceLabel: sourceLabel(base: "Grok Billing API", team: entry.codingDataTeam)
+                    )
                 )
-            case .authRequired:
-                return QuotaSnapshot(
-                    provider: .grok,
-                    accountId: account.id,
-                    plan: entry.resolvedPlan,
-                    status: .reauthRequired("请重新登录 Grok CLI"),
-                    sourceLabel: "Grok CLI",
-                    paceNote: expiryHint(for: entry)
-                )
-            case .failed:
-                return QuotaSnapshot(
-                    provider: .grok,
-                    accountId: account.id,
-                    plan: entry.resolvedPlan,
-                    status: .reauthRequired("请重新登录 Grok CLI"),
-                    sourceLabel: "Grok CLI",
-                    paceNote: expiryHint(for: entry)
+            case .authRequired, .failed:
+                return .snapshot(
+                    QuotaSnapshot(
+                        provider: .grok,
+                        accountId: accountId,
+                        plan: entry.resolvedPlan,
+                        status: .reauthRequired("请重新登录 Grok CLI"),
+                        sourceLabel: "Grok CLI",
+                        paceNote: expiryHint(for: entry)
+                    )
                 )
             }
 
@@ -203,45 +370,56 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
             let fallbackResult = await fetchFallbackBilling(entry: entry)
             switch fallbackResult {
             case .success(let parsed):
-                return makeReadySnapshot(
-                    accountId: account.id,
-                    entry: entry,
-                    parsed: parsed,
-                    sourceLabel: sourceLabel(base: "Grok Billing API", team: entry.codingDataTeam)
+                return .snapshot(
+                    makeReadySnapshot(
+                        accountId: accountId,
+                        entry: entry,
+                        parsed: parsed,
+                        sourceLabel: sourceLabel(base: "Grok Billing API", team: entry.codingDataTeam)
+                    )
                 )
             case .authRequired:
-                return QuotaSnapshot(
-                    provider: .grok,
-                    accountId: account.id,
-                    plan: entry.resolvedPlan,
-                    status: .reauthRequired("请重新登录 Grok CLI"),
-                    sourceLabel: "Grok CLI",
-                    paceNote: expiryHint(for: entry)
-                )
-            case .failed(let fallbackErr):
-                let expiredHint = expiryHint(for: entry)
-                if let expiresAt = entry.expiresAt, expiresAt <= Date() {
-                    return QuotaSnapshot(
+                if allowReactiveOIDCDefer {
+                    return .needsOIDCRefresh
+                }
+                return .snapshot(
+                    QuotaSnapshot(
                         provider: .grok,
-                        accountId: account.id,
+                        accountId: accountId,
                         plan: entry.resolvedPlan,
                         status: .reauthRequired("请重新登录 Grok CLI"),
                         sourceLabel: "Grok CLI",
-                        paceNote: expiredHint
+                        paceNote: expiryHint(for: entry)
+                    )
+                )
+            case .failed(let fallbackErr):
+                let expiredHint = expiryHint(for: entry)
+                if expiredHint != nil {
+                    return .snapshot(
+                        QuotaSnapshot(
+                            provider: .grok,
+                            accountId: accountId,
+                            plan: entry.resolvedPlan,
+                            status: .reauthRequired("请重新登录 Grok CLI"),
+                            sourceLabel: "Grok CLI",
+                            paceNote: expiredHint
+                        )
                     )
                 }
-                return QuotaSnapshot(
-                    provider: .grok,
-                    accountId: account.id,
-                    plan: entry.resolvedPlan,
-                    status: .failed(primaryErr.isEmpty ? fallbackErr : primaryErr),
-                    sourceLabel: "Grok CLI"
+                return .snapshot(
+                    QuotaSnapshot(
+                        provider: .grok,
+                        accountId: accountId,
+                        plan: entry.resolvedPlan,
+                        status: .failed(primaryErr.isEmpty ? fallbackErr : primaryErr),
+                        sourceLabel: "Grok CLI"
+                    )
                 )
             }
         }
     }
 
-    // MARK: - Read-Only Auth Loader
+    // MARK: - Auth Loader & OIDC Refresh with Advisory Flock
 
     public func readAuthEntry() throws -> AuthEntry? {
         guard FileManager.default.fileExists(atPath: authFileURL.path) else {
@@ -258,7 +436,7 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
 
         // Defensive support if a flat object with "key" is ever provided.
         if let directKey = nonEmptyString(root["key"]) {
-            return makeAuthEntry(entryKey: "default", dict: root, accessToken: directKey)
+            return makeAuthEntry(entryKey: "default", dict: root, accessToken: directKey, isFlatRoot: true)
         }
 
         var candidates: [(entry: AuthEntry, priority: Int)] = []
@@ -267,7 +445,7 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
                   let token = nonEmptyString(dict["key"]) else {
                 continue
             }
-            let entry = makeAuthEntry(entryKey: rawKey, dict: dict, accessToken: token)
+            let entry = makeAuthEntry(entryKey: rawKey, dict: dict, accessToken: token, isFlatRoot: false)
             var priority = 0
             if rawKey.hasPrefix("https://auth.x.ai::") {
                 priority += 100
@@ -298,7 +476,12 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
         return candidates.first?.entry
     }
 
-    private static func makeAuthEntry(entryKey: String, dict: [String: Any], accessToken: String) -> AuthEntry {
+    private static func makeAuthEntry(
+        entryKey: String,
+        dict: [String: Any],
+        accessToken: String,
+        isFlatRoot: Bool
+    ) -> AuthEntry {
         let email = nonEmptyString(dict["email"]) ?? ""
         let firstName = nonEmptyString(dict["first_name"]) ?? ""
         let lastName = nonEmptyString(dict["last_name"]) ?? ""
@@ -306,6 +489,21 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
         let displayName = !combinedName.isEmpty ? combinedName : (!email.isEmpty ? email : "Grok")
         let authMode = nonEmptyString(dict["auth_mode"])
         let team = nonEmptyString(dict["coding_data_team"])
+        let refreshToken = nonEmptyString(dict["refresh_token"])
+
+        var oidcIssuer = nonEmptyString(dict["oidc_issuer"])
+        var oidcClientId = nonEmptyString(dict["oidc_client_id"])
+        if let sep = entryKey.range(of: "::") {
+            let keyIssuer = String(entryKey[..<sep.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let keyClient = String(entryKey[sep.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if oidcIssuer == nil && !keyIssuer.isEmpty {
+                oidcIssuer = keyIssuer
+            }
+            if oidcClientId == nil && !keyClient.isEmpty {
+                oidcClientId = keyClient
+            }
+        }
+
         let expiresAt: Date?
         if let expStr = nonEmptyString(dict["expires_at"]) {
             expiresAt = Formatters.parseRFC3339(expStr)
@@ -324,8 +522,210 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
             displayName: displayName,
             authMode: authMode,
             codingDataTeam: team,
-            expiresAt: expiresAt
+            expiresAt: expiresAt,
+            refreshToken: refreshToken,
+            oidcIssuer: oidcIssuer,
+            oidcClientId: oidcClientId,
+            isFlatRoot: isFlatRoot
         )
+    }
+
+    public static func jwtExpirationDate(from token: String) -> Date? {
+        guard let payload = Formatters.decodeJWTPayload(token),
+              let exp = parseDouble(payload["exp"]),
+              exp > 1_000_000_000 else {
+            return nil
+        }
+        return exp > 1_000_000_000_000
+            ? Date(timeIntervalSince1970: exp / 1000.0)
+            : Date(timeIntervalSince1970: exp)
+    }
+
+    private enum OIDCRefreshOutcome {
+        case refreshed(AuthEntry)
+        case reauthRequired
+        case failed(String)
+        case notApplicable
+    }
+
+    private func refreshOIDCEntry(
+        currentEntry: AuthEntry,
+        forceRefresh: Bool,
+        now: Date = Date()
+    ) async -> OIDCRefreshOutcome {
+        let lockURL = URL(fileURLWithPath: authFileURL.path + ".lock")
+        return await withAdvisoryFileLock(lockURL: lockURL, timeoutSeconds: 15.0) {
+            // Re-read auth.json inside flock in case Grok CLI (or another process) already refreshed it.
+            let diskEntry = try? readAuthEntry()
+            if let latest = diskEntry {
+                if !forceRefresh && !latest.needsProactiveRefresh(now: now) {
+                    return .refreshed(latest)
+                }
+                if forceRefresh
+                    && latest.accessToken != currentEntry.accessToken
+                    && !latest.needsProactiveRefresh(now: now) {
+                    return .refreshed(latest)
+                }
+            }
+
+            let target = diskEntry ?? currentEntry
+            guard target.canRefreshOIDC,
+                  let tokenURL = target.resolvedTokenEndpointURL,
+                  let clientId = target.oidcClientId,
+                  let refreshToken = target.refreshToken else {
+                return .notApplicable
+            }
+
+            let bodyString = [
+                "grant_type=refresh_token",
+                "client_id=\(Self.formURLEncode(clientId))",
+                "refresh_token=\(Self.formURLEncode(refreshToken))",
+            ].joined(separator: "&")
+
+            var req = URLRequest(url: tokenURL)
+            req.httpMethod = "POST"
+            req.httpBody = Data(bodyString.utf8)
+            req.httpShouldHandleCookies = false
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            req.setValue("RoryOrbit/1.0", forHTTPHeaderField: "User-Agent")
+
+            do {
+                let (data, response) = try await session.data(for: req)
+                guard let http = response as? HTTPURLResponse else {
+                    return .failed("Grok OIDC 续期无有效响应")
+                }
+                if http.statusCode == 400 || http.statusCode == 401 {
+                    return .reauthRequired
+                }
+                guard (200...299).contains(http.statusCode) else {
+                    return .failed("Grok OIDC 续期返回 HTTP \(http.statusCode)")
+                }
+                guard let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
+                      let newAccessToken = Self.nonEmptyString(json["access_token"]) else {
+                    return .failed("Grok OIDC 续期响应格式无效")
+                }
+
+                let newExpiresAt: Date?
+                if let expiresIn = Self.parseDouble(json["expires_in"]), expiresIn > 0 {
+                    newExpiresAt = Date().addingTimeInterval(expiresIn)
+                } else {
+                    newExpiresAt = Self.jwtExpirationDate(from: newAccessToken)
+                }
+                let rotatedRefreshToken = Self.nonEmptyString(json["refresh_token"]) ?? target.refreshToken
+
+                // Atomically persist updated auth.json (0600) while preserving all existing fields.
+                persistRefreshedAuthEntry(
+                    target: target,
+                    newAccessToken: newAccessToken,
+                    newExpiresAt: newExpiresAt,
+                    newRefreshToken: rotatedRefreshToken
+                )
+
+                let updatedEntry = AuthEntry(
+                    entryKey: target.entryKey,
+                    accessToken: newAccessToken,
+                    email: target.email,
+                    displayName: target.displayName,
+                    authMode: target.authMode,
+                    codingDataTeam: target.codingDataTeam,
+                    expiresAt: newExpiresAt ?? target.expiresAt,
+                    refreshToken: rotatedRefreshToken,
+                    oidcIssuer: target.oidcIssuer,
+                    oidcClientId: target.oidcClientId,
+                    isFlatRoot: target.isFlatRoot
+                )
+                return .refreshed(updatedEntry)
+            } catch {
+                return .failed("Grok OIDC 续期网络失败: \(Self.sanitizedNetworkError(error))")
+            }
+        }
+    }
+
+    private func persistRefreshedAuthEntry(
+        target: AuthEntry,
+        newAccessToken: String,
+        newExpiresAt: Date?,
+        newRefreshToken: String?
+    ) {
+        guard let existingData = try? Data(contentsOf: authFileURL),
+              var root = (try? JSONSerialization.jsonObject(with: existingData, options: [])) as? [String: Any] else {
+            return
+        }
+
+        if target.isFlatRoot {
+            root["key"] = newAccessToken
+            if let newExpiresAt {
+                root["expires_at"] = Formatters.formatRFC3339UTC(newExpiresAt)
+            }
+            if let newRefreshToken, !newRefreshToken.isEmpty {
+                root["refresh_token"] = newRefreshToken
+            }
+        } else if var entryDict = root[target.entryKey] as? [String: Any] {
+            entryDict["key"] = newAccessToken
+            if let newExpiresAt {
+                entryDict["expires_at"] = Formatters.formatRFC3339UTC(newExpiresAt)
+            }
+            if let newRefreshToken, !newRefreshToken.isEmpty {
+                entryDict["refresh_token"] = newRefreshToken
+            }
+            root[target.entryKey] = entryDict
+        } else {
+            return
+        }
+
+        guard var encoded = try? JSONSerialization.data(
+            withJSONObject: root,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) else {
+            return
+        }
+        encoded.append(0x0A)
+        try? KeychainStore.writeAtomicFile(data: encoded, to: authFileURL, mode: 0o600)
+    }
+
+    private func withAdvisoryFileLock<T>(
+        lockURL: URL,
+        timeoutSeconds: TimeInterval,
+        operation: () async -> T
+    ) async -> T {
+        let dir = lockURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? KeychainStore.ensureDirectory(at: dir, mode: 0o700)
+        }
+
+        let fd = Darwin.open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            return await operation()
+        }
+        _ = Darwin.fchmod(fd, S_IRUSR | S_IWUSR)
+
+        var acquired = false
+        let deadline = Date().addingTimeInterval(max(1.0, timeoutSeconds))
+        while Date() < deadline {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                acquired = true
+                break
+            }
+            if errno != EWOULDBLOCK && errno != EINTR {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        defer {
+            if acquired {
+                _ = flock(fd, LOCK_UN)
+            }
+            _ = Darwin.close(fd)
+        }
+        return await operation()
+    }
+
+    private static func formURLEncode(_ raw: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
     }
 
     // MARK: - Network Fetchers
@@ -836,8 +1236,11 @@ public final class GrokProvider: ProviderAdapter, @unchecked Sendable {
     }
 
     private func expiryHint(for entry: AuthEntry) -> String? {
-        guard let exp = entry.expiresAt else { return nil }
-        if exp <= Date() {
+        let now = Date()
+        if let exp = entry.expiresAt, exp <= now {
+            return "本地 OIDC 会话已过期，请执行 grok login"
+        }
+        if let jwtExp = Self.jwtExpirationDate(from: entry.accessToken), jwtExp <= now {
             return "本地 OIDC 会话已过期，请执行 grok login"
         }
         return nil

@@ -65,6 +65,24 @@ public enum ProviderID: String, CaseIterable, Codable, Identifiable, Hashable, S
 
     public var supportsAccountSwitch: Bool {
         switch self {
+        case .antigravity, .codex, .claude:
+            return true
+        case .grok, .cursor, .kimi, .deepseek:
+            return false
+        }
+    }
+
+    public var supportsMultiAccount: Bool {
+        switch self {
+        case .antigravity, .codex, .claude:
+            return true
+        case .grok, .cursor, .kimi, .deepseek:
+            return false
+        }
+    }
+
+    public var supportsClientControl: Bool {
+        switch self {
         case .antigravity, .codex:
             return true
         case .claude, .grok, .cursor, .kimi, .deepseek:

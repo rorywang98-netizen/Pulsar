@@ -73,7 +73,7 @@ public enum PopoverTab: String, CaseIterable, Identifiable, Hashable, Sendable {
 @MainActor
 public final class AppStore: ObservableObject {
     public nonisolated static let bundleIdentifier = "com.rory.roryorbit"
-    public nonisolated static let appVersion = "1.4.1"
+    public nonisolated static let appVersion = "1.5.0"
 
     public nonisolated static var defaultAvatarCacheDirectoryURL: URL {
         RegistryData.defaultDirectoryURL.appendingPathComponent("avatars", isDirectory: true)
@@ -279,7 +279,7 @@ public final class AppStore: ObservableObject {
 
     public func accounts(for provider: ProviderID) -> [AccountRecord] {
         let list = registry.accounts(for: provider)
-        guard provider.supportsAccountSwitch else {
+        guard provider.supportsMultiAccount else {
             return list
         }
         return list.sorted { lhs, rhs in
@@ -1001,7 +1001,7 @@ public final class AppStore: ObservableObject {
             let syncedLiveId = await currentAdapter.syncLiveAccount(registry: &providerScopedRegistry)
 
             var effectiveAccounts = providerScopedRegistry.accounts(for: provider)
-            if !provider.supportsAccountSwitch {
+            if !provider.supportsMultiAccount {
                 if let liveId = syncedLiveId,
                    liveId != syntheticDefaultId,
                    effectiveAccounts.count > 1,
@@ -1027,7 +1027,7 @@ public final class AppStore: ObservableObject {
                 for idx in effectiveAccounts.indices {
                     effectiveAccounts[idx].isActiveLive = (effectiveAccounts[idx].id == syncedLiveId)
                 }
-            } else if !provider.supportsAccountSwitch, !effectiveAccounts.isEmpty {
+            } else if !provider.supportsMultiAccount, !effectiveAccounts.isEmpty {
                 for idx in effectiveAccounts.indices {
                     effectiveAccounts[idx].isActiveLive = (idx == 0)
                 }
@@ -1224,7 +1224,12 @@ public final class AppStore: ObservableObject {
             }
             registry.setActiveLive(accountId: account.id, for: provider)
             persistRegistryQuietly()
-            if reopenedApps.isEmpty {
+            if provider == .claude {
+                setBanner(
+                    "已将新终端 Claude CLI 默认账号切换为 \(account.displayName)（不重启进行中的终端）",
+                    isError: false
+                )
+            } else if reopenedApps.isEmpty {
                 setBanner("已切换 \(provider.displayName) 至 \(account.displayName)", isError: false)
             } else {
                 setBanner("已切换至 \(account.displayName)，已重新打开 \(reopenedApps.joined(separator: "、"))", isError: false)
@@ -1353,9 +1358,80 @@ public final class AppStore: ObservableObject {
         }
     }
 
+    public func claudeProfileId(for accountId: String) -> String? {
+        if let claudeAdapter = adapters[.claude] as? ClaudeProvider {
+            return claudeAdapter.profileId(for: accountId)
+        }
+        if accountId.hasPrefix(ClaudeProvider.profileAccountIdPrefix) {
+            let suffix = String(accountId.dropFirst(ClaudeProvider.profileAccountIdPrefix.count))
+            return suffix.isEmpty ? nil : suffix
+        }
+        if accountId == ClaudeProvider.defaultLocalAccountId || accountId == "claude:default" {
+            return ClaudeProvider.defaultProfileSlug
+        }
+        return nil
+    }
+
+    public func claudeLaunchCommand(for accountId: String) -> String? {
+        if let claudeAdapter = adapters[.claude] as? ClaudeProvider {
+            return claudeAdapter.launchCommand(for: accountId)
+        }
+        guard let slug = claudeProfileId(for: accountId) else { return nil }
+        return "CLAUDE_PROFILE=\(slug) claude"
+    }
+
+    public func copyClaudeLaunchCommand(_ command: String) {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(trimmed, forType: .string)
+        setBanner("已复制登录命令：\(trimmed)", isError: false, autoClearSeconds: 5.0)
+    }
+
+    @discardableResult
+    public func createClaudeCLIProfile(
+        id rawId: String,
+        label: String?
+    ) async -> Result<(profileId: String, launchCommand: String), Error> {
+        guard let claudeAdapter = adapters[.claude] as? ClaudeProvider else {
+            let err = ProviderAdapterError.operationFailed("未启用 Claude CLI 适配器")
+            setBanner("创建配置失败：\(err.localizedDescription)", isError: true, autoClearSeconds: nil)
+            return .failure(err)
+        }
+        guard busyActionLabel == nil else {
+            let err = ProviderAdapterError.operationFailed("当前有正在执行的操作，请稍后重试")
+            return .failure(err)
+        }
+
+        busyActionLabel = "正在创建 Claude CLI 配置..."
+        defer { busyActionLabel = nil }
+
+        do {
+            let created = try claudeAdapter.createCLIProfile(id: rawId, label: label)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(created.launchCommand, forType: .string)
+            await refreshProvider(.claude, userInitiated: true)
+            setBanner(
+                "已创建配置 \(created.profileId)，登录命令已复制：\(created.launchCommand)",
+                isError: false,
+                autoClearSeconds: 8.0
+            )
+            return .success(created)
+        } catch {
+            setBanner("创建配置失败：\(error.localizedDescription)", isError: true, autoClearSeconds: nil)
+            return .failure(error)
+        }
+    }
+
     public func removeAccount(provider: ProviderID, account: AccountRecord) async {
         guard let adapter = adapters[provider] else { return }
         guard busyActionLabel == nil else { return }
+
+        if provider == .claude,
+           claudeProfileId(for: account.id)?.lowercased() == ClaudeProvider.defaultProfileSlug {
+            setBanner("无法移除默认 Claude CLI 配置（default）", isError: true)
+            return
+        }
 
         busyActionLabel = "正在移除账号..."
         defer { busyActionLabel = nil }
@@ -1363,7 +1439,13 @@ public final class AppStore: ObservableObject {
         do {
             try adapter.deleteAccountCredentials(accountId: account.id)
         } catch {
-            setBanner("移除钥匙串凭证失败：\(error.localizedDescription)", isError: true, autoClearSeconds: nil)
+            setBanner(
+                provider == .claude
+                    ? "移除 Claude CLI 配置失败：\(error.localizedDescription)"
+                    : "移除钥匙串凭证失败：\(error.localizedDescription)",
+                isError: true,
+                autoClearSeconds: nil
+            )
             return
         }
 
@@ -1373,7 +1455,12 @@ public final class AppStore: ObservableObject {
         loadedAvatarURLByAccountId.removeValue(forKey: account.id)
         refreshBestRemainingBadges()
         persistRegistryQuietly()
-        setBanner("已移除 \(provider.displayName) 账号：\(account.displayName)", isError: false)
+        if provider == .claude {
+            await refreshProvider(.claude)
+            setBanner("已移除 Claude CLI 配置：\(account.displayName)（本地目录已保留）", isError: false)
+        } else {
+            setBanner("已移除 \(provider.displayName) 账号：\(account.displayName)", isError: false)
+        }
     }
 
     // MARK: - Client Control (Restart / Quit)
@@ -1383,6 +1470,13 @@ public final class AppStore: ObservableObject {
         restart: Bool,
         allowForceQuit: Bool = false
     ) async {
+        guard provider.supportsClientControl else {
+            let refusal = (provider == .claude)
+                ? ClaudeProvider.policyRefusalMessage
+                : "\(provider.displayName) 不支持客户端启停控制"
+            setBanner(refusal, isError: true)
+            return
+        }
         guard let adapter = adapters[provider] else { return }
         guard busyActionLabel == nil else { return }
 
@@ -2986,13 +3080,13 @@ public final class AppStore: ObservableObject {
     }
 
     private func ensureDefaultAccountsForEnabledNonSwitchableProviders() {
-        for provider in enabledProvidersOrdered where !provider.supportsAccountSwitch {
+        for provider in enabledProvidersOrdered where !provider.supportsMultiAccount {
             ensureDefaultAccountIfNeeded(for: provider)
         }
     }
 
     private func ensureDefaultAccountIfNeeded(for provider: ProviderID) {
-        guard !provider.supportsAccountSwitch else { return }
+        guard !provider.supportsMultiAccount else { return }
         guard registry.accounts(for: provider).isEmpty else { return }
         let record = AccountRecord(
             id: defaultAccountId(for: provider),
@@ -3014,7 +3108,7 @@ public final class AppStore: ObservableObject {
         let previousForProvider = registry.accounts(for: provider)
 
         var mergedProviderAccounts = syncedAccounts
-        if !provider.supportsAccountSwitch {
+        if !provider.supportsMultiAccount {
             let syntheticDefaultId = defaultAccountId(for: provider)
             if let liveId = liveAccountId,
                liveId != syntheticDefaultId,
@@ -3043,7 +3137,7 @@ public final class AppStore: ObservableObject {
 
         if let liveAccountId {
             registry.setActiveLive(accountId: liveAccountId, for: provider)
-        } else if !provider.supportsAccountSwitch, let firstId = mergedProviderAccounts.first?.id {
+        } else if !provider.supportsMultiAccount, let firstId = mergedProviderAccounts.first?.id {
             registry.setActiveLive(accountId: firstId, for: provider)
         }
 
@@ -3243,7 +3337,7 @@ public final class AppStore: ObservableObject {
 
     private func refreshBestRemainingBadges() {
         var byAccountId: [String: QuotaSnapshot] = [:]
-        for account in registry.accounts where account.provider.supportsAccountSwitch {
+        for account in registry.accounts where account.provider.supportsMultiAccount {
             if let snap = snapshot(for: account.provider, accountId: account.id) {
                 byAccountId[account.id] = snap
             }
@@ -3252,6 +3346,14 @@ public final class AppStore: ObservableObject {
             snapshots: byAccountId,
             antigravityPool: registry.settings.menuBarCustom.antigravityPool
         )
+        let readyClaudeCount = registry.accounts(for: .claude).filter {
+            snapshot(for: .claude, accountId: $0.id)?.status.isReady == true
+        }.count
+        if readyClaudeCount < 2 {
+            for idx in registry.accounts.indices where registry.accounts[idx].provider == .claude {
+                registry.accounts[idx].isBestRemaining = false
+            }
+        }
     }
 
     private func refreshAPIKeyStatuses() {

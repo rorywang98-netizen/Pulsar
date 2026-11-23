@@ -2432,10 +2432,10 @@ public struct SettingsView: View {
                         .foregroundColor(Color(nsColor: .systemGreen))
                         .padding(.top, 1)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Claude CLI 纯本地被动模式（零联网 · 不碰桌面端）")
+                        Text("Claude CLI 多账号纯本地被动模式（零联网 · 不碰桌面端）")
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundColor(.primary)
-                        Text("仅离线读取 ~/.claude.json 与 ~/.cache/pulsar/claude-cli-quota.json 中的非敏感余量，绝不请求远端接口、读取系统钥匙串/Cookie 或触碰 Claude 桌面端。")
+                        Text("仅离线读取 ~/.config/pulsar/claude-cli-profiles.json、独立配置目录 .claude.json 与 ~/.cache/pulsar/claude-cli-quotas/ 中的非敏感余量，切号仅更新本地默认配置指针，绝不请求远端接口、读取系统钥匙串/Cookie 或触碰 Claude 桌面端。")
                             .font(.system(size: 10.5))
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2540,7 +2540,7 @@ public struct SettingsView: View {
         switch provider {
         case .antigravity: return "多账号切换 · 本地 RPC + Cloud Code"
         case .codex: return "多账号切换 · 5小时 / 本周配额"
-        case .claude: return "纯本地被动 · 零联网 · 5h / 周余量"
+        case .claude: return "多账号本地被动 · 零联网 · 5h / 周余量"
         case .grok: return "CLI 账单配额监控"
         case .cursor: return "本地会话配额监控"
         case .kimi: return "API 用量监控"

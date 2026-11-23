@@ -105,7 +105,7 @@ enum CLIRunner {
                     }
 
                     var accounts = scopedRegistry.accounts(for: provider)
-                    if !provider.supportsAccountSwitch {
+                    if !provider.supportsMultiAccount {
                         let defaultId = provider.supportsAPIKeyConfig
                             ? "\(provider.rawValue):api"
                             : "\(provider.rawValue):default"

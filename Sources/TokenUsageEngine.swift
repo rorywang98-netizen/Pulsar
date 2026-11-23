@@ -393,7 +393,7 @@ public actor TokenUsageEngine {
         var activePaths = Set<String>()
         var liveScannedFilesCount = 0
 
-        // 1. Claude Code (~/.claude/projects/**/*.jsonl)
+        // 1. Claude Code (~/.claude/projects/**/*.jsonl & ~/.claude-profiles/*/projects/**/*.jsonl)
         liveScannedFilesCount += scanClaudeLogs(
             cache: &scanCache,
             activePaths: &activePaths,
@@ -860,30 +860,49 @@ public actor TokenUsageEngine {
         historyCutoffSec: Double,
         dirMtimes: inout [String: Double]
     ) -> Int {
-        let rootPath = homeDirectoryURL.appendingPathComponent(".claude/projects", isDirectory: true).path
-        if let dm = dirMtime(at: rootPath) { dirMtimes[rootPath] = dm }
+        var rootPaths: [String] = []
+        let defaultRoot = homeDirectoryURL.appendingPathComponent(".claude/projects", isDirectory: true).path
+        if let dm = dirMtime(at: defaultRoot) { dirMtimes[defaultRoot] = dm }
+        rootPaths.append(defaultRoot)
+
+        let profilesBase = homeDirectoryURL.appendingPathComponent(".claude-profiles", isDirectory: true).path
+        if let dm = dirMtime(at: profilesBase) {
+            dirMtimes[profilesBase] = dm
+            for profileName in listSubdirectoryNames(at: profilesBase) {
+                let profilePath = profilesBase + "/" + profileName
+                if let pdm = dirMtime(at: profilePath) { dirMtimes[profilePath] = pdm }
+                let projectsPath = profilePath + "/projects"
+                if let projMtime = dirMtime(at: projectsPath) {
+                    dirMtimes[projectsPath] = projMtime
+                    rootPaths.append(projectsPath)
+                }
+            }
+        }
+
         var seen = 0
-        for projName in listSubdirectoryNames(at: rootPath) {
-            let projPath = rootPath + "/" + projName
-            if let dm = dirMtime(at: projPath) { dirMtimes[projPath] = dm }
-            let entries = listDirectoryEntries(at: projPath)
-            for ent in entries {
-                if ent.isDirectory {
-                    let subagentsPath = projPath + "/" + ent.name + "/subagents"
-                    for file in listRecentRegularFiles(at: subagentsPath, suffix: ".jsonl", mtimeCutoff: watchCutoff) {
-                        seen += 1
-                        trackWatchTarget(path: file.path, kind: .claude, mtime: file.mtime, watchCutoff: watchCutoff)
-                        if file.mtime >= mtimeCutoff {
-                            ingestLiveClaudeFile(path: file.path, mtime: file.mtime, size: file.size, historyCutoffSec: historyCutoffSec)
+        for rootPath in rootPaths {
+            for projName in listSubdirectoryNames(at: rootPath) {
+                let projPath = rootPath + "/" + projName
+                if let dm = dirMtime(at: projPath) { dirMtimes[projPath] = dm }
+                let entries = listDirectoryEntries(at: projPath)
+                for ent in entries {
+                    if ent.isDirectory {
+                        let subagentsPath = projPath + "/" + ent.name + "/subagents"
+                        for file in listRecentRegularFiles(at: subagentsPath, suffix: ".jsonl", mtimeCutoff: watchCutoff) {
+                            seen += 1
+                            trackWatchTarget(path: file.path, kind: .claude, mtime: file.mtime, watchCutoff: watchCutoff)
+                            if file.mtime >= mtimeCutoff {
+                                ingestLiveClaudeFile(path: file.path, mtime: file.mtime, size: file.size, historyCutoffSec: historyCutoffSec)
+                            }
                         }
-                    }
-                } else if ent.name.hasSuffix(".jsonl") {
-                    seen += 1
-                    let fPath = projPath + "/" + ent.name
-                    if let attrs = fileMtimeAndSize(at: fPath), attrs.mtime >= watchCutoff {
-                        trackWatchTarget(path: fPath, kind: .claude, mtime: attrs.mtime, watchCutoff: watchCutoff)
-                        if attrs.mtime >= mtimeCutoff {
-                            ingestLiveClaudeFile(path: fPath, mtime: attrs.mtime, size: attrs.size, historyCutoffSec: historyCutoffSec)
+                    } else if ent.name.hasSuffix(".jsonl") {
+                        seen += 1
+                        let fPath = projPath + "/" + ent.name
+                        if let attrs = fileMtimeAndSize(at: fPath), attrs.mtime >= watchCutoff {
+                            trackWatchTarget(path: fPath, kind: .claude, mtime: attrs.mtime, watchCutoff: watchCutoff)
+                            if attrs.mtime >= mtimeCutoff {
+                                ingestLiveClaudeFile(path: fPath, mtime: attrs.mtime, size: attrs.size, historyCutoffSec: historyCutoffSec)
+                            }
                         }
                     }
                 }
@@ -1996,8 +2015,26 @@ public actor TokenUsageEngine {
         speedCutoffSec: Double,
         speedMtimeCutoffSec: Double
     ) -> Int {
-        let root = homeDirectoryURL.appendingPathComponent(".claude/projects", isDirectory: true)
-        let files = enumerateFiles(under: root, suffix: ".jsonl")
+        var roots: [URL] = [
+            homeDirectoryURL.appendingPathComponent(".claude/projects", isDirectory: true),
+        ]
+        let profilesBase = homeDirectoryURL.appendingPathComponent(".claude-profiles", isDirectory: true)
+        for profileName in listSubdirectoryNames(at: profilesBase.path) {
+            let projectsURL = profilesBase
+                .appendingPathComponent(profileName, isDirectory: true)
+                .appendingPathComponent("projects", isDirectory: true)
+            roots.append(projectsURL)
+        }
+
+        var files: [URL] = []
+        var seenFilePaths = Set<String>()
+        for root in roots {
+            for url in enumerateFiles(under: root, suffix: ".jsonl") {
+                if seenFilePaths.insert(url.path).inserted {
+                    files.append(url)
+                }
+            }
+        }
         guard !files.isEmpty else { return 0 }
 
         var count = 0
