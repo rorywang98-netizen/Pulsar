@@ -7431,18 +7431,18 @@ private func testV123RegressionSuite() async {
             AccountRecord(
                 id: "sub-rory",
                 provider: .antigravity,
-                email: "rorywangdev@example.com",
-                displayName: "rorywangdev",
+                email: "devuser@example.com",
+                displayName: "devuser",
                 isActiveLive: true,
                 avatarURL: "https://lh3.googleusercontent.com/rory.png"
             ),
         ])
 
-        // 4a. Desktop Snow vs Keychain rorywangdev (no id_token in Keychain -> offline SHA-256 match, ZERO userinfo calls)
+        // 4a. Desktop Snow vs Keychain devuser (no id_token in Keychain -> offline SHA-256 match, ZERO userinfo calls)
         let roryBundle: [String: Any] = [
             "auth_method": "consumer",
             "writer_id": "writer_rory_1111111111111111111111111111111",
-            "id_token_email": "rorywangdev@example.com",
+            "id_token_email": "devuser@example.com",
             "token": [
                 "access_token": "at_rory_1",
                 "refresh_token": "rt_rory_vault",
@@ -7452,7 +7452,7 @@ private func testV123RegressionSuite() async {
         try writeLiveBundle(roryBundle, roryBundle)
 
         let liveId = await provider.syncLiveAccount(registry: &reg)
-        T.expectEqual(liveId, "sub-snow", "desktop truth must mark Snow active even when Keychain holds rorywangdev")
+        T.expectEqual(liveId, "sub-snow", "desktop truth must mark Snow active even when Keychain holds devuser")
         T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-snow" }?.isActiveLive, true)
         T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-rory" }?.isActiveLive, false)
 
@@ -7465,8 +7465,8 @@ private func testV123RegressionSuite() async {
         T.expectEqual(drift4a?.reason, .desktopKeychainMismatch, "must flag .desktopKeychainMismatch")
         T.expectEqual(drift4a?.desktopAccountId, "sub-snow")
         T.expectEqual(drift4a?.desktopEmail, "snow@example.com")
-        T.expectEqual(drift4a?.keychainEmail, "rorywangdev@example.com")
-        T.expectEqual(drift4a?.mirrorEmail, "rorywangdev@example.com")
+        T.expectEqual(drift4a?.keychainEmail, "devuser@example.com")
+        T.expectEqual(drift4a?.mirrorEmail, "devuser@example.com")
         T.expectEqual(drift4a?.staleBackgroundAgyPids, [668], "must detect PID 668 and exclude agy-bridge & agy acp")
 
         // Active desktop Snow immediately gets 本地 RPC quota even before repair.
@@ -7479,7 +7479,7 @@ private func testV123RegressionSuite() async {
         let staleMetaKC: [String: Any] = [
             "auth_method": "consumer",
             "writer_id": "writer_snow_1111111111111111111111111111111",
-            "id_token_email": "rorywangdev@example.com",
+            "id_token_email": "devuser@example.com",
             "token": [
                 "access_token": "at_snow_1",
                 "refresh_token": "rt_snow_vault",
@@ -7504,7 +7504,7 @@ private func testV123RegressionSuite() async {
         let staleMirrorEmail: [String: Any] = [
             "auth_method": "consumer",
             "writer_id": "writer_snow_1111111111111111111111111111111",
-            "id_token_email": "rorywangdev@example.com",
+            "id_token_email": "devuser@example.com",
             "token": [
                 "access_token": "at_snow_hour1",
                 "refresh_token": "rt_snow_vault",
@@ -7514,7 +7514,7 @@ private func testV123RegressionSuite() async {
         try writeLiveBundle(cleanSnowKC, staleMirrorEmail)
         _ = await provider.syncLiveAccount(registry: &reg)
         T.expectEqual(provider.currentCredentialDrift?.reason, .mirrorFileMismatch, "stale mirror id_token_email must flag .mirrorFileMismatch")
-        T.expectEqual(provider.currentCredentialDrift?.mirrorEmail, "rorywangdev@example.com")
+        T.expectEqual(provider.currentCredentialDrift?.mirrorEmail, "devuser@example.com")
 
         // 4c-ii. Mirror file has stale refresh_token (even when id_token_email is absent) -> .mirrorFileMismatch
         let staleMirrorRT: [String: Any] = [
@@ -7529,7 +7529,7 @@ private func testV123RegressionSuite() async {
         try writeLiveBundle(cleanSnowKC, staleMirrorRT)
         _ = await provider.syncLiveAccount(registry: &reg)
         T.expectEqual(provider.currentCredentialDrift?.reason, .mirrorFileMismatch, "mismatched mirror refresh_token must flag .mirrorFileMismatch")
-        T.expectEqual(provider.currentCredentialDrift?.mirrorEmail, "rorywangdev@example.com")
+        T.expectEqual(provider.currentCredentialDrift?.mirrorEmail, "devuser@example.com")
 
         // 4d. Normal hourly Keychain refresh (different access_token / expiry / writer_id, same refresh_token & matching id_token_email) -> nil drift!
         let normalHourlyMirror: [String: Any] = [
@@ -7573,7 +7573,7 @@ private func testV123RegressionSuite() async {
         let driftedObj: [String: Any] = [
             "auth_method": "consumer",
             "writer_id": oldWriterID,
-            "id_token_email": "rorywangdev@example.com",
+            "id_token_email": "devuser@example.com",
             "polluted_field": "must_strip",
             "token": [
                 "access_token": "at_rory_stale",
@@ -7764,8 +7764,8 @@ private func testV123RegressionSuite() async {
             AccountRecord(
                 id: "sub-rory",
                 provider: .antigravity,
-                email: "rorywangdev@example.com",
-                displayName: "rorywangdev",
+                email: "devuser@example.com",
+                displayName: "devuser",
                 isActiveLive: true,
                 avatarURL: "https://lh3.googleusercontent.com/rory.png"
             ),
@@ -7859,7 +7859,7 @@ private func testV123RegressionSuite() async {
         let roryKCObj: [String: Any] = [
             "auth_method": "consumer",
             "writer_id": "writer_rory_edge_0123456789abcdefghijklmnop",
-            "id_token_email": "rorywangdev@example.com",
+            "id_token_email": "devuser@example.com",
             "token": [
                 "access_token": "at_rory_live",
                 "refresh_token": "rt_rory_vault",
@@ -7884,7 +7884,7 @@ private func testV123RegressionSuite() async {
             ),
         ]
 
-        // Part (a): Unregistered desktop account (`unregistered@example.com`) vs registered Keychain (`rorywangdev`)
+        // Part (a): Unregistered desktop account (`unregistered@example.com`) vs registered Keychain (`devuser`)
         StubURLProtocol.reset { req, _ in
             let urlStr = req.url?.absoluteString ?? ""
             let resp: (Int, Any) -> (HTTPURLResponse, Data) = { code, obj in
@@ -7921,8 +7921,8 @@ private func testV123RegressionSuite() async {
             AccountRecord(
                 id: "sub-rory",
                 provider: .antigravity,
-                email: "rorywangdev@example.com",
-                displayName: "rorywangdev",
+                email: "devuser@example.com",
+                displayName: "devuser",
                 isActiveLive: true,
                 avatarURL: "https://lh3.googleusercontent.com/rory.png"
             ),
@@ -7930,12 +7930,12 @@ private func testV123RegressionSuite() async {
 
         let syncedId = await provider.syncLiveAccount(registry: &reg)
         T.expectEqual(syncedId, nil, "unregistered desktop account must NOT mark another Keychain account active")
-        T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-rory" }?.isActiveLive, false, "rorywangdev must have isActiveLive == false when desktop is unregistered@example.com")
+        T.expectEqual(reg.accounts(for: .antigravity).first { $0.id == "sub-rory" }?.isActiveLive, false, "devuser must have isActiveLive == false when desktop is unregistered@example.com")
         T.expectEqual(provider.currentCredentialDrift?.reason, .desktopKeychainMismatch)
         T.expectEqual(provider.currentCredentialDrift?.desktopAccountId, nil, "unregistered desktop drift must set desktopAccountId == nil")
         T.expectEqual(provider.currentCredentialDrift?.desktopEmail, "unregistered@example.com")
 
-        // Verify AppStore.repairAntigravityCredentialDrift() refuses to overwrite Keychain with rorywangdev!
+        // Verify AppStore.repairAntigravityCredentialDrift() refuses to overwrite Keychain with devuser!
         let regURL = dir.appendingPathComponent("registry-edge.json")
         try reg.save(to: regURL)
         let store = await MainActor.run {
@@ -9565,9 +9565,9 @@ private func testV150RegressionSuite() async {
             profilesBaseDirURL: profilesBaseDir
         )
 
-        let fixedNow = Formatters.parseRFC3339("2026-11-23T08:00:00Z")!
-        let reset5h = "2026-11-23T11:30:00Z"
-        let reset7d = "2026-11-28T08:00:00Z"
+        let fixedNow = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+        let reset5h = Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(12_600))
+        let reset7d = Formatters.formatRFC3339UTC(fixedNow.addingTimeInterval(5 * 86_400))
 
         let mockInspector = MockProcessInspector()
         mockInspector.processes = [
@@ -9962,17 +9962,22 @@ private func testV150RegressionSuite() async {
         try fm.createDirectory(at: defaultProjDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: profileProjDir, withIntermediateDirectories: true)
 
+        let usageDayStart = Calendar.current.startOfDay(for: fixedNow)
+        let usageTs1 = Formatters.formatRFC3339UTC(max(usageDayStart, fixedNow.addingTimeInterval(-300)))
+        let usageTs2 = Formatters.formatRFC3339UTC(max(usageDayStart, fixedNow.addingTimeInterval(-120)))
+        let usageTs3 = Formatters.formatRFC3339UTC(fixedNow)
+
         let defaultLogLines = [
-            #"{"type":"assistant","timestamp":"2026-11-23T02:00:00Z","cwd":"/Users/demo/repo-main","message":{"id":"msg_v150_shared","model":"claude-sonnet-4","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":300,"cache_creation_input_tokens":0}}}"#,
-            #"{"type":"assistant","timestamp":"2026-11-23T02:05:00Z","cwd":"/Users/demo/repo-main","message":{"id":"msg_v150_default","model":"claude-sonnet-4","usage":{"input_tokens":150,"output_tokens":150,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}}}"#,
+            "{\"type\":\"assistant\",\"timestamp\":\"\(usageTs1)\",\"cwd\":\"/Users/demo/repo-main\",\"message\":{\"id\":\"msg_v150_shared\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":100,\"output_tokens\":200,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":0}}}",
+            "{\"type\":\"assistant\",\"timestamp\":\"\(usageTs2)\",\"cwd\":\"/Users/demo/repo-main\",\"message\":{\"id\":\"msg_v150_default\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":150,\"output_tokens\":150,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":0}}}",
         ].joined(separator: "\n") + "\n"
         try Data(defaultLogLines.utf8).write(to: defaultProjDir.appendingPathComponent("session-default.jsonl"))
 
         let profileLogLines = [
             // Duplicate msg_v150_shared across profile dir -> MUST deduplicate globally!
-            #"{"type":"assistant","timestamp":"2026-11-23T02:00:00Z","cwd":"/Users/demo/repo-side","message":{"id":"msg_v150_shared","model":"claude-sonnet-4","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":300,"cache_creation_input_tokens":0}}}"#,
+            "{\"type\":\"assistant\",\"timestamp\":\"\(usageTs1)\",\"cwd\":\"/Users/demo/repo-side\",\"message\":{\"id\":\"msg_v150_shared\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":100,\"output_tokens\":200,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":0}}}",
             // Unique message inside ~/.claude-profiles/pro2/projects/ -> total 500
-            #"{"type":"assistant","timestamp":"2026-11-23T02:10:00Z","cwd":"/Users/demo/repo-side","message":{"id":"msg_v150_pro2","model":"claude-opus-4","usage":{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0}}}"#,
+            "{\"type\":\"assistant\",\"timestamp\":\"\(usageTs3)\",\"cwd\":\"/Users/demo/repo-side\",\"message\":{\"id\":\"msg_v150_pro2\",\"model\":\"claude-opus-4\",\"usage\":{\"input_tokens\":200,\"output_tokens\":100,\"cache_read_input_tokens\":200,\"cache_creation_input_tokens\":0}}}",
         ].joined(separator: "\n") + "\n"
         try Data(profileLogLines.utf8).write(to: profileProjDir.appendingPathComponent("session-pro2.jsonl"))
 

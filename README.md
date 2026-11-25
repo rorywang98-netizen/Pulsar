@@ -3,7 +3,7 @@
   <h1>Pulsar</h1>
   <p><strong>原生 macOS Liquid Glass 菜单栏 AI 配额监控、多账号安全切换、纯本地 Token 分析与实时 <code>tok/s</code> 测速工具</strong></p>
   <p>
-    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.2"><img src="https://img.shields.io/badge/version-v1.2.2-6366F1?style=flat-square" alt="Version v1.2.2" /></a>
+    <a href="https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.5.1"><img src="https://img.shields.io/badge/version-v1.5.1-6366F1?style=flat-square" alt="Version v1.5.1" /></a>
     <img src="https://img.shields.io/badge/macOS-13%2B%20%7C%20Liquid%20Glass%2026%2F27-0EA5E9?style=flat-square" alt="macOS 13+" />
     <img src="https://img.shields.io/badge/arch-Apple%20Silicon%20(arm64)-10B981?style=flat-square" alt="Apple Silicon" />
     <img src="https://img.shields.io/badge/Swift-AppKit%20%2B%20SwiftUI%20(Zero%20Deps)-F97316?style=flat-square" alt="Pure Swift" />
@@ -19,9 +19,9 @@
 
 | 下载项 | 链接 / 信息 |
 |---|---|
-| **DMG 直链下载（最新 v1.2.2）** | [**Pulsar-v1.2.2-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/latest/download/Pulsar-v1.2.2-macOS-arm64.dmg) |
-| **GitHub Release 发布页** | [Releases · v1.2.2](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.2.2) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
-| **SHA-256 校验值** | `a1b6f4038bfead52821f98eac9a3d20cf8c0166b1b0d569ffbc70b0989ad435a` |
+| **DMG 直链下载（最新 v1.5.1）** | [**Pulsar-v1.5.1-macOS-arm64.dmg**](https://github.com/rorywang98-netizen/Pulsar/releases/download/v1.5.1/Pulsar-v1.5.1-macOS-arm64.dmg) |
+| **GitHub Release 发布页** | [Releases · v1.5.1](https://github.com/rorywang98-netizen/Pulsar/releases/tag/v1.5.1) · [Latest Release](https://github.com/rorywang98-netizen/Pulsar/releases/latest) |
+| **SHA-256 校验值** | `8335b0788c1b58e7a01f65e5da94e083c5ea8f187b2ae367b9fa205b824a4907` |
 | **系统要求** | macOS 13.0+（Apple Silicon `arm64`），macOS 26/27 自动启用原生 Liquid Glass 液态玻璃材质 |
 
 ### 首次打开说明（本地 Ad-hoc 签名）
@@ -35,9 +35,28 @@ xattr -dr com.apple.quarantine /Applications/Pulsar.app
 可选校验下载完整性：
 
 ```bash
-shasum -a 256 Pulsar-v1.2.2-macOS-arm64.dmg
-# 应输出: a1b6f4038bfead52821f98eac9a3d20cf8c0166b1b0d569ffbc70b0989ad435a  Pulsar-v1.2.2-macOS-arm64.dmg
+shasum -a 256 Pulsar-v1.5.1-macOS-arm64.dmg
+# 应输出: 8335b0788c1b58e7a01f65e5da94e083c5ea8f187b2ae367b9fa205b824a4907  Pulsar-v1.5.1-macOS-arm64.dmg
 ```
+
+---
+
+## v1.5.0 – v1.5.1 新特性与修复
+
+- **Claude CLI 多账号纯本地被动追踪与默认配置切换（零联网 · 零钥匙串 · 零碰桌面端）**：
+  - 通过 `~/.config/pulsar/claude-cli-profiles.json` + `~/.cache/pulsar/claude-cli-quotas/<id>.json` 支持多个隔离的 `CLAUDE_CONFIG_DIR` CLI 配置，支持面板内 **`+ 添加配置`**、**`设为默认`**（仅原子更新指针文件，不重启进行中终端）、每账号独立 `5h / 周` 消耗曲线，以及内置 Desktop 排除黑名单彻底阻断共享 `~/.claude.json` 污染。
+  - 修复 macOS `JSONSerialization` 中 `NSNumber(0 / 1)` 误命中 `is Bool` 导致满格 `100% / 99%` 余量被丢弃的问题（`v1.5.1`）。
+  - `TokenUsageEngine` 同步扩展扫描 `~/.claude-profiles/*/projects/**/*.jsonl`，完整统计多账号 Token 用量与实时 `tok/s`。
+- **Cursor 钥匙串主密钥跨发版持久化**：首次解密成功后将静态 `Cursor Safe Storage` 主密钥缓存进 Pulsar 自有 `/usr/bin/security` 钥匙串项（`com.rory.roryorbit.cursor`），后续 ad-hoc 升级重签不再反复掉授权。
+- **Grok OIDC 6 小时自动续期**：在 `GrokProvider` 中增加基于 `flock` 锁与原子 `0600` 写回的 `refresh_token` 静默续期，彻底告别 6 小时掉线。
+
+---
+
+## v1.3.0 – v1.4.1 核心更新
+
+- **7 天纯本地配额消耗曲线（`QuotaHistoryStore`）**：支持在账号卡片内联展开 `6h / 24h / 7d` 5h+周双曲线、悬停读数、重置竖线与「掉额最快时段」统计。
+- **Token 用量默认展示「模型」+ 占比进度条 & 根治 Antigravity `unknown` 模型**：支持只读解码 `conversations/*.db` `gen_metadata` protobuf 及 `CHECKPOINT` 继承，彻底消除未知模型归类。
+- **Antigravity 2.34 `daemon/hub_*.json` 本地 RPC 发现 & 钥匙串漂移一键修复（`v1.2.3`）**：支持 `KERN_PROCARGS2` 识别已 unlink 的热更新进程及不重启一键修复 Keychain 漂移。
 
 ---
 
@@ -87,15 +106,16 @@ shasum -a 256 Pulsar-v1.2.2-macOS-arm64.dmg
 - **5 向原生拖拽自由缩放**：默认 **`390×620pt`**，支持左/右/下边缘及左下/右下角点自由拖拽缩放（范围 **`340–680 × 460–920pt`**），内置 **`超窄 350×560`** / **`标准 390×620`** / **`宽屏 520×720`** 快捷预设与双击底角复位；拉宽至 `≥ 430pt` 时 KPI 自动展开为 `2×2` 网格，`340pt` 极窄宽度下全视图零截断。
 - **全新 Pulsar 品牌资产**：配备全套 10 档超椭圆 `AppIcon.icns`、顶栏高清宇宙脉冲星图标（`pulsar.png`）与菜单栏单色自适应反白模板标（`pulsar-template.png`）。
 
-### 2. 六大 AI 服务官方图标与多账号安全切换
-内置 6 家服务高清官方 PNG 图标（Codex / Grok 采用单色模板自动适配浅色与深色菜单栏；Antigravity / Cursor / Kimi / DeepSeek 保留官方原色）：
+### 2. 七大 AI 服务官方图标与多账号安全切换
+内置 7 家服务高清官方 PNG 图标（Codex / Grok 采用单色模板自动适配浅色与深色菜单栏；Antigravity / Claude / Cursor / Kimi / DeepSeek 保留官方原色）：
 
 | 服务 | 核心能力 | 认证与配额来源 |
 |---|---|---|
-| **Antigravity** | 多账号安全切换、Google 真实圆形头像、5h / 周多池配额监控、客户端生命周期控制 | 优先直连本机 `language_server` Connect RPC；远端使用原生 UA 访问 Cloud Code（支持 403 自动回退链路）；完整拆分各模型池 **5 小时** 与 **周** 窗口（含 `Argon · 周`），准确识别 Ultra / Pro 套餐；双装感知 Stable 与 Insiders |
+| **Antigravity** | 多账号安全切换、Google 真实圆形头像、5h / 周多池配额监控、客户端生命周期控制 | 优先直连本机 `language_server` / `daemon/hub_*.json` Connect RPC；远端使用原生 UA 访问 Cloud Code（支持 403 自动回退链路）；完整拆分各模型池 **5 小时** 与 **周** 窗口（含 `Argon · 周`），准确识别 Ultra / Pro 套餐；双装感知 Stable 与 Insiders |
 | **Codex** | 多账号安全切换、5h / 本周配额与 Credits 监控、项目侧边栏同步保留 | 只读活跃账号防触发 `refresh_token_reused`；查询 `wham/usage` 与可选 `rate-limit-reset-credits`；自动忽略 `add_*` 附加限流窗口；支持 `file` / `keyring` / `auto` 存储模式及 `.codex-global-state.json` 本地项目保留与回滚 |
-| **Grok** | SuperGrok / CLI 配额实时监控 | 只读本地 `~/.grok/auth.json`；主通道 gRPC-web Protobuf，备用代理通道自动回退 |
-| **Cursor** | Ultra 多通道 / 附加美元余额 / 账单周期监控 | 非阻塞只读 SQLite3 查询 `state.vscdb` + Electron SafeStorage AES-128-CBC 解密（后台轮询与 CLI 强制非交互绝不弹窗）；并发聚合多端点完整展示 Ultra 多通道、按量附加余额与账单周期 |
+| **Claude CLI** | 多账号纯本地被动余量监控、默认配置切换与消耗曲线（**零联网 · 零钥匙串 · 零碰桌面端**） | 仅被动读取本地 `~/.config/pulsar/claude-cli-profiles.json`、隔离配置目录与 `~/.cache/pulsar/claude-cli-quotas/*.json` 状态栏镜像 |
+| **Grok** | SuperGrok / CLI 配额实时监控与 6h OIDC 自动续期 | 只读本地 `~/.grok/auth.json` 并支持 `flock` 加锁 OIDC `refresh_token` 静默续期；主通道 gRPC-web Protobuf，备用代理通道自动回退 |
+| **Cursor** | Ultra 多通道 / 附加美元余额 / 账单周期监控 | 非阻塞只读 SQLite3 查询 `state.vscdb` + Electron SafeStorage AES-128-CBC 解密（静态主密钥持久化于自有钥匙串，跨发版免重复授权）；并发聚合多端点完整展示 Ultra 多通道、按量附加余额与账单周期 |
 | **Kimi** | Kimi Coding 用量监控与 API Key 管理 | 独立 macOS 钥匙串安全存储 API Key，支持自定义 `KIMI_CODE_BASE_URL` |
 | **DeepSeek** | 账户余额监控（CNY / USD 多币种）与 API Key 管理 | 独立 macOS 钥匙串安全存储 API Key，实时展示可用余额与多币种汇总 |
 
@@ -133,8 +153,8 @@ shasum -a 256 Pulsar-v1.2.2-macOS-arm64.dmg
 ## 零 Claude 联网与核心安全承诺
 
 - **严格零 Claude 联网与零凭据触碰**：
-  - 配额监控与快照导出仅覆盖 Antigravity / Codex / Grok / Cursor / Kimi / DeepSeek 6 个非 Claude 服务；
-  - 本地 Token 用量与实时 `tok/s` 测速引擎（`TokenUsageModels.swift` / `TokenUsageEngine.swift` / `TokenUsageViews.swift`）全程 **0 `URLSession`、0 `Process(`**，仅离线只读本机已落盘会话日志，**零网络请求 Anthropic 接口、零拉起 Claude CLI、零读取 Claude 钥匙串凭据**；
+  - 联网配额拉取仅覆盖 Antigravity / Codex / Grok / Cursor / Kimi / DeepSeek 6 个非 Claude 服务；Claude CLI 多账号余量与号池快照仅纯本地被动读取 `~/.config/pulsar/claude-cli-profiles.json` 与 `~/.cache/pulsar/claude-cli-quotas/*.json` 状态栏镜像，**零网络请求 Anthropic 接口、零拉起 Claude CLI、零读取 Claude 钥匙串凭据、零触碰 Claude Desktop**；
+  - 本地 Token 用量与实时 `tok/s` 测速引擎（`TokenUsageModels.swift` / `TokenUsageEngine.swift` / `TokenUsageViews.swift`）全程 **0 `URLSession`、0 `Process(`**，仅离线只读本机已落盘会话日志；
   - 内置更新器（`ReleaseUpdater.swift`）严格锁定 4 个 GitHub Releases HTTPS 白名单域名并校验重定向目标，下载后强制 SHA-256 + Bundle ID + `codesign --verify --deep --strict` 三重校验，CLI 子命令零联网触发。
 - **绝不自动 `SIGKILL`**：多账号切换控制客户端时先验证目标凭证有效，再优雅调用 `NSRunningApplication.terminate()` / `SIGTERM` 并等待 12 秒；超时直接中止并提示，仅用户显式确认才允许强制结束，Antigravity 切换后默认仅拉起正式版不双开 Insiders 预览版。
 - **保护 Codex 单次 Refresh Token**：后台轮询严格只读当前活跃 Codex 账号，非活跃账号刷新经内存门控 + 跨进程 `flock` 锁串行执行并即时轮换落盘。
@@ -184,7 +204,7 @@ bash install.sh
 # 全量只读配额自检（输出脱敏摘要表）
 /Applications/Pulsar.app/Contents/MacOS/RoryOrbit --smoke-quota
 
-# 导出脱敏号池 JSON 快照（零密钥、零 Claude）
+# 导出脱敏号池 JSON 快照（零密钥、Claude 仅含本地状态栏镜像）
 /Applications/Pulsar.app/Contents/MacOS/RoryOrbit --export-accountpool-json [--max-age 240] [--refresh]
 
 # 一次性幂等迁移历史账号与密钥（支持环境变量指定自定义目录）
@@ -198,7 +218,7 @@ bash install.sh
   - `avatars/<sha256>.img`：Google 账号圆形头像磁盘缓存
   - `daily-history-archive.json` / `token-history-seed.json` / `token-scan-cache.json` / `token-usage-snapshot.json`：本地 Token 分析与归档缓存
   - `accountpool-snapshot.json` / `.refresh.lock`：号池暖缓存快照与跨进程 `flock` 协同锁
-- **独立钥匙串命名空间**：`com.rory.roryorbit.antigravity`、`com.rory.roryorbit.codex`、`com.rory.roryorbit.keys`
+- **独立钥匙串命名空间**：`com.rory.roryorbit.antigravity`、`com.rory.roryorbit.codex`、`com.rory.roryorbit.cursor`、`com.rory.roryorbit.keys`
 - **可选历史迁移环境变量**：
   - `PULSAR_LEGACY_ORBITSWITCH_DIR`：指定自定义 OrbitSwitch 历史备份目录或 `accounts.json` 路径（默认回退 `~/Library/Application Support/OrbitSwitch/accounts.json`）
   - `PULSAR_LEGACY_TOKEN_MONITOR_DIR`：指定自定义历史 Token Monitor 导出目录或 `.json` 路径（默认回退 `~/Library/Application Support/Token Monitor/`）
